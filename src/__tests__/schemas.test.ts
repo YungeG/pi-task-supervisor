@@ -6,6 +6,7 @@ import {
   ClearTasksParams,
   GetReadyTasksParams,
   AdvanceTasksParams,
+  WorkflowGateParams,
 } from "../schemas";
 
 // TypeBox schemas are plain objects at runtime but the TypeScript types
@@ -180,6 +181,23 @@ describe("CompileTasksParams", () => {
     expect(CompileTasksParams.type).toBe("object");
     expect(CompileTasksParams.properties.finalAcceptanceTaskId).toBeDefined();
     expect(CompileTasksParams.required).toContain("finalAcceptanceTaskId");
+  });
+});
+
+describe("WorkflowGateParams", () => {
+  it("exposes bounded decision and execution receipt fields", () => {
+    expect(WorkflowGateParams.required).toContain("action");
+    expect((WorkflowGateParams.properties.action as any).enum).toEqual([
+      "wait_for_decision",
+      "bind_execution",
+      "clear_execution",
+    ]);
+    expect((WorkflowGateParams.properties.decision as any).properties.question.maxLength).toBe(
+      1000,
+    );
+    expect((WorkflowGateParams.properties.executionRef as any).properties.runId.maxLength).toBe(
+      200,
+    );
   });
 });
 

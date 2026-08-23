@@ -95,7 +95,7 @@ export function formatClaimedTaskDetails(tasks: TaskRecord[]): string {
 
 /** Format the hidden context message for before_agent_start injection. */
 export function formatHiddenContext(board: TaskBoardSnapshot): string {
-  const lines: string[] = ["[PHASED TASKS ACTIVE]", ""];
+  const lines: string[] = ["[CONTINUOUS TASKS ACTIVE]", ""];
 
   const activePhase = board.phases.find((p) => p.status === "active");
   lines.push(`Active Phase: ${activePhase ? phaseLabel(board, activePhase.phase) : "none"}`);
@@ -118,6 +118,11 @@ export function formatHiddenContext(board: TaskBoardSnapshot): string {
     lines.push("Currently claimed:");
     for (const t of claimed) {
       lines.push(`  ${getStatusIcon(t.status)} [${t.id}] ${t.title}`);
+      if (t.executionRef) {
+        lines.push(
+          `    Existing ${t.executionRef.source} run ${t.executionRef.runId}; inspect it before launching any writer.`,
+        );
+      }
     }
   }
 
@@ -148,7 +153,7 @@ export function formatHiddenContext(board: TaskBoardSnapshot): string {
 
   lines.push("");
   lines.push(
-    "Workflow: write_tasks → edit_tasks (blockers/data) → compile_tasks → get_ready_tasks → advance_tasks → done",
+    "Workflow: write_tasks → edit_tasks → compile_tasks → get_ready_tasks → advance_tasks → workflow_gate → done",
   );
 
   return lines.join("\n");
@@ -166,6 +171,11 @@ export function formatContinuePrompt(board: TaskBoardSnapshot): string {
       lines.push("Currently claimed:");
       for (const t of active) {
         lines.push(`  [${t.id}] ${t.title} (${t.status})`);
+        if (t.executionRef) {
+          lines.push(
+            `    Existing ${t.executionRef.source} run ${t.executionRef.runId}; inspect it and do not launch a duplicate writer.`,
+          );
+        }
       }
     }
     if (ready.length > 0) {

@@ -23,6 +23,7 @@ export function createMockContext(
     ui: {
       setStatus: vi.fn(),
       setWidget: vi.fn(),
+      notify: vi.fn(),
     },
     sessionManager: {
       getBranch: vi.fn(() => branch),
@@ -41,6 +42,9 @@ export function createMockAPI(): {
   registerTool: ReturnType<typeof vi.fn>;
   on: ReturnType<typeof vi.fn>;
   registerMessageRenderer: ReturnType<typeof vi.fn>;
+  registerCommand: ReturnType<typeof vi.fn>;
+  getActiveTools: ReturnType<typeof vi.fn>;
+  setActiveTools: ReturnType<typeof vi.fn>;
   appendEntry: ReturnType<typeof vi.fn>;
 } {
   const sendMessage = vi.fn();
@@ -48,6 +52,9 @@ export function createMockAPI(): {
   const registerTool = vi.fn();
   const on = vi.fn();
   const registerMessageRenderer = vi.fn();
+  const registerCommand = vi.fn();
+  const getActiveTools = vi.fn(() => ["read", "write_tasks"]);
+  const setActiveTools = vi.fn();
   const appendEntry = vi.fn();
 
   return {
@@ -57,6 +64,9 @@ export function createMockAPI(): {
       registerTool,
       on,
       registerMessageRenderer,
+      registerCommand,
+      getActiveTools,
+      setActiveTools,
       appendEntry,
     } as unknown as ExtensionAPI,
     sendMessage,
@@ -64,6 +74,9 @@ export function createMockAPI(): {
     registerTool,
     on,
     registerMessageRenderer,
+    registerCommand,
+    getActiveTools,
+    setActiveTools,
     appendEntry,
   };
 }

@@ -12,6 +12,7 @@ import {
   ClearTasksParams,
   GetReadyTasksParams,
   AdvanceTasksParams,
+  WorkflowGateParams,
 } from "./schemas";
 import {
   CUSTOM_EVENT_TYPE,
@@ -21,7 +22,7 @@ import {
 } from "./types";
 import type { TaskBoardSnapshot, TaskEdit, TaskWorkflowEvent } from "./types";
 import { writeTasks, applyEdits, compileBoard, createEmptyBoard, claimReadyTasks } from "./engine";
-import { getStatusCounts } from "./validation";
+import { cloneBoard, getStatusCounts, isSafeBoundedText } from "./validation";
 import { getBoardRef, setBoard, persistEntries, updateUI } from "./state";
 import { loadConfig, resolvePhasePrompt } from "./config";
 import {
@@ -602,6 +603,167 @@ export function createAdvanceTasksTool(
       if (!details) return new Text(text, 0, 0);
       if (details.error) return new Text(theme.fg("error", details.error), 0, 0);
       return renderColoredBoardResult(text, details.snapshot, theme);
+    },
+  };
+}
+
+type WorkflowGateInput = {
+  action: "wait_for_decision" | "bind_execution" | "clear_execution";
+  taskId?: string;
+  decision?: { question: string; whyUserOwned: string; options?: string[] };
+  executionRef?: { source: "pi-subagents" | "workflow"; runId: string };
+};
+
+type GateResult = { board: TaskBoardSnapshot; event: TaskWorkflowEvent };
+
+function gateTask(board: Readonly<TaskBoardSnapshot>, taskId: string | undefined) {
+  if (!taskId || !isSafeBoundedText(taskId, 100)) throw new Error("taskId is required");
+  const task = board.tasks.find((candidate) => candidate.id === taskId);
+  if (!task) throw new Error(`Task "${taskId}" not found`);
+  return task;
+}
+
+function waitForDecision(
+  board: Readonly<TaskBoardSnapshot>,
+  params: WorkflowGateInput,
+  now: string,
+): GateResult {
+  const task = gateTask(board, params.taskId);
+  const decision = params.decision;
+  if (!decision) throw new Error("decision is required");
+  if (
+    !isSafeBoundedText(decision.question, 1000) ||
+    !isSafeBoundedText(decision.whyUserOwned, 1000) ||
+    (decision.options?.length ?? 0) > 10 ||
+    (decision.options?.some((option) => !isSafeBoundedText(option, 500)) ?? false)
+  ) {
+    throw new Error("Decision content is invalid or secret-like");
+  }
+  const actionable = board.tasks.filter((candidate) =>
+    ["ready", "implementing", "reviewing"].includes(candidate.status),
+  );
+  if (actionable.some((candidate) => candidate.id !== task.id)) {
+    throw new Error(
+      "Independent actionable tasks remain; continue them before waiting for a decision",
+    );
+  }
+  const updated = cloneBoard(board);
+  const record = {
+    id: `decision-${board.generation + 1}`,
+    taskId: task.id,
+    question: decision.question,
+    whyUserOwned: decision.whyUserOwned,
+    options: decision.options ? [...decision.options] : undefined,
+    createdAt: now,
+  };
+  updated.workflowStatus = "waiting_for_decision";
+  updated.decision = record;
+  updated.generation++;
+  updated.stagnantSettles = 0;
+  return { board: updated, event: { type: "wait_for_decision", decision: record } };
+}
+
+function requireExecutionRef(params: WorkflowGateInput) {
+  if (!params.executionRef || !isSafeBoundedText(params.executionRef.runId, 200)) {
+    throw new Error("executionRef is required and must be safe");
+  }
+  return params.executionRef;
+}
+
+function bindExecution(board: Readonly<TaskBoardSnapshot>, params: WorkflowGateInput): GateResult {
+  const task = gateTask(board, params.taskId);
+  if (task.status !== "implementing" && task.status !== "reviewing") {
+    throw new Error("Execution receipts can only be bound to implementing or reviewing tasks");
+  }
+  const executionRef = requireExecutionRef(params);
+  if (task.executionRef) {
+    throw new Error(`Task "${task.id}" already has an execution receipt`);
+  }
+  const updated = cloneBoard(board);
+  const target = updated.tasks.find((candidate) => candidate.id === task.id);
+  if (!target) throw new Error(`Task "${task.id}" disappeared during update`);
+  target.executionRef = { ...executionRef };
+  updated.generation++;
+  updated.stagnantSettles = 0;
+  return {
+    board: updated,
+    event: { type: "bind_execution", id: task.id, executionRef: { ...executionRef } },
+  };
+}
+
+function clearExecution(board: Readonly<TaskBoardSnapshot>, params: WorkflowGateInput): GateResult {
+  const task = gateTask(board, params.taskId);
+  const executionRef = requireExecutionRef(params);
+  if (!task.executionRef) throw new Error(`Task "${task.id}" has no execution receipt`);
+  if (
+    task.executionRef.source !== executionRef.source ||
+    task.executionRef.runId !== executionRef.runId
+  ) {
+    throw new Error("executionRef does not match the active receipt");
+  }
+  const updated = cloneBoard(board);
+  const target = updated.tasks.find((candidate) => candidate.id === task.id);
+  if (!target) throw new Error(`Task "${task.id}" disappeared during update`);
+  target.executionRef = undefined;
+  updated.generation++;
+  updated.stagnantSettles = 0;
+  return {
+    board: updated,
+    event: { type: "clear_execution", id: task.id, executionRef: { ...executionRef } },
+  };
+}
+
+export function createWorkflowGateTool(
+  pi: ExtensionAPI,
+): ToolDefinition<typeof WorkflowGateParams, TaskToolDetails> {
+  return {
+    name: "workflow_gate",
+    label: "Workflow Gate",
+    description:
+      "Create a real user-decision gate or bind/clear an opaque subagent/workflow execution receipt. This tool never runs or resumes the external execution itself.",
+    parameters: WorkflowGateParams,
+    promptSnippet: "workflow_gate: wait for a user decision or bind an existing execution receipt",
+    promptGuidelines: [
+      "Use workflow_gate wait_for_decision only for a material user-owned decision after independent ready work is exhausted.",
+      "Use workflow_gate bind_execution immediately after launching a writer so later continuations inspect rather than duplicate it.",
+    ],
+
+    // eslint-disable-next-line @typescript-eslint/require-await
+    async execute(_toolCallId, params, _signal, _onUpdate, ctx) {
+      const board = getBoardRef();
+      if (board.workflowStatus !== "active") {
+        return makeErrorResult("Workflow must be active", board);
+      }
+      const now = new Date().toISOString();
+      try {
+        const result =
+          params.action === "wait_for_decision"
+            ? waitForDecision(board, params, now)
+            : params.action === "bind_execution"
+              ? bindExecution(board, params)
+              : clearExecution(board, params);
+        setBoard(result.board);
+        persistEntries(pi, result.event, result.board);
+        updateUI(ctx, result.board);
+        return makeSuccessResult(`Workflow gate applied: ${params.action}`, result.board);
+      } catch (error) {
+        return makeErrorResult(error instanceof Error ? error.message : String(error), board);
+      }
+    },
+
+    renderCall(args, theme) {
+      return new Text(
+        theme.fg("toolTitle", theme.bold("workflow_gate ")) + theme.fg("muted", args.action),
+        0,
+        0,
+      );
+    },
+
+    renderResult(result, _options, theme) {
+      const details = result.details as TaskToolDetails | undefined;
+      const text = result.content[0] && "text" in result.content[0] ? result.content[0].text : "";
+      if (details?.error) return new Text(theme.fg("error", details.error), 0, 0);
+      return new Text(theme.fg("success", text), 0, 0);
     },
   };
 }

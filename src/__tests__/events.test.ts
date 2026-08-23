@@ -108,8 +108,33 @@ describe("continuous task lifecycle events", () => {
       "agent_end",
       "agent_settled",
       "input",
+      "tool_call",
       "tool_result",
     ]);
+  });
+
+  it("removes task tools and blocks calls outside the allowlist", async () => {
+    const mockAPI = createMockAPI();
+    const ctx = context();
+    registerEventHandlers(mockAPI.api, async () => DEFAULT_CONFIG);
+
+    await getHandler(mockAPI, "session_start")({}, ctx);
+    expect(mockAPI.setActiveTools).toHaveBeenCalledWith(["read"]);
+    expect(await getHandler(mockAPI, "tool_call")({ toolName: "write_tasks" }, ctx)).toEqual({
+      block: true,
+      reason: "Continuous Tasks is disabled for this session",
+    });
+    expect(await getHandler(mockAPI, "tool_call")({ toolName: "read" }, ctx)).toBeUndefined();
+  });
+
+  it("enables all task tools for an allowlisted session", async () => {
+    const mockAPI = createMockAPI();
+    await registerAllowed(mockAPI);
+
+    const enabled = mockAPI.setActiveTools.mock.calls.at(-1)?.[0] as string[];
+    expect(enabled).toContain("read");
+    expect(enabled).toContain("workflow_gate");
+    expect(enabled).toContain("advance_tasks");
   });
 
   it("restores a version-2 board on session start", async () => {
@@ -159,6 +184,7 @@ describe("continuous task lifecycle events", () => {
             workflowStatus === "waiting_for_decision"
               ? {
                   id: "d1",
+                  taskId: "t-1.1",
                   question: "Choose",
                   whyUserOwned: "Product decision",
                   createdAt: NOW,

@@ -63,6 +63,7 @@ export type WorkflowStatus =
 
 export interface DecisionRecord {
   id: string;
+  taskId: string;
   question: string;
   whyUserOwned: string;
   options?: string[];
@@ -129,6 +130,10 @@ export type TaskWorkflowEvent =
       evidence?: CompletionEvidence;
     }
   | { type: "abandon_task"; id: string }
+  | { type: "wait_for_decision"; decision: DecisionRecord }
+  | { type: "resolve_decision"; id: string; answer: string }
+  | { type: "bind_execution"; id: string; executionRef: ExecutionRef }
+  | { type: "clear_execution"; id: string; executionRef: ExecutionRef }
   | { type: "clear_tasks" };
 
 // ── Edit Input Types ──

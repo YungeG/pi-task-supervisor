@@ -152,7 +152,7 @@ const VALID_EVIDENCE_STATUSES = new Set(["passed", "fixed", "deferred"]);
 const SECRET_LIKE =
   /\b(?:Bearer\s+[A-Za-z0-9._-]{8,}|(?:api[_-]?key|token|password)\s*[:=]\s*\S+|(?:sk|ghp|pt|dt)_[A-Za-z0-9_-]{8,})/i;
 
-function boundedText(value: unknown, maxLength: number): value is string {
+export function isSafeBoundedText(value: unknown, maxLength: number): value is string {
   return (
     typeof value === "string" &&
     value.trim().length > 0 &&
@@ -164,11 +164,11 @@ function boundedText(value: unknown, maxLength: number): value is string {
 function evidenceRefError(ref: EvidenceRef): string | undefined {
   if (!VALID_EVIDENCE_KINDS.has(ref.kind)) return `Invalid evidence kind: ${ref.kind}`;
   if (!VALID_EVIDENCE_STATUSES.has(ref.status)) return `Invalid evidence status: ${ref.status}`;
-  if (!boundedText(ref.label, 200)) return "Evidence label is invalid or secret-like";
-  if (ref.ref !== undefined && !boundedText(ref.ref, 500)) {
+  if (!isSafeBoundedText(ref.label, 200)) return "Evidence label is invalid or secret-like";
+  if (ref.ref !== undefined && !isSafeBoundedText(ref.ref, 500)) {
     return "Evidence ref is invalid or secret-like";
   }
-  if (ref.digest !== undefined && !boundedText(ref.digest, 200)) {
+  if (ref.digest !== undefined && !isSafeBoundedText(ref.digest, 200)) {
     return "Evidence digest is invalid or secret-like";
   }
   if (ref.exitCode !== undefined && !Number.isInteger(ref.exitCode)) {
@@ -187,7 +187,7 @@ export function completionEvidenceError(
   evidence: CompletionEvidence | undefined,
 ): string | undefined {
   if (!evidence) return "Completion evidence is required";
-  if (!boundedText(evidence.summary, 1000)) {
+  if (!isSafeBoundedText(evidence.summary, 1000)) {
     return "Completion evidence summary is invalid or secret-like";
   }
   if (!Array.isArray(evidence.refs) || evidence.refs.length < 1 || evidence.refs.length > 20) {
@@ -203,11 +203,20 @@ export function completionEvidenceError(
   if (
     evidence.residualRisks !== undefined &&
     (evidence.residualRisks.length > 20 ||
-      !evidence.residualRisks.every((risk) => boundedText(risk, 500)))
+      !evidence.residualRisks.every((risk) => isSafeBoundedText(risk, 500)))
   ) {
     return "Residual risks are invalid or secret-like";
   }
   return undefined;
+}
+
+function isValidExecutionRef(value: unknown): boolean {
+  if (typeof value !== "object" || value === null) return false;
+  const ref = value as Record<string, unknown>;
+  return (
+    (ref.source === "pi-subagents" || ref.source === "workflow") &&
+    isSafeBoundedText(ref.runId, 200)
+  );
 }
 
 function isValidTask(t: unknown, requireEvidence: boolean): boolean {
@@ -222,6 +231,7 @@ function isValidTask(t: unknown, requireEvidence: boolean): boolean {
     Array.isArray(task.dependencies) &&
     (task.dependencies as unknown[]).every((d) => typeof d === "string");
   if (!validShape) return false;
+  if (task.executionRef !== undefined && !isValidExecutionRef(task.executionRef)) return false;
   return (
     !requireEvidence ||
     task.status !== "done" ||
@@ -280,6 +290,27 @@ function hasValidV2Metadata(obj: Record<string, unknown>): boolean {
   return true;
 }
 
+function isValidDecision(value: unknown, tasks: Array<Record<string, unknown>>): boolean {
+  if (typeof value !== "object" || value === null) return false;
+  const decision = value as Record<string, unknown>;
+  if (
+    !isSafeBoundedText(decision.id, 100) ||
+    !isSafeBoundedText(decision.taskId, 100) ||
+    !isSafeBoundedText(decision.question, 1000) ||
+    !isSafeBoundedText(decision.whyUserOwned, 1000) ||
+    !isSafeBoundedText(decision.createdAt, 100)
+  ) {
+    return false;
+  }
+  if (!tasks.some((task) => task.id === decision.taskId)) return false;
+  if (decision.options === undefined) return true;
+  return (
+    Array.isArray(decision.options) &&
+    decision.options.length <= 10 &&
+    decision.options.every((option) => isSafeBoundedText(option, 500))
+  );
+}
+
 function hasConsistentWorkflowState(obj: Record<string, unknown>): boolean {
   const status = obj.workflowStatus as string;
   const tasks = obj.tasks as Array<Record<string, unknown>>;
@@ -301,7 +332,7 @@ function hasConsistentWorkflowState(obj: Record<string, unknown>): boolean {
     return false;
   }
   if (status === "waiting_for_decision") {
-    return typeof obj.decision === "object" && obj.decision !== null;
+    return isValidDecision(obj.decision, tasks);
   }
   return obj.decision === undefined;
 }

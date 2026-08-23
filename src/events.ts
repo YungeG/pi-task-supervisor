@@ -2,6 +2,7 @@ import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-a
 import type { ContinuousTasksConfig } from "./config";
 import { isSessionEnabled, loadConfig, resetConfig } from "./config";
 import { formatContinuePrompt, formatHiddenContext } from "./formatting";
+import { isSessionScopeEnabled, setSessionScopeEnabled } from "./scope";
 import {
   getBoardRef,
   persistEntries,
@@ -19,9 +20,23 @@ type ConfigLoader = () => Promise<ContinuousTasksConfig>;
 
 let activeCountdown: ReturnType<typeof setInterval> | null = null;
 let activeTimeout: ReturnType<typeof setTimeout> | null = null;
-let sessionAllowed = false;
+const TOOL_NAMES = new Set([
+  "write_tasks",
+  "edit_tasks",
+  "compile_tasks",
+  "clear_tasks",
+  "get_ready_tasks",
+  "advance_tasks",
+  "workflow_gate",
+]);
+
 let lastRunOutcome: RunOutcome = "normal";
 let extensionContinuationGeneration: number | null = null;
+
+function updateActiveTools(pi: ExtensionAPI, enabled: boolean): void {
+  const active = pi.getActiveTools().filter((name) => !TOOL_NAMES.has(name));
+  pi.setActiveTools(enabled ? [...active, ...TOOL_NAMES] : active);
+}
 
 function clearCountdown(ctx: ExtensionContext): void {
   if (activeCountdown !== null) clearInterval(activeCountdown);
@@ -199,7 +214,7 @@ export function registerEventHandlers(
   pi: ExtensionAPI,
   configLoader: ConfigLoader = loadConfig,
 ): void {
-  sessionAllowed = false;
+  setSessionScopeEnabled(false);
   lastRunOutcome = "normal";
   extensionContinuationGeneration = null;
 
@@ -212,7 +227,9 @@ export function registerEventHandlers(
     const board = reconstructState(ctx);
     setBoard(board);
     updateUI(ctx, board);
-    sessionAllowed = isSessionEnabled(await configLoader(), sessionId(ctx));
+    const enabled = isSessionEnabled(await configLoader(), sessionId(ctx));
+    setSessionScopeEnabled(enabled);
+    updateActiveTools(pi, enabled);
   });
 
   pi.on("session_tree", async (_event, ctx) => {
@@ -222,18 +239,20 @@ export function registerEventHandlers(
     const board = reconstructState(ctx);
     setBoard(board);
     updateUI(ctx, board);
-    sessionAllowed = isSessionEnabled(await configLoader(), sessionId(ctx));
+    const enabled = isSessionEnabled(await configLoader(), sessionId(ctx));
+    setSessionScopeEnabled(enabled);
+    updateActiveTools(pi, enabled);
   });
 
   pi.on("session_shutdown", (_event, ctx) => {
     clearCountdown(ctx);
-    sessionAllowed = false;
+    setSessionScopeEnabled(false);
     extensionContinuationGeneration = null;
   });
 
   pi.on("before_agent_start", () => {
     const board = getBoardRef();
-    if (!sessionAllowed || board.workflowStatus !== "active") return;
+    if (!isSessionScopeEnabled() || board.workflowStatus !== "active") return;
     return {
       message: {
         customType: "continuous-tasks:context",
@@ -279,6 +298,16 @@ export function registerEventHandlers(
     clearCountdown(ctx);
     extensionContinuationGeneration = null;
     setLastToolWasAdvance(false);
+  });
+
+  pi.on("tool_call", (event) => {
+    if (!isSessionScopeEnabled() && TOOL_NAMES.has(event.toolName)) {
+      return {
+        block: true,
+        reason: "Continuous Tasks is disabled for this session",
+      };
+    }
+    return undefined;
   });
 
   pi.on("tool_result", (event) => {

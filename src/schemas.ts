@@ -92,3 +92,23 @@ export const AdvanceTasksParams = Type.Object({
     { minItems: 1, maxItems: 50 },
   ),
 });
+
+export const WorkflowGateParams = Type.Object({
+  action: StringEnum(["wait_for_decision", "bind_execution", "clear_execution"] as const),
+  taskId: Type.Optional(Type.String({ minLength: 1, maxLength: 100 })),
+  decision: Type.Optional(
+    Type.Object({
+      question: Type.String({ minLength: 1, maxLength: 1000 }),
+      whyUserOwned: Type.String({ minLength: 1, maxLength: 1000 }),
+      options: Type.Optional(
+        Type.Array(Type.String({ minLength: 1, maxLength: 500 }), { maxItems: 10 }),
+      ),
+    }),
+  ),
+  executionRef: Type.Optional(
+    Type.Object({
+      source: StringEnum(["pi-subagents", "workflow"] as const),
+      runId: Type.String({ minLength: 1, maxLength: 200 }),
+    }),
+  ),
+});

@@ -261,10 +261,10 @@ describe("formatClaimedTaskDetails", () => {
 // ═══════════════════════════════════════════
 
 describe("formatHiddenContext", () => {
-  it("includes [PHASED TASKS ACTIVE] header", () => {
+  it("includes [CONTINUOUS TASKS ACTIVE] header", () => {
     const board = createEmptyBoard();
     const result = formatHiddenContext(board);
-    expect(result).toContain("[PHASED TASKS ACTIVE]");
+    expect(result).toContain("[CONTINUOUS TASKS ACTIVE]");
   });
 
   it("includes Active Phase: line", () => {
