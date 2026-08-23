@@ -305,6 +305,10 @@ function validateEdit(
       }
       break;
     }
+    default: {
+      const unsupported: never = edit;
+      throw new Error(`Unsupported task edit: ${String(unsupported)}`);
+    }
   }
 }
 
@@ -552,6 +556,10 @@ export function claimReadyTasks(
     task.status = "implementing";
     task.updatedAt = now;
     claimed.push({ ...task });
+  }
+  if (claimed.length > 0) {
+    result.generation = board.generation + 1;
+    result.stagnantSettles = 0;
   }
 
   return { board: result, claimed };

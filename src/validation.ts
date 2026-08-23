@@ -277,7 +277,7 @@ export function isValidLegacySnapshot(data: unknown): data is LegacyTaskBoardSna
 }
 
 function hasValidV2Metadata(obj: Record<string, unknown>): boolean {
-  if (!Number.isInteger(obj.generation) || (obj.generation as number) < 0) return false;
+  if (!Number.isInteger(obj.generation) || (obj.generation as number) < 1) return false;
   if (typeof obj.workflowStatus !== "string" || !VALID_WORKFLOW_STATUSES.has(obj.workflowStatus)) {
     return false;
   }

@@ -92,20 +92,8 @@ export async function loadConfig(): Promise<ContinuousTasksConfig> {
       cachedConfig = decoded;
       return cachedConfig;
     }
-    console.warn("[continuous-tasks] Invalid configuration; extension disabled");
-  } catch (error) {
-    if (
-      !(
-        error instanceof Error &&
-        "code" in error &&
-        (error as NodeJS.ErrnoException).code === "ENOENT"
-      )
-    ) {
-      console.warn(
-        "[continuous-tasks] Failed to load config:",
-        error instanceof Error ? error.message : String(error),
-      );
-    }
+  } catch {
+    // Default-deny on missing, malformed, or unreadable configuration.
   }
   cachedConfig = { ...DEFAULT_CONFIG };
   return cachedConfig;

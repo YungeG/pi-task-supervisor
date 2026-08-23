@@ -103,9 +103,9 @@ function sendContinuation(
       display: false,
       details: {
         generation: board.generation,
-        actionableTaskIds: board.tasks
-          .filter((task) => ["ready", "implementing", "reviewing"].includes(task.status))
-          .map((task) => task.id),
+        actionableTaskIds: board.tasks.flatMap((task) =>
+          ["ready", "implementing", "reviewing"].includes(task.status) ? [task.id] : [],
+        ),
       },
     },
     { triggerTurn: true, deliverAs: "followUp" },
@@ -210,6 +210,24 @@ function recordStagnation(
   return false;
 }
 
+async function restoreSession(
+  pi: ExtensionAPI,
+  ctx: ExtensionContext,
+  configLoader: ConfigLoader,
+  resetOutcome: boolean,
+): Promise<void> {
+  clearCountdown(ctx);
+  setLastToolWasAdvance(false);
+  extensionContinuationGeneration = null;
+  if (resetOutcome) lastRunOutcome = "normal";
+  const board = reconstructState(ctx);
+  setBoard(board);
+  updateUI(ctx, board);
+  const enabled = isSessionEnabled(await configLoader(), sessionId(ctx));
+  setSessionScopeEnabled(enabled);
+  updateActiveTools(pi, enabled);
+}
+
 export function registerEventHandlers(
   pi: ExtensionAPI,
   configLoader: ConfigLoader = loadConfig,
@@ -220,28 +238,11 @@ export function registerEventHandlers(
 
   pi.on("session_start", async (_event, ctx) => {
     resetConfig();
-    clearCountdown(ctx);
-    setLastToolWasAdvance(false);
-    extensionContinuationGeneration = null;
-    lastRunOutcome = "normal";
-    const board = reconstructState(ctx);
-    setBoard(board);
-    updateUI(ctx, board);
-    const enabled = isSessionEnabled(await configLoader(), sessionId(ctx));
-    setSessionScopeEnabled(enabled);
-    updateActiveTools(pi, enabled);
+    await restoreSession(pi, ctx, configLoader, true);
   });
 
   pi.on("session_tree", async (_event, ctx) => {
-    clearCountdown(ctx);
-    setLastToolWasAdvance(false);
-    extensionContinuationGeneration = null;
-    const board = reconstructState(ctx);
-    setBoard(board);
-    updateUI(ctx, board);
-    const enabled = isSessionEnabled(await configLoader(), sessionId(ctx));
-    setSessionScopeEnabled(enabled);
-    updateActiveTools(pi, enabled);
+    await restoreSession(pi, ctx, configLoader, false);
   });
 
   pi.on("session_shutdown", (_event, ctx) => {

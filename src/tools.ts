@@ -20,7 +20,7 @@ import {
   TERMINAL_STATUSES,
   ACTIVE_STATUSES,
 } from "./types";
-import type { TaskBoardSnapshot, TaskEdit, TaskWorkflowEvent } from "./types";
+import type { AdvanceEdit, TaskBoardSnapshot, TaskEdit, TaskWorkflowEvent } from "./types";
 import { writeTasks, applyEdits, compileBoard, createEmptyBoard, claimReadyTasks } from "./engine";
 import { cloneBoard, getStatusCounts, isSafeBoundedText } from "./validation";
 import { getBoardRef, setBoard, persistEntries, updateUI } from "./state";
@@ -409,6 +409,7 @@ export function createClearTasksTool(
       }
 
       const emptyBoard = createEmptyBoard();
+      emptyBoard.generation = board.generation + 1;
       setBoard(emptyBoard);
 
       const event: TaskWorkflowEvent = { type: "clear_tasks" };
@@ -518,6 +519,29 @@ export function createGetReadyTasksTool(
 
 // ── Tool 6: advance_tasks ──
 
+function advanceEvent(
+  edit: AdvanceEdit,
+  before: TaskBoardSnapshot,
+  after: TaskBoardSnapshot,
+): TaskWorkflowEvent {
+  const original = before.tasks.find((task) => task.id === edit.id);
+  const updated = after.tasks.find((task) => task.id === edit.id);
+  if (!original || !updated) throw new Error(`Task "${edit.id}" disappeared during advance`);
+  if (original.status !== "implementing" && original.status !== "reviewing") {
+    throw new Error(`Task "${edit.id}" had invalid pre-advance status ${original.status}`);
+  }
+  if (updated.status !== "reviewing" && updated.status !== "done") {
+    throw new Error(`Task "${edit.id}" had invalid post-advance status ${updated.status}`);
+  }
+  return {
+    type: "advance_task",
+    id: edit.id,
+    from: original.status,
+    to: updated.status,
+    evidence: edit.data?.evidence,
+  };
+}
+
 export function createAdvanceTasksTool(
   pi: ExtensionAPI,
 ): ToolDefinition<typeof AdvanceTasksParams, TaskToolDetails> {
@@ -542,7 +566,7 @@ export function createAdvanceTasksTool(
       if (new Set(ids).size !== ids.length) {
         return makeErrorResult("Duplicate task ids in transitions", board);
       }
-      const edits: TaskEdit[] = params.transitions.map((transition) => ({
+      const edits: AdvanceEdit[] = params.transitions.map((transition) => ({
         id: transition.id,
         type: "advance" as const,
         data: transition.evidence ? { evidence: transition.evidence } : undefined,
@@ -555,19 +579,7 @@ export function createAdvanceTasksTool(
         setBoard(newBoard);
 
         for (const edit of edits) {
-          const original = board.tasks.find((t) => t.id === edit.id);
-          const updated = newBoard.tasks.find((t) => t.id === edit.id);
-          const event: TaskWorkflowEvent =
-            original && updated
-              ? {
-                  type: "advance_task",
-                  id: edit.id,
-                  from: original.status as "implementing" | "reviewing",
-                  to: updated.status as "reviewing" | "done",
-                  evidence: edit.type === "advance" ? edit.data?.evidence : undefined,
-                }
-              : { type: "advance_task", id: edit.id, from: "implementing", to: "reviewing" };
-          pi.appendEntry(CUSTOM_EVENT_TYPE, event);
+          pi.appendEntry(CUSTOM_EVENT_TYPE, advanceEvent(edit, board, newBoard));
         }
         pi.appendEntry(CUSTOM_SNAPSHOT_TYPE, newBoard);
         updateUI(ctx, newBoard);
@@ -713,6 +725,25 @@ function clearExecution(board: Readonly<TaskBoardSnapshot>, params: WorkflowGate
   };
 }
 
+function applyWorkflowGate(
+  board: Readonly<TaskBoardSnapshot>,
+  params: WorkflowGateInput,
+  now: string,
+): GateResult {
+  switch (params.action) {
+    case "wait_for_decision":
+      return waitForDecision(board, params, now);
+    case "bind_execution":
+      return bindExecution(board, params);
+    case "clear_execution":
+      return clearExecution(board, params);
+    default: {
+      const unsupported: never = params.action;
+      throw new Error(`Unsupported workflow gate: ${String(unsupported)}`);
+    }
+  }
+}
+
 export function createWorkflowGateTool(
   pi: ExtensionAPI,
 ): ToolDefinition<typeof WorkflowGateParams, TaskToolDetails> {
@@ -736,12 +767,7 @@ export function createWorkflowGateTool(
       }
       const now = new Date().toISOString();
       try {
-        const result =
-          params.action === "wait_for_decision"
-            ? waitForDecision(board, params, now)
-            : params.action === "bind_execution"
-              ? bindExecution(board, params)
-              : clearExecution(board, params);
+        const result = applyWorkflowGate(board, params, now);
         setBoard(result.board);
         persistEntries(pi, result.event, result.board);
         updateUI(ctx, result.board);

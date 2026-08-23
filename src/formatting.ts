@@ -104,8 +104,7 @@ export function formatHiddenContext(board: TaskBoardSnapshot): string {
   const counts = getStatusCounts(board);
   lines.push(
     `Status: ${Object.entries(counts)
-      .filter(([, c]) => c > 0)
-      .map(([s, c]) => `${c} ${s}`)
+      .flatMap(([status, count]) => (count > 0 ? [`${count} ${status}`] : []))
       .join(", ")}`,
   );
 
@@ -205,7 +204,7 @@ export function formatContinuePrompt(board: TaskBoardSnapshot): string {
 /** Format the "all done" terminal message. */
 export function formatAllDoneMessage(board: TaskBoardSnapshot): string {
   if (board.phases.length === 0) return "All tasks resolved.";
-  const lastPhaseRecord = board.phases[board.phases.length - 1];
+  const lastPhaseRecord = board.phases.at(-1);
   if (!lastPhaseRecord) return "All tasks resolved.";
   return `All tasks resolved. ${phaseLabel(board, lastPhaseRecord.phase)} complete.`;
 }

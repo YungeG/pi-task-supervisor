@@ -84,22 +84,25 @@ function migrateLegacySnapshot(snapshot: LegacyTaskBoardSnapshot): TaskBoardSnap
  */
 export function reconstructState(ctx: ExtensionContext): TaskBoardSnapshot {
   const branch = ctx.sessionManager.getBranch();
+  let latestV2: TaskBoardSnapshot | undefined;
+  let latestLegacy: LegacyTaskBoardSnapshot | undefined;
 
-  for (let i = branch.length - 1; i >= 0; i--) {
-    const entry = branch[i];
-    if (!entry) continue;
+  for (const entry of branch) {
     if (entry.type !== "custom") continue;
     const customType = (entry as { customType?: string }).customType;
     const data = (entry as { data?: unknown }).data;
-    if (customType === CUSTOM_SNAPSHOT_TYPE && isValidSnapshotV2(data)) {
-      return cloneBoard(data);
-    }
     if (customType === LEGACY_CUSTOM_SNAPSHOT_TYPE && isValidLegacySnapshot(data)) {
-      return migrateLegacySnapshot(data);
+      if (latestV2) return createEmptyBoard();
+      latestLegacy = structuredClone(data);
+      continue;
     }
+    if (customType !== CUSTOM_SNAPSHOT_TYPE || !isValidSnapshotV2(data)) continue;
+    if (latestV2 && data.generation <= latestV2.generation) return createEmptyBoard();
+    latestV2 = cloneBoard(data);
   }
 
-  return createEmptyBoard();
+  if (latestV2) return latestV2;
+  return latestLegacy ? migrateLegacySnapshot(latestLegacy) : createEmptyBoard();
 }
 
 // ── Persistence Helpers ──

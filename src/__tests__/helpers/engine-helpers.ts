@@ -42,9 +42,9 @@ export function makeCompiledBoard(
     board,
     {
       mode: "replace",
-      phases: phaseOrder.map((pn) => ({
-        title: `Phase ${pn}`,
-        tasks: phaseGroups.get(pn)!,
+      phases: phaseOrder.map((phaseNum) => ({
+        title: `Phase ${phaseNum}`,
+        tasks: phaseGroups.get(phaseNum)!,
       })),
     },
     NOW,

@@ -112,6 +112,49 @@ describe("continuous-tasks command", () => {
     expect(mockAPI.sendMessage).not.toHaveBeenCalled();
   });
 
+  it.each([
+    ["pause", "Continuous Tasks is not active"],
+    ["resume", "Continuous Tasks is not paused"],
+    ["resolve decision-1 answer", "No decision is waiting"],
+    ["unknown", "Usage: /continuous-tasks"],
+  ])("reports invalid command state for %s", async (args, expected) => {
+    const mockAPI = createMockAPI();
+    registerCommands(mockAPI.api);
+    const ctx = createMockContext() as ExtensionCommandContext;
+    setBoard({ ...activeBoard(), workflowStatus: args === "pause" ? "paused" : "active" });
+
+    await commandHandler(mockAPI)(args, ctx);
+
+    expect(ctx.ui.notify).toHaveBeenCalledWith(expect.stringContaining(expected), "error");
+  });
+
+  it("rejects a stale decision id and secret-like answer", async () => {
+    const mockAPI = createMockAPI();
+    registerCommands(mockAPI.api);
+    const ctx = createMockContext() as ExtensionCommandContext;
+    const waiting = {
+      ...activeBoard(),
+      workflowStatus: "waiting_for_decision" as const,
+      decision: {
+        id: "decision-6",
+        taskId: "t-1.1",
+        question: "Choose",
+        whyUserOwned: "Product decision",
+        createdAt: NOW,
+      },
+    };
+    setBoard(waiting);
+    await commandHandler(mockAPI)("resolve decision-5 answer", ctx);
+    expect(ctx.ui.notify).toHaveBeenCalledWith("Decision id does not match decision-6", "error");
+
+    setBoard(waiting);
+    await commandHandler(mockAPI)("resolve decision-6 token=secret-value-123456", ctx);
+    expect(ctx.ui.notify).toHaveBeenCalledWith(
+      "Decision answer is empty, too long, or secret-like",
+      "error",
+    );
+  });
+
   it("reports status without starting a model turn", async () => {
     const mockAPI = createMockAPI();
     registerCommands(mockAPI.api);

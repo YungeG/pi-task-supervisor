@@ -1,7 +1,8 @@
 {
-  "name": "@harms-haus/pi-tasks",
-  "version": "0.1.0",
-  "description": "pi-coding-agent extension: phased task workflow with dependency tracking and strict status gating",
+  "name": "continuous-tasks-local",
+  "version": "0.1.0-local.0",
+  "private": true,
+  "description": "Session-scoped continuous execution with phased tasks, settled continuation, and evidence gates",
   "keywords": [
     "pi-package"
   ],
@@ -12,36 +13,33 @@
       "./src/index.ts"
     ]
   },
-  "publishConfig": {
-    "access": "public"
-  },
-  "repository": {
-    "type": "git",
-    "url": "git+https://github.com/harms-haus/pi-tasks.git"
-  },
   "files": [
     "src/**/*.ts",
     "!src/__tests__/**",
     "docs/",
     "README.md",
     "CHANGELOG.md",
-    "LICENSE"
+    "LICENSE",
+    "LICENSE.upstream",
+    "UPSTREAM.md"
   ],
   "scripts": {
     "lint": "eslint src/",
     "test": "vitest run",
     "test:watch": "vitest",
     "test:coverage": "vitest run --coverage",
+    "test:smoke": "node test/real-pi-smoke.mjs",
+    "check": "npm run typecheck && npm run lint && npm run format:check && npm run test:coverage && npm run test:smoke",
     "format": "prettier --write src/",
     "format:check": "prettier --check src/",
     "typecheck": "tsc --noEmit",
     "lint:fix": "eslint --fix src/"
   },
   "peerDependencies": {
-    "@earendil-works/pi-ai": "*",
-    "@earendil-works/pi-coding-agent": "*",
-    "@earendil-works/pi-tui": "*",
-    "typebox": "*"
+    "@earendil-works/pi-ai": "0.84.2",
+    "@earendil-works/pi-coding-agent": "0.84.2",
+    "@earendil-works/pi-tui": "0.84.2",
+    "typebox": "1.3.7"
   },
   "devDependencies": {
     "@earendil-works/pi-ai": "0.84.2",
@@ -58,7 +56,7 @@
     "typescript-eslint": "^8.59.3",
     "vitest": "^4.1.6"
   },
-  "author": "harms-haus",
+  "author": "harms-haus; local fork maintained by ygguo",
   "engines": {
     "node": ">=22.0.0"
   },

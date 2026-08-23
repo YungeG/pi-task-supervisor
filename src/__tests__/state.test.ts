@@ -91,6 +91,7 @@ describe("state", () => {
 
     it("finds the latest snapshot in reverse scan", () => {
       const firstSnapshot = makeSampleBoard({
+        generation: 1,
         tasks: [
           ...makeSampleBoard().tasks,
           {
@@ -106,7 +107,7 @@ describe("state", () => {
           },
         ],
       });
-      const secondSnapshot = makeSampleBoard();
+      const secondSnapshot = makeSampleBoard({ generation: 2 });
 
       const branch = [
         snapshotEntry(firstSnapshot),

@@ -90,18 +90,12 @@ describe("config", () => {
       await expect(loadConfig()).resolves.toEqual(DEFAULT_CONFIG);
     });
 
-    it("logs non-ENOENT read failures without exposing config content", async () => {
-      const warnSpy = vi.spyOn(console, "warn").mockImplementation(() => undefined);
+    it("fails closed on unreadable configuration", async () => {
       const error = new Error("permission denied") as NodeJS.ErrnoException;
       error.code = "EACCES";
       mockReadFile.mockRejectedValue(error);
 
       await expect(loadConfig()).resolves.toEqual(DEFAULT_CONFIG);
-      expect(warnSpy).toHaveBeenCalledWith(
-        "[continuous-tasks] Failed to load config:",
-        expect.stringContaining("permission"),
-      );
-      warnSpy.mockRestore();
     });
 
     it("caches the decoded config", async () => {
