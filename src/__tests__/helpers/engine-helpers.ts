@@ -94,6 +94,20 @@ export function makeBoardWithStatuses(
       status: t.status,
       createdAt: NOW,
       updatedAt: NOW,
+      completionEvidence:
+        t.status === "done"
+          ? {
+              summary: "Test completion",
+              refs: [
+                {
+                  kind: "review",
+                  label: "test review",
+                  status: "passed",
+                  ref: "test://review",
+                },
+              ],
+            }
+          : undefined,
     });
   }
   return board;

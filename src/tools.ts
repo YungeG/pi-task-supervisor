@@ -22,14 +22,7 @@ import {
 import type { TaskBoardSnapshot, TaskEdit, TaskWorkflowEvent } from "./types";
 import { writeTasks, applyEdits, compileBoard, createEmptyBoard, claimReadyTasks } from "./engine";
 import { getStatusCounts } from "./validation";
-import {
-  getBoardRef,
-  setBoard,
-  persistEntries,
-  updateUI,
-  getLastToolWasAdvance,
-  setLastToolWasAdvance,
-} from "./state";
+import { getBoardRef, setBoard, persistEntries, updateUI } from "./state";
 import { loadConfig, resolvePhasePrompt } from "./config";
 import {
   formatBoardText,
@@ -340,12 +333,12 @@ export function createCompileTasksTool(
     name: "compile_tasks",
     label: "Compile Tasks",
     description:
-      "Validate and compile the task board. Checks for cycles, invalid dependencies, and duplicate ids. Moves draft tasks to 'configured' and computes which tasks are 'ready' based on phase gating and dependency resolution.",
+      "Validate and compile the task board with an explicit final acceptance task. Checks cycles, dependencies, acceptance coverage, and phase gating before enabling autonomous execution.",
     parameters: CompileTasksParams,
     promptSnippet: undefined,
     promptGuidelines: undefined,
 
-    async execute(_toolCallId, _params, _signal, _onUpdate, ctx) {
+    async execute(_toolCallId, params, _signal, _onUpdate, ctx) {
       const board = getBoardRef();
       const now = new Date().toISOString();
 
@@ -353,7 +346,7 @@ export function createCompileTasksTool(
       const beforePhases = board.phases.map((p) => ({ ...p }));
 
       try {
-        const newBoard = compileBoard(board, now);
+        const newBoard = compileBoard(board, now, params.finalAcceptanceTaskId);
 
         // Detect phase completion and set pending prompt
         await checkAndSetPhaseCompletion(beforePhases, newBoard);
@@ -531,25 +524,28 @@ export function createAdvanceTasksTool(
     name: "advance_tasks",
     label: "Advance Tasks",
     description:
-      "Advance tasks through their lifecycle: implementing → reviewing → done. Each call advances each task by one step. Tasks must be in 'implementing' or 'reviewing' status.",
+      "Advance tasks through implementing → reviewing → done. Reviewing tasks require bounded completion evidence; evidence is rejected before review or when validation failed.",
     parameters: AdvanceTasksParams,
     promptSnippet: "advance_tasks: move tasks implementing → reviewing → done",
     promptGuidelines: [
       "Use advance_tasks to advance claimed tasks through implementing → reviewing → done.",
-      "Each call advances by one step: implementing→reviewing, then reviewing→done.",
-      "IMPORTANT: Do NOT skip the review step. After advancing to reviewing, review the work before advancing to done.",
+      "Each transition advances one task by one step; provide evidence only for reviewing→done.",
+      "Do not mark reviewing tasks done until review and required validation evidence are available.",
     ],
 
     async execute(_toolCallId, params, _signal, _onUpdate, ctx) {
-      const wasConsecutive = getLastToolWasAdvance();
-      setLastToolWasAdvance(true);
-
       const board = getBoardRef();
       const now = new Date().toISOString();
       const beforePhases = board.phases.map((p) => ({ ...p }));
-
-      const uniqueIds = [...new Set(params.ids)];
-      const edits: TaskEdit[] = uniqueIds.map((id) => ({ id, type: "advance" as const }));
+      const ids = params.transitions.map((transition) => transition.id);
+      if (new Set(ids).size !== ids.length) {
+        return makeErrorResult("Duplicate task ids in transitions", board);
+      }
+      const edits: TaskEdit[] = params.transitions.map((transition) => ({
+        id: transition.id,
+        type: "advance" as const,
+        data: transition.evidence ? { evidence: transition.evidence } : undefined,
+      }));
 
       try {
         const newBoard = applyEdits(board, edits, now);
@@ -567,6 +563,7 @@ export function createAdvanceTasksTool(
                   id: edit.id,
                   from: original.status as "implementing" | "reviewing",
                   to: updated.status as "reviewing" | "done",
+                  evidence: edit.type === "advance" ? edit.data?.evidence : undefined,
                 }
               : { type: "advance_task", id: edit.id, from: "implementing", to: "reviewing" };
           pi.appendEntry(CUSTOM_EVENT_TYPE, event);
@@ -581,11 +578,10 @@ export function createAdvanceTasksTool(
           : formatBoardText(newBoard, { activePhaseOnly: true, counts });
 
         const summary = formatSummaryLine(newBoard, counts);
-        let text = `Advanced ${edits.length} task(s). ${summary}\n\n${boardText}`;
-        if (wasConsecutive) {
-          text = `⚠️ Review should not be skipped. Please actually review the work before advancing to done.\n\n${text}`;
-        }
-        return makeSuccessResult(text, newBoard);
+        return makeSuccessResult(
+          `Advanced ${edits.length} task(s). ${summary}\n\n${boardText}`,
+          newBoard,
+        );
       } catch (err) {
         return makeErrorResult(err instanceof Error ? err.message : String(err), board);
       }
@@ -594,7 +590,7 @@ export function createAdvanceTasksTool(
     renderCall(args, theme) {
       return new Text(
         theme.fg("toolTitle", theme.bold("advance_tasks ")) +
-          theme.fg("muted", `(${args.ids.length} tasks)`),
+          theme.fg("muted", `(${args.transitions.length} tasks)`),
         0,
         0,
       );

@@ -52,7 +52,13 @@ export const EditTasksParams = Type.Object({
   ),
 });
 
-export const CompileTasksParams = Type.Object({});
+export const CompileTasksParams = Type.Object({
+  finalAcceptanceTaskId: Type.String({
+    description: "Task id in the final phase that owns final acceptance",
+    minLength: 1,
+    maxLength: 100,
+  }),
+});
 
 export const ClearTasksParams = Type.Object({});
 
@@ -60,6 +66,29 @@ export const GetReadyTasksParams = Type.Object({
   count: Type.Integer({ description: "Number of tasks to claim (>= 1)", minimum: 1 }),
 });
 
+const EvidenceRefParams = Type.Object({
+  kind: StringEnum(["command", "review", "artifact", "diff"] as const),
+  label: Type.String({ minLength: 1, maxLength: 200 }),
+  status: StringEnum(["passed", "fixed", "deferred"] as const),
+  ref: Type.Optional(Type.String({ minLength: 1, maxLength: 500 })),
+  exitCode: Type.Optional(Type.Integer()),
+  digest: Type.Optional(Type.String({ minLength: 1, maxLength: 200 })),
+});
+
+const CompletionEvidenceParams = Type.Object({
+  summary: Type.String({ minLength: 1, maxLength: 1000 }),
+  refs: Type.Array(EvidenceRefParams, { minItems: 1, maxItems: 20 }),
+  residualRisks: Type.Optional(
+    Type.Array(Type.String({ minLength: 1, maxLength: 500 }), { maxItems: 20 }),
+  ),
+});
+
 export const AdvanceTasksParams = Type.Object({
-  ids: Type.Array(Type.String(), { description: "Task IDs to advance", maxItems: 50 }),
+  transitions: Type.Array(
+    Type.Object({
+      id: Type.String({ minLength: 1, maxLength: 100 }),
+      evidence: Type.Optional(CompletionEvidenceParams),
+    }),
+    { minItems: 1, maxItems: 50 },
+  ),
 });

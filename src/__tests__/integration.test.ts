@@ -18,6 +18,29 @@ async function callExecute(tool: any, params: any, ctx: any): Promise<any> {
   return await tool.execute("test-call-id", params, undefined, undefined, ctx);
 }
 
+function advance(...ids: string[]) {
+  return { transitions: ids.map((id) => ({ id })) };
+}
+
+function complete(...ids: string[]) {
+  return {
+    transitions: ids.map((id) => ({
+      id,
+      evidence: {
+        summary: "Reviewed and validated",
+        refs: [
+          {
+            kind: "review" as const,
+            label: "integration review",
+            status: "passed" as const,
+            ref: "test://integration-review",
+          },
+        ],
+      },
+    })),
+  };
+}
+
 /** Extract the snapshot from a tool result. */
 function snapshot(result: any): TaskBoardSnapshot {
   return result.details.snapshot as TaskBoardSnapshot;
@@ -160,7 +183,7 @@ describe("full lifecycle integration", () => {
     expect(findTask(afterClaim1, "t-1.2").status).toBe("implementing");
 
     // ── Step 5: advance_tasks A and B to reviewing ──
-    const advanceResult1 = await callExecute(advanceTool, { ids: ["t-1.1", "t-1.2"] }, ctx);
+    const advanceResult1 = await callExecute(advanceTool, advance("t-1.1", "t-1.2"), ctx);
 
     expect(advanceResult1.details.error).toBeUndefined();
     const afterReview1 = snapshot(advanceResult1);
@@ -168,7 +191,7 @@ describe("full lifecycle integration", () => {
     expect(findTask(afterReview1, "t-1.2").status).toBe("reviewing");
 
     // ── Step 6: advance_tasks A and B to done ──
-    const advanceResult2 = await callExecute(advanceTool, { ids: ["t-1.1", "t-1.2"] }, ctx);
+    const advanceResult2 = await callExecute(advanceTool, complete("t-1.1", "t-1.2"), ctx);
 
     expect(advanceResult2.details.error).toBeUndefined();
     const afterDone1 = snapshot(advanceResult2);
@@ -208,9 +231,9 @@ describe("full lifecycle integration", () => {
     expect(findTask(afterClaim2, "t-2.2").status).toBe("implementing");
 
     // ── Step 10: advance C and D through reviewing → done ──
-    await callExecute(advanceTool, { ids: ["t-2.1", "t-2.2"] }, ctx); // → reviewing
+    await callExecute(advanceTool, advance("t-2.1", "t-2.2"), ctx); // → reviewing
 
-    const advanceResult4 = await callExecute(advanceTool, { ids: ["t-2.1", "t-2.2"] }, ctx); // → done
+    const advanceResult4 = await callExecute(advanceTool, complete("t-2.1", "t-2.2"), ctx); // → done
 
     expect(advanceResult4.details.error).toBeUndefined();
     const afterDone2 = snapshot(advanceResult4);
@@ -244,9 +267,9 @@ describe("full lifecycle integration", () => {
     expect(findTask(afterClaim3, "t-3.2").status).toBe("implementing");
 
     // ── Step 14: advance both through reviewing → done ──
-    await callExecute(advanceTool, { ids: ["t-3.1", "t-3.2"] }, ctx); // → reviewing
+    await callExecute(advanceTool, advance("t-3.1", "t-3.2"), ctx); // → reviewing
 
-    const advanceResult6 = await callExecute(advanceTool, { ids: ["t-3.1", "t-3.2"] }, ctx); // → done
+    const advanceResult6 = await callExecute(advanceTool, complete("t-3.1", "t-3.2"), ctx); // → done
 
     expect(advanceResult6.details.error).toBeUndefined();
     const afterDone3 = snapshot(advanceResult6);

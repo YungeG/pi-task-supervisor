@@ -1,6 +1,27 @@
 import { describe, it, expect } from "vitest";
 import { createEmptyBoard, writeTasks, applyEdits, claimReadyTasks } from "../engine";
+import type { TaskEdit } from "../types";
 import { NOW, makeCompiledBoard } from "./helpers/engine-helpers";
+
+function completeTask(id: string): TaskEdit {
+  return {
+    id,
+    type: "advance",
+    data: {
+      evidence: {
+        summary: "Reviewed and validated",
+        refs: [
+          {
+            kind: "review",
+            label: "test review",
+            status: "passed",
+            ref: "test://review",
+          },
+        ],
+      },
+    },
+  };
+}
 
 // ═══════════════════════════════════════════
 // 4. applyEdits — advance
@@ -26,7 +47,7 @@ describe("applyEdits — advance", () => {
     board = applyEdits(board, [{ id: "t-1.1", type: "advance" }], NOW);
     expect(board.tasks[0]!.status).toBe("reviewing");
 
-    const result = applyEdits(board, [{ id: "t-1.1", type: "advance" }], NOW);
+    const result = applyEdits(board, [completeTask("t-1.1")], NOW);
     expect(result.tasks[0]!.status).toBe("done");
   });
 
@@ -48,7 +69,7 @@ describe("applyEdits — advance", () => {
     board = applyEdits(board, [{ id: "t-1.1", type: "advance" }], NOW);
 
     // Advance A to done
-    board = applyEdits(board, [{ id: "t-1.1", type: "advance" }], NOW);
+    board = applyEdits(board, [completeTask("t-1.1")], NOW);
 
     expect(board.tasks[0]!.status).toBe("done");
     // B should now be ready since its only dependency (A) is done
@@ -95,7 +116,7 @@ describe("applyEdits — advance", () => {
     let board = makeCompiledBoard([{ title: "A", prompt: "P", profile: "c", phase: 1 }]);
     board = claimReadyTasks(board, 1, NOW).board;
     board = applyEdits(board, [{ id: "t-1.1", type: "advance" }], NOW); // → reviewing
-    board = applyEdits(board, [{ id: "t-1.1", type: "advance" }], NOW); // → done
+    board = applyEdits(board, [completeTask("t-1.1")], NOW); // → done
 
     expect(() => applyEdits(board, [{ id: "t-1.1", type: "advance" }], NOW)).toThrow(
       /Cannot advance task/,
@@ -120,7 +141,7 @@ describe("applyEdits — advance", () => {
     expect(result.tasks[0]!.status).toBe("reviewing");
 
     // reviewing → done is the second advance
-    const result2 = applyEdits(result, [{ id: "t-1.1", type: "advance" }], NOW);
+    const result2 = applyEdits(result, [completeTask("t-1.1")], NOW);
     expect(result2.tasks[0]!.status).toBe("done");
 
     // No way to go directly from implementing to done — it goes through reviewing
@@ -189,7 +210,7 @@ describe("applyEdits — abandon", () => {
     let board = makeCompiledBoard([{ title: "A", prompt: "P", profile: "c", phase: 1 }]);
     board = claimReadyTasks(board, 1, NOW).board;
     board = applyEdits(board, [{ id: "t-1.1", type: "advance" }], NOW);
-    board = applyEdits(board, [{ id: "t-1.1", type: "advance" }], NOW);
+    board = applyEdits(board, [completeTask("t-1.1")], NOW);
     expect(board.tasks[0]!.status).toBe("done");
 
     expect(() => applyEdits(board, [{ id: "t-1.1", type: "abandon" }], NOW)).toThrow(
@@ -252,7 +273,7 @@ describe("applyEdits — abandon", () => {
     let board = makeCompiledBoard([{ title: "A", prompt: "P", profile: "c", phase: 1 }]);
     board = claimReadyTasks(board, 1, NOW).board;
     board = applyEdits(board, [{ id: "t-1.1", type: "advance" }], NOW);
-    board = applyEdits(board, [{ id: "t-1.1", type: "advance" }], NOW);
+    board = applyEdits(board, [completeTask("t-1.1")], NOW);
     expect(board.tasks[0]!.status).toBe("done");
     expect(() => applyEdits(board, [{ id: "t-1.1", type: "abandon" }], NOW)).toThrow(
       /Already resolved/,
@@ -354,7 +375,7 @@ describe("applyEdits — data", () => {
     // Phase 1 active, A ready, B configured (phase 2 pending)
     board = claimReadyTasks(board, 1, NOW).board;
     board = applyEdits(board, [{ id: "t-1.1", type: "advance" }], NOW); // → reviewing
-    board = applyEdits(board, [{ id: "t-1.1", type: "advance" }], NOW); // → done
+    board = applyEdits(board, [completeTask("t-1.1")], NOW); // → done
 
     // Now phase 1 is done, phase 2 active, B is ready
     expect(board.tasks[1]!.status).toBe("ready");

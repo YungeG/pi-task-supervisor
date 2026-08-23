@@ -1,4 +1,11 @@
-import type { LegacyTaskBoardSnapshot, TaskBoardSnapshot, TaskRecord, TaskStatus } from "./types";
+import type {
+  CompletionEvidence,
+  EvidenceRef,
+  LegacyTaskBoardSnapshot,
+  TaskBoardSnapshot,
+  TaskRecord,
+  TaskStatus,
+} from "./types";
 import { TERMINAL_STATUSES, ACTIVE_STATUSES } from "./types";
 
 // ── String Validation ──
@@ -140,18 +147,85 @@ const VALID_TASK_STATUSES = new Set([
 ]);
 
 const VALID_PHASE_STATUSES = new Set(["pending", "active", "completed"]);
+const VALID_EVIDENCE_KINDS = new Set(["command", "review", "artifact", "diff"]);
+const VALID_EVIDENCE_STATUSES = new Set(["passed", "fixed", "deferred"]);
+const SECRET_LIKE =
+  /\b(?:Bearer\s+[A-Za-z0-9._-]{8,}|(?:api[_-]?key|token|password)\s*[:=]\s*\S+|(?:sk|ghp|pt|dt)_[A-Za-z0-9_-]{8,})/i;
 
-function isValidTask(t: unknown): boolean {
+function boundedText(value: unknown, maxLength: number): value is string {
+  return (
+    typeof value === "string" &&
+    value.trim().length > 0 &&
+    value.length <= maxLength &&
+    !SECRET_LIKE.test(value)
+  );
+}
+
+function evidenceRefError(ref: EvidenceRef): string | undefined {
+  if (!VALID_EVIDENCE_KINDS.has(ref.kind)) return `Invalid evidence kind: ${ref.kind}`;
+  if (!VALID_EVIDENCE_STATUSES.has(ref.status)) return `Invalid evidence status: ${ref.status}`;
+  if (!boundedText(ref.label, 200)) return "Evidence label is invalid or secret-like";
+  if (ref.ref !== undefined && !boundedText(ref.ref, 500)) {
+    return "Evidence ref is invalid or secret-like";
+  }
+  if (ref.digest !== undefined && !boundedText(ref.digest, 200)) {
+    return "Evidence digest is invalid or secret-like";
+  }
+  if (ref.exitCode !== undefined && !Number.isInteger(ref.exitCode)) {
+    return "Evidence exitCode must be an integer";
+  }
+  if (ref.kind === "command" && ref.exitCode !== 0) {
+    return "Command evidence must have exitCode 0";
+  }
+  if (ref.status === "fixed" && ref.ref === undefined) {
+    return "Fixed evidence must reference a finding or report";
+  }
+  return undefined;
+}
+
+export function completionEvidenceError(
+  evidence: CompletionEvidence | undefined,
+): string | undefined {
+  if (!evidence) return "Completion evidence is required";
+  if (!boundedText(evidence.summary, 1000)) {
+    return "Completion evidence summary is invalid or secret-like";
+  }
+  if (!Array.isArray(evidence.refs) || evidence.refs.length < 1 || evidence.refs.length > 20) {
+    return "Completion evidence must contain 1-20 refs";
+  }
+  for (const ref of evidence.refs) {
+    const error = evidenceRefError(ref);
+    if (error) return error;
+  }
+  if (!evidence.refs.some((ref) => ref.status === "passed")) {
+    return "Completion evidence must include at least one passed ref";
+  }
+  if (
+    evidence.residualRisks !== undefined &&
+    (evidence.residualRisks.length > 20 ||
+      !evidence.residualRisks.every((risk) => boundedText(risk, 500)))
+  ) {
+    return "Residual risks are invalid or secret-like";
+  }
+  return undefined;
+}
+
+function isValidTask(t: unknown, requireEvidence: boolean): boolean {
   if (typeof t !== "object" || t === null) return false;
   const task = t as Record<string, unknown>;
-  return (
+  const validShape =
     typeof task.id === "string" &&
     typeof task.title === "string" &&
     typeof task.status === "string" &&
     VALID_TASK_STATUSES.has(task.status) &&
     typeof task.phase === "number" &&
     Array.isArray(task.dependencies) &&
-    (task.dependencies as unknown[]).every((d) => typeof d === "string")
+    (task.dependencies as unknown[]).every((d) => typeof d === "string");
+  if (!validShape) return false;
+  return (
+    !requireEvidence ||
+    task.status !== "done" ||
+    completionEvidenceError(task.completionEvidence as CompletionEvidence) === undefined
   );
 }
 
@@ -173,11 +247,14 @@ const VALID_WORKFLOW_STATUSES = new Set([
   "completed",
 ]);
 
-function hasValidTaskAndPhaseArrays(obj: Record<string, unknown>): boolean {
+function hasValidTaskAndPhaseArrays(
+  obj: Record<string, unknown>,
+  requireEvidence: boolean,
+): boolean {
   return (
     Array.isArray(obj.tasks) &&
     Array.isArray(obj.phases) &&
-    (obj.tasks as unknown[]).every(isValidTask) &&
+    (obj.tasks as unknown[]).every((task) => isValidTask(task, requireEvidence)) &&
     (obj.phases as unknown[]).every(isValidPhaseRecord)
   );
 }
@@ -186,7 +263,7 @@ function hasValidTaskAndPhaseArrays(obj: Record<string, unknown>): boolean {
 export function isValidLegacySnapshot(data: unknown): data is LegacyTaskBoardSnapshot {
   if (typeof data !== "object" || data === null) return false;
   const obj = data as Record<string, unknown>;
-  return obj.version === 1 && hasValidTaskAndPhaseArrays(obj);
+  return obj.version === 1 && hasValidTaskAndPhaseArrays(obj, false);
 }
 
 function hasValidV2Metadata(obj: Record<string, unknown>): boolean {
@@ -233,7 +310,7 @@ function hasConsistentWorkflowState(obj: Record<string, unknown>): boolean {
 export function isValidSnapshotV2(data: unknown): data is TaskBoardSnapshot {
   if (typeof data !== "object" || data === null) return false;
   const obj = data as Record<string, unknown>;
-  if (obj.version !== 2 || !hasValidTaskAndPhaseArrays(obj) || !hasValidV2Metadata(obj)) {
+  if (obj.version !== 2 || !hasValidTaskAndPhaseArrays(obj, true) || !hasValidV2Metadata(obj)) {
     return false;
   }
   return hasConsistentWorkflowState(obj);

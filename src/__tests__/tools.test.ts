@@ -27,6 +27,29 @@ async function callExecute(tool: any, params: any, ctx?: any): Promise<any> {
   );
 }
 
+function advance(...ids: string[]) {
+  return { transitions: ids.map((id) => ({ id })) };
+}
+
+function complete(...ids: string[]) {
+  return {
+    transitions: ids.map((id) => ({
+      id,
+      evidence: {
+        summary: "Reviewed and validated",
+        refs: [
+          {
+            kind: "review" as const,
+            label: "test review",
+            status: "passed" as const,
+            ref: "test://review",
+          },
+        ],
+      },
+    })),
+  };
+}
+
 // ═══════════════════════════════════════════
 // 1. write_tasks
 // ═══════════════════════════════════════════
@@ -702,7 +725,7 @@ describe("advance_tasks tool", () => {
     await callExecute(getReadyTool, { count: 1 }, ctx);
     // t-1.1 is implementing
 
-    const result = await callExecute(advanceTool, { ids: ["t-1.1"] }, ctx);
+    const result = await callExecute(advanceTool, advance("t-1.1"), ctx);
 
     const r = result as { details: { snapshot: TaskBoardSnapshot; error?: string } };
     expect(r.details.error).toBeUndefined();
@@ -745,10 +768,10 @@ describe("advance_tasks tool", () => {
     await callExecute(getReadyTool, { count: 1 }, ctx);
     // t-1.1 implementing
 
-    await callExecute(advanceTool, { ids: ["t-1.1"] }, ctx);
+    await callExecute(advanceTool, advance("t-1.1"), ctx);
     // t-1.1 reviewing
 
-    const result = await callExecute(advanceTool, { ids: ["t-1.1"] }, ctx);
+    const result = await callExecute(advanceTool, complete("t-1.1"), ctx);
     // t-1.1 done
 
     const r = result as { details: { snapshot: TaskBoardSnapshot; error?: string } };
@@ -784,7 +807,7 @@ describe("advance_tasks tool", () => {
     await callExecute(getReadyTool, { count: 2 }, ctx);
     // Both implementing
 
-    const result = await callExecute(advanceTool, { ids: ["t-1.1", "t-1.2"] }, ctx);
+    const result = await callExecute(advanceTool, advance("t-1.1", "t-1.2"), ctx);
 
     const r = result as { details: { snapshot: TaskBoardSnapshot; error?: string } };
     expect(r.details.error).toBeUndefined();
@@ -806,7 +829,7 @@ describe("advance_tasks tool", () => {
     );
     // t-1.1 is draft (not compiled)
 
-    const result = await callExecute(advanceTool, { ids: ["t-1.1"] }, ctx);
+    const result = await callExecute(advanceTool, advance("t-1.1"), ctx);
 
     const r = result as { details: { error?: string } };
     expect(r.details.error).toBeDefined();
@@ -842,7 +865,7 @@ describe("advance_tasks tool", () => {
     await callExecute(compileTool, {}, ctx);
     // B is configured (blocked by A)
 
-    const result = await callExecute(advanceTool, { ids: ["t-1.2"] }, ctx);
+    const result = await callExecute(advanceTool, advance("t-1.2"), ctx);
 
     const r = result as { details: { error?: string } };
     expect(r.details.error).toBeDefined();
@@ -851,13 +874,13 @@ describe("advance_tasks tool", () => {
   it("errors on nonexistent task", async () => {
     const advanceTool = createAdvanceTasksTool(api);
 
-    const result = await callExecute(advanceTool, { ids: ["t-999.1"] }, ctx);
+    const result = await callExecute(advanceTool, advance("t-999.1"), ctx);
 
     const r = result as { details: { error?: string } };
     expect(r.details.error).toBeDefined();
   });
 
-  it("shows double-advance warning when advanceWarningPending is set", async () => {
+  it("accepts reviewing to done with explicit evidence", async () => {
     const writeTool = createWriteTasksTool(api);
     const compileTool = createCompileTasksTool(api);
     const getReadyTool = createGetReadyTasksTool(api);
@@ -875,11 +898,11 @@ describe("advance_tasks tool", () => {
     await callExecute(getReadyTool, { count: 1 }, ctx);
     // t-1.1 implementing
 
-    await callExecute(advanceTool, { ids: ["t-1.1"] }, ctx);
+    await callExecute(advanceTool, advance("t-1.1"), ctx);
     // t-1.1 reviewing
 
-    // Second consecutive advance triggers the warning (wasConsecutive = true)
-    const result = await callExecute(advanceTool, { ids: ["t-1.1"] }, ctx);
+    // Completion requires explicit review evidence.
+    const result = await callExecute(advanceTool, complete("t-1.1"), ctx);
     // t-1.1 done
 
     const r = result as {
@@ -887,11 +910,12 @@ describe("advance_tasks tool", () => {
       details: { snapshot: TaskBoardSnapshot; error?: string };
     };
     expect(r.details.error).toBeUndefined();
-    expect(r.content[0]!.text).toContain("Review should not be skipped");
+    expect(r.content[0]!.text).toContain("Advanced 1 task");
     expect(r.details.snapshot.tasks[0]!.status).toBe("done");
+    expect(r.details.snapshot.tasks[0]!.completionEvidence).toBeDefined();
   });
 
-  it("deduplicates IDs", async () => {
+  it("rejects duplicate transition IDs", async () => {
     const writeTool = createWriteTasksTool(api);
     const compileTool = createCompileTasksTool(api);
     const getReadyTool = createGetReadyTasksTool(api);
@@ -909,18 +933,17 @@ describe("advance_tasks tool", () => {
     await callExecute(getReadyTool, { count: 1 }, ctx);
     // t-1.1 is implementing
 
-    const result = await callExecute(advanceTool, { ids: ["t-1.1", "t-1.1"] }, ctx);
+    const result = await callExecute(advanceTool, advance("t-1.1", "t-1.1"), ctx);
 
     const r = result as { details: { snapshot: TaskBoardSnapshot; error?: string } };
-    expect(r.details.error).toBeUndefined();
-    // Should only advance once: implementing → reviewing (not done)
-    expect(r.details.snapshot.tasks[0]!.status).toBe("reviewing");
+    expect(r.details.error).toMatch(/Duplicate task ids/);
+    expect(r.details.snapshot.tasks[0]!.status).toBe("implementing");
   });
 
   it("renderCall shows task count", () => {
     const advanceTool = createAdvanceTasksTool(api);
     const theme = createMockTheme();
-    const rendered = (advanceTool as any).renderCall({ ids: ["t-1.1", "t-1.2"] }, theme);
+    const rendered = (advanceTool as any).renderCall(advance("t-1.1", "t-1.2"), theme);
     const text = rendered.toString();
     expect(text).toContain("advance_tasks");
     expect(text).toContain("2 tasks");
@@ -1035,8 +1058,8 @@ describe("edit_tasks - abandon", () => {
     );
     await callExecute(compileTool, {}, ctx);
     await callExecute(getReadyTool, { count: 1 }, ctx);
-    await callExecute(advanceTool, { ids: ["t-1.1"] }, ctx); // → reviewing
-    await callExecute(advanceTool, { ids: ["t-1.1"] }, ctx); // → done
+    await callExecute(advanceTool, advance("t-1.1"), ctx); // → reviewing
+    await callExecute(advanceTool, complete("t-1.1"), ctx); // → done
 
     const result = await callExecute(
       editTool,
@@ -1385,7 +1408,7 @@ describe("clear_tasks", () => {
     );
     await callExecute(compileTool, {}, ctx);
     await callExecute(getReadyTool, { count: 1 }, ctx);
-    await callExecute(advanceTool, { ids: ["t-1.1"] }, ctx);
+    await callExecute(advanceTool, advance("t-1.1"), ctx);
     // t-1.1 is reviewing
 
     const result = await callExecute(clearTool, {}, ctx);
@@ -1632,8 +1655,8 @@ describe("get_ready_tasks", () => {
     );
     await callExecute(compileTool, {}, ctx);
     await callExecute(getReadyTool, { count: 1 }, ctx);
-    await callExecute(advanceTool, { ids: ["t-1.1"] }, ctx); // → reviewing
-    await callExecute(advanceTool, { ids: ["t-1.1"] }, ctx); // → done
+    await callExecute(advanceTool, advance("t-1.1"), ctx); // → reviewing
+    await callExecute(advanceTool, complete("t-1.1"), ctx); // → done
 
     const result = await callExecute(getReadyTool, { count: 1 }, ctx);
 
@@ -1862,10 +1885,10 @@ describe("phase completion prompt", () => {
     await callExecute(getReadyTool, { count: 1 }, ctx);
     // t-1.1 is implementing
 
-    await callExecute(advanceTool, { ids: ["t-1.1"] }, ctx);
+    await callExecute(advanceTool, advance("t-1.1"), ctx);
     // t-1.1 is reviewing
 
-    const result = await callExecute(advanceTool, { ids: ["t-1.1"] }, ctx);
+    const result = await callExecute(advanceTool, complete("t-1.1"), ctx);
     // t-1.1 is done — Phase 1 should complete
 
     const r = result as {
@@ -2492,7 +2515,7 @@ describe("catch blocks with non-Error values", () => {
     });
 
     const tool = createAdvanceTasksTool(api);
-    const result = await callExecute(tool, { ids: ["t-1.1"] }, ctx);
+    const result = await callExecute(tool, advance("t-1.1"), ctx);
 
     const r = result as {
       content: Array<{ type: string; text: string }>;

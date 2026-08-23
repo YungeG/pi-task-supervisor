@@ -8,6 +8,7 @@ import {
   findMissingDependencies,
   detectCycle,
   cloneBoard,
+  completionEvidenceError,
 } from "./validation";
 
 // ── Internal Helpers ──
@@ -241,6 +242,21 @@ function validateDataEdit(edit: TaskEdit & { type: "data" }, hasActiveTasksOnBoa
   }
 }
 
+function validateAdvanceEdit(edit: TaskEdit & { type: "advance" }, task: TaskRecord): void {
+  if (task.status !== "implementing" && task.status !== "reviewing") {
+    throw new Error(
+      `Cannot advance task "${edit.id}" from "${task.status}". Can only advance from "implementing" or "reviewing".`,
+    );
+  }
+  if (task.status === "implementing" && edit.data?.evidence !== undefined) {
+    throw new Error(`Task "${edit.id}" cannot attach completion evidence before review`);
+  }
+  if (task.status === "reviewing") {
+    const error = completionEvidenceError(edit.data?.evidence);
+    if (error) throw new Error(`Task "${edit.id}": ${error}`);
+  }
+}
+
 function validateEdit(
   edit: TaskEdit,
   taskMap: Map<string, TaskRecord>,
@@ -278,11 +294,7 @@ function validateEdit(
       break;
     }
     case "advance": {
-      if (task.status !== "implementing" && task.status !== "reviewing") {
-        throw new Error(
-          `Cannot advance task "${edit.id}" from "${task.status}". Can only advance from "implementing" or "reviewing".`,
-        );
-      }
+      validateAdvanceEdit(edit, task);
       break;
     }
     case "abandon": {
@@ -347,8 +359,11 @@ function applyStateEdits(
         task.status = "reviewing";
         task.updatedAt = now;
       } else {
-        // Must be "reviewing" (validated above)
+        // Must be "reviewing" with valid evidence (validated above)
+        const evidence = edit.data?.evidence;
+        if (!evidence) throw new Error(`Task "${edit.id}": Completion evidence is required`);
         task.status = "done";
+        task.completionEvidence = structuredClone(evidence);
         task.updatedAt = now;
         needsRecompute = true;
       }
@@ -362,6 +377,12 @@ function applyStateEdits(
   }
   if (needsRecompute) {
     recomputePhasesAndReadiness(board, oldBoard, now);
+    const finalTask = board.tasks.find((task) => task.id === board.finalAcceptanceTaskId);
+    board.workflowStatus =
+      finalTask?.status === "done" &&
+      board.tasks.every((task) => TERMINAL_STATUSES.has(task.status))
+        ? "completed"
+        : board.workflowStatus;
   }
 }
 

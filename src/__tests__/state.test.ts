@@ -38,6 +38,10 @@ function makeSampleBoard(overrides: Partial<TaskBoardSnapshot> = {}): TaskBoardS
         status: "done",
         createdAt: now,
         updatedAt: now,
+        completionEvidence: {
+          summary: "Test completion",
+          refs: [{ kind: "review", label: "test review", status: "passed", ref: "test://review" }],
+        },
       },
       {
         id: "t-2.1",
@@ -408,6 +412,17 @@ describe("state", () => {
             status: "done",
             createdAt: now,
             updatedAt: now,
+            completionEvidence: {
+              summary: "Test completion",
+              refs: [
+                {
+                  kind: "review",
+                  label: "test review",
+                  status: "passed",
+                  ref: "test://review",
+                },
+              ],
+            },
           },
           {
             id: "t-1.2",

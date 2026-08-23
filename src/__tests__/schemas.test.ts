@@ -152,17 +152,22 @@ describe("GetReadyTasksParams", () => {
 // ═══════════════════════════════════════════
 
 describe("AdvanceTasksParams", () => {
-  it("is an object schema with ids property", () => {
+  it("requires per-task transitions", () => {
     expect(AdvanceTasksParams.type).toBe("object");
-    expect(AdvanceTasksParams.properties.ids).toBeDefined();
-    expect(AdvanceTasksParams.required).toContain("ids");
+    expect(AdvanceTasksParams.properties.transitions).toBeDefined();
+    expect(AdvanceTasksParams.required).toContain("transitions");
   });
 
-  it("ids is an array of strings with maxItems: 50", () => {
-    const ids = AdvanceTasksParams.properties.ids as any;
-    expect(ids.type).toBe("array");
-    expect(ids.items.type).toBe("string");
-    expect(ids.maxItems).toBe(50);
+  it("bounds transitions and completion evidence", () => {
+    const transitions = AdvanceTasksParams.properties.transitions as any;
+    expect(transitions.type).toBe("array");
+    expect(transitions.minItems).toBe(1);
+    expect(transitions.maxItems).toBe(50);
+    expect(transitions.items.properties.id.type).toBe("string");
+    const evidence = transitions.items.properties.evidence;
+    expect(evidence.properties.summary.maxLength).toBe(1000);
+    expect(evidence.properties.refs.minItems).toBe(1);
+    expect(evidence.properties.refs.maxItems).toBe(20);
   });
 });
 
@@ -171,11 +176,10 @@ describe("AdvanceTasksParams", () => {
 // ═══════════════════════════════════════════
 
 describe("CompileTasksParams", () => {
-  it("is an object schema with no required fields", () => {
+  it("requires the final acceptance task id", () => {
     expect(CompileTasksParams.type).toBe("object");
-    expect(CompileTasksParams.properties).toBeDefined();
-    // TypeBox omits `required` when the object has no properties
-    expect(CompileTasksParams.required).toBeUndefined();
+    expect(CompileTasksParams.properties.finalAcceptanceTaskId).toBeDefined();
+    expect(CompileTasksParams.required).toContain("finalAcceptanceTaskId");
   });
 });
 

@@ -126,6 +126,7 @@ export type TaskWorkflowEvent =
       id: string;
       from: "implementing" | "reviewing";
       to: "reviewing" | "done";
+      evidence?: CompletionEvidence;
     }
   | { type: "abandon_task"; id: string }
   | { type: "clear_tasks" };
@@ -147,7 +148,7 @@ export interface BlockersEdit {
 export interface AdvanceEdit {
   id: string;
   type: "advance";
-  data?: Record<string, never>;
+  data?: { evidence?: CompletionEvidence };
 }
 
 export interface AbandonEdit {
