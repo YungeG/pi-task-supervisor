@@ -1,5 +1,5 @@
 import { describe, it, expect } from "vitest";
-import type { TaskBoardSnapshot, TaskRecord } from "../types";
+import type { LegacyTaskBoardSnapshot, TaskRecord } from "../types";
 import {
   isNonEmptyString,
   isValidPhase,
@@ -33,10 +33,10 @@ function makeTask(overrides: Partial<TaskRecord> = {}): TaskRecord {
   };
 }
 
-/** Creates a minimal valid TaskBoardSnapshot. */
-function makeBoard(overrides: Partial<TaskBoardSnapshot> = {}): TaskBoardSnapshot {
+/** Creates a minimal valid legacy snapshot. */
+function makeBoard(overrides: Partial<LegacyTaskBoardSnapshot> = {}): LegacyTaskBoardSnapshot {
   return {
-    version: 1 as const,
+    version: 1,
     tasks: [],
     phases: [],
     ...overrides,
@@ -334,8 +334,8 @@ describe("isValidSnapshot", () => {
   });
 
   it("accepts a valid snapshot with tasks and phases", () => {
-    const snapshot: TaskBoardSnapshot = {
-      version: 1 as const,
+    const snapshot: LegacyTaskBoardSnapshot = {
+      version: 1,
       tasks: [makeTask()],
       phases: [{ phase: 1, status: "active" }],
     };

@@ -1,8 +1,13 @@
 import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
-import type { TaskBoardSnapshot } from "./types";
-import { CUSTOM_EVENT_TYPE, CUSTOM_SNAPSHOT_TYPE } from "./types";
+import type { LegacyTaskBoardSnapshot, TaskBoardSnapshot } from "./types";
+import { CUSTOM_EVENT_TYPE, CUSTOM_SNAPSHOT_TYPE, LEGACY_CUSTOM_SNAPSHOT_TYPE } from "./types";
 import { createEmptyBoard } from "./engine";
-import { isValidSnapshot, cloneBoard, getStatusCounts } from "./validation";
+import {
+  cloneBoard,
+  getStatusCounts,
+  isValidLegacySnapshot,
+  isValidSnapshotV2,
+} from "./validation";
 import { phaseLabel } from "./formatting";
 
 // ── Mutable State ──
@@ -58,10 +63,24 @@ export function resetState(): void {
 
 // ── State Reconstruction ──
 
+function migrateLegacySnapshot(snapshot: LegacyTaskBoardSnapshot): TaskBoardSnapshot {
+  return {
+    version: 2,
+    generation: 1,
+    workflowStatus: "inactive",
+    tasks: structuredClone(snapshot.tasks),
+    phases: structuredClone(snapshot.phases),
+    pendingPhasePrompt: snapshot.pendingPhasePrompt
+      ? structuredClone(snapshot.pendingPhasePrompt)
+      : undefined,
+    stagnantSettles: 0,
+  };
+}
+
 /**
  * Reconstructs board state from session history.
- * Scans the branch in reverse to find the latest phased-tasks:snapshot custom entry.
- * Falls back to empty board if no valid snapshot found.
+ * Reads local version-2 snapshots and one-way migrates pinned upstream version-1 snapshots.
+ * Falls back to empty board if no valid snapshot is found.
  */
 export function reconstructState(ctx: ExtensionContext): TaskBoardSnapshot {
   const branch = ctx.sessionManager.getBranch();
@@ -70,10 +89,13 @@ export function reconstructState(ctx: ExtensionContext): TaskBoardSnapshot {
     const entry = branch[i];
     if (!entry) continue;
     if (entry.type !== "custom") continue;
-    if ((entry as { customType?: string }).customType !== CUSTOM_SNAPSHOT_TYPE) continue;
+    const customType = (entry as { customType?: string }).customType;
     const data = (entry as { data?: unknown }).data;
-    if (data && isValidSnapshot(data)) {
+    if (customType === CUSTOM_SNAPSHOT_TYPE && isValidSnapshotV2(data)) {
       return cloneBoard(data);
+    }
+    if (customType === LEGACY_CUSTOM_SNAPSHOT_TYPE && isValidLegacySnapshot(data)) {
+      return migrateLegacySnapshot(data);
     }
   }
 

@@ -21,7 +21,15 @@ function guardNoActiveTasks(board: TaskBoardSnapshot, message: string): void {
 // ── Board Creation ──
 
 export function createEmptyBoard(): TaskBoardSnapshot {
-  return { version: 1, tasks: [], phases: [], pendingPhasePrompt: undefined };
+  return {
+    version: 2,
+    generation: 0,
+    workflowStatus: "inactive",
+    tasks: [],
+    phases: [],
+    pendingPhasePrompt: undefined,
+    stagnantSettles: 0,
+  };
 }
 
 // ── Write Tasks ──
@@ -108,6 +116,12 @@ export function writeTasks(
     });
   }
 
+  result.generation = board.generation + 1;
+  result.workflowStatus = "inactive";
+  result.finalAcceptanceTaskId = undefined;
+  result.decision = undefined;
+  result.pauseReason = undefined;
+  result.stagnantSettles = 0;
   return result;
 }
 
@@ -383,12 +397,46 @@ export function applyEdits(
     applyStateEdits(stateEdits, taskMap, result, board, now);
   }
 
+  result.generation = board.generation + 1;
+  result.stagnantSettles = 0;
   return result;
 }
 
 // ── Compile Board ──
 
-export function compileBoard(board: TaskBoardSnapshot, now: string): TaskBoardSnapshot {
+function assertFinalAcceptanceCoverage(
+  board: TaskBoardSnapshot,
+  finalAcceptanceTaskId: string,
+  finalAcceptanceTask: TaskRecord,
+): void {
+  const taskMap = new Map(board.tasks.map((task) => [task.id, task]));
+  const covered = new Set<string>();
+  const stack = [...finalAcceptanceTask.dependencies];
+  while (stack.length > 0) {
+    const dependencyId = stack.pop();
+    if (dependencyId === undefined) break;
+    if (covered.has(dependencyId)) continue;
+    covered.add(dependencyId);
+    const dependency = taskMap.get(dependencyId);
+    if (dependency) stack.push(...dependency.dependencies);
+  }
+  const uncovered = board.tasks.filter(
+    (task) => task.id !== finalAcceptanceTaskId && !covered.has(task.id),
+  );
+  if (uncovered.length > 0) {
+    throw new Error(
+      `Final acceptance task must depend on every earlier task: ${uncovered
+        .map((task) => task.id)
+        .join(", ")}`,
+    );
+  }
+}
+
+export function compileBoard(
+  board: TaskBoardSnapshot,
+  now: string,
+  finalAcceptanceTaskId?: string,
+): TaskBoardSnapshot {
   if (board.tasks.length === 0) {
     throw new Error("Cannot compile an empty board");
   }
@@ -417,6 +465,21 @@ export function compileBoard(board: TaskBoardSnapshot, now: string): TaskBoardSn
     throw new Error(`Dependency cycle detected: ${cycle.join(" → ")}`);
   }
 
+  if (finalAcceptanceTaskId) {
+    const finalAcceptanceTask = board.tasks.find((task) => task.id === finalAcceptanceTaskId);
+    if (!finalAcceptanceTask) {
+      throw new Error(`Final acceptance task not found: ${finalAcceptanceTaskId}`);
+    }
+    const finalPhase = Math.max(...board.tasks.map((task) => task.phase));
+    if (finalAcceptanceTask.phase !== finalPhase) {
+      throw new Error("Final acceptance task must be in the final phase");
+    }
+    if (finalAcceptanceTask.status === "abandoned") {
+      throw new Error("Final acceptance task cannot be abandoned");
+    }
+    assertFinalAcceptanceCoverage(board, finalAcceptanceTaskId, finalAcceptanceTask);
+  }
+
   const result = cloneBoard(board);
 
   for (const task of result.tasks) {
@@ -427,6 +490,10 @@ export function compileBoard(board: TaskBoardSnapshot, now: string): TaskBoardSn
   }
 
   recomputePhasesAndReadiness(result, board, now);
+  result.finalAcceptanceTaskId = finalAcceptanceTaskId;
+  result.workflowStatus = finalAcceptanceTaskId ? "active" : "inactive";
+  result.generation = board.generation + 1;
+  result.stagnantSettles = 0;
 
   return result;
 }

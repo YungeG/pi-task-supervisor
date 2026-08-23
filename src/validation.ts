@@ -1,4 +1,4 @@
-import type { TaskRecord, TaskStatus, TaskBoardSnapshot } from "./types";
+import type { LegacyTaskBoardSnapshot, TaskBoardSnapshot, TaskRecord, TaskStatus } from "./types";
 import { TERMINAL_STATUSES, ACTIVE_STATUSES } from "./types";
 
 // ── String Validation ──
@@ -105,23 +105,25 @@ export function getStatusCounts(board: TaskBoardSnapshot): Record<TaskStatus, nu
 
 // ── Board State Checks ──
 
+type TaskCollection = { readonly tasks: readonly TaskRecord[] };
+
 /** Returns true if any task is in implementing or reviewing. */
-function hasActiveTasks(board: TaskBoardSnapshot): boolean {
+function hasActiveTasks(board: TaskCollection): boolean {
   return board.tasks.some((t) => ACTIVE_STATUSES.has(t.status));
 }
 
 /** Returns true if any task is in a non-terminal state. */
-function hasNonTerminalTasks(board: TaskBoardSnapshot): boolean {
+function hasNonTerminalTasks(board: TaskCollection): boolean {
   return board.tasks.some((t) => !TERMINAL_STATUSES.has(t.status));
 }
 
 /** Returns true if there are tasks in ready, implementing, or reviewing. */
-export function hasActionableTasks(board: TaskBoardSnapshot): boolean {
+export function hasActionableTasks(board: TaskCollection): boolean {
   return board.tasks.some((t) => t.status === "ready") || hasActiveTasks(board);
 }
 
 /** Returns true if there are non-terminal tasks but none are actionable (deadlock). */
-export function hasBlockedNonTerminalTasks(board: TaskBoardSnapshot): boolean {
+export function hasBlockedNonTerminalTasks(board: TaskCollection): boolean {
   return hasNonTerminalTasks(board) && !hasActionableTasks(board);
 }
 
@@ -163,14 +165,85 @@ function isValidPhaseRecord(p: unknown): boolean {
   );
 }
 
-/** Type guard for a valid TaskBoardSnapshot. Checks version field, structure, and task/phase validity. */
-export function isValidSnapshot(data: unknown): data is TaskBoardSnapshot {
+const VALID_WORKFLOW_STATUSES = new Set([
+  "inactive",
+  "active",
+  "paused",
+  "waiting_for_decision",
+  "completed",
+]);
+
+function hasValidTaskAndPhaseArrays(obj: Record<string, unknown>): boolean {
+  return (
+    Array.isArray(obj.tasks) &&
+    Array.isArray(obj.phases) &&
+    (obj.tasks as unknown[]).every(isValidTask) &&
+    (obj.phases as unknown[]).every(isValidPhaseRecord)
+  );
+}
+
+/** Type guard for the pinned upstream version-1 snapshot. */
+export function isValidLegacySnapshot(data: unknown): data is LegacyTaskBoardSnapshot {
   if (typeof data !== "object" || data === null) return false;
   const obj = data as Record<string, unknown>;
-  if (obj.version !== 1 || !Array.isArray(obj.tasks) || !Array.isArray(obj.phases)) return false;
-  if (!(obj.tasks as unknown[]).every(isValidTask)) return false;
-  if (!(obj.phases as unknown[]).every(isValidPhaseRecord)) return false;
+  return obj.version === 1 && hasValidTaskAndPhaseArrays(obj);
+}
+
+function hasValidV2Metadata(obj: Record<string, unknown>): boolean {
+  if (!Number.isInteger(obj.generation) || (obj.generation as number) < 0) return false;
+  if (typeof obj.workflowStatus !== "string" || !VALID_WORKFLOW_STATUSES.has(obj.workflowStatus)) {
+    return false;
+  }
+  if (!Number.isInteger(obj.stagnantSettles) || (obj.stagnantSettles as number) < 0) {
+    return false;
+  }
+  if (obj.finalAcceptanceTaskId !== undefined && typeof obj.finalAcceptanceTaskId !== "string") {
+    return false;
+  }
   return true;
+}
+
+function hasConsistentWorkflowState(obj: Record<string, unknown>): boolean {
+  const status = obj.workflowStatus as string;
+  const tasks = obj.tasks as Array<Record<string, unknown>>;
+  const finalAcceptanceTaskId = obj.finalAcceptanceTaskId;
+  if (status !== "inactive" && typeof finalAcceptanceTaskId !== "string") return false;
+
+  if (typeof finalAcceptanceTaskId === "string") {
+    const finalTask = tasks.find((task) => task.id === finalAcceptanceTaskId);
+    if (!finalTask) return false;
+    const finalPhase = Math.max(...tasks.map((task) => Number(task.phase)));
+    if (finalTask.phase !== finalPhase || finalTask.status === "abandoned") return false;
+    if (status === "completed" && finalTask.status !== "done") return false;
+  }
+
+  if (
+    status === "completed" &&
+    tasks.some((task) => task.status !== "done" && task.status !== "abandoned")
+  ) {
+    return false;
+  }
+  if (status === "waiting_for_decision") {
+    return typeof obj.decision === "object" && obj.decision !== null;
+  }
+  return obj.decision === undefined;
+}
+
+/** Type guard for a valid local version-2 snapshot. */
+export function isValidSnapshotV2(data: unknown): data is TaskBoardSnapshot {
+  if (typeof data !== "object" || data === null) return false;
+  const obj = data as Record<string, unknown>;
+  if (obj.version !== 2 || !hasValidTaskAndPhaseArrays(obj) || !hasValidV2Metadata(obj)) {
+    return false;
+  }
+  return hasConsistentWorkflowState(obj);
+}
+
+/** Backward-compatible snapshot predicate for callers that inspect stored history. */
+export function isValidSnapshot(
+  data: unknown,
+): data is TaskBoardSnapshot | LegacyTaskBoardSnapshot {
+  return isValidSnapshotV2(data) || isValidLegacySnapshot(data);
 }
 
 // ── Deep Clone ──
@@ -180,6 +253,8 @@ export function isValidSnapshot(data: unknown): data is TaskBoardSnapshot {
  * Uses JSON roundtrip (instead of structuredClone) because benchmarks show it's
  * faster for plain-object graphs without special types.
  */
-export function cloneBoard(board: TaskBoardSnapshot): TaskBoardSnapshot {
-  return JSON.parse(JSON.stringify(board)) as TaskBoardSnapshot;
+export function cloneBoard<T extends TaskBoardSnapshot | LegacyTaskBoardSnapshot>(
+  board: Readonly<T>,
+): T {
+  return structuredClone(board);
 }

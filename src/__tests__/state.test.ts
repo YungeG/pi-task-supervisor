@@ -23,7 +23,10 @@ import { createMockContext, createMockAPI } from "./helpers/mocks";
 function makeSampleBoard(overrides: Partial<TaskBoardSnapshot> = {}): TaskBoardSnapshot {
   const now = new Date().toISOString();
   return {
-    version: 1 as const,
+    version: 2,
+    generation: 1,
+    workflowStatus: "active",
+    finalAcceptanceTaskId: "t-2.1",
     tasks: [
       {
         id: "t-1.1",
@@ -52,6 +55,7 @@ function makeSampleBoard(overrides: Partial<TaskBoardSnapshot> = {}): TaskBoardS
       { phase: 1, status: "completed", completedAt: now },
       { phase: 2, status: "active" },
     ],
+    stagnantSettles: 0,
     ...overrides,
   };
 }
@@ -344,7 +348,10 @@ describe("state", () => {
       const ctx = createMockContext([]);
       const now = new Date().toISOString();
       const board: TaskBoardSnapshot = {
-        version: 1 as const,
+        version: 2,
+        generation: 1,
+        workflowStatus: "active",
+        finalAcceptanceTaskId: "t-1.2",
         tasks: [
           {
             id: "t-1.1",
@@ -370,6 +377,7 @@ describe("state", () => {
           },
         ],
         phases: [{ phase: 1, status: "active" }],
+        stagnantSettles: 0,
       };
 
       updateUI(ctx, board);
@@ -385,7 +393,10 @@ describe("state", () => {
       const ctx = createMockContext([]);
       const now = new Date().toISOString();
       const board: TaskBoardSnapshot = {
-        version: 1 as const,
+        version: 2,
+        generation: 1,
+        workflowStatus: "completed",
+        finalAcceptanceTaskId: "t-1.1",
         tasks: [
           {
             id: "t-1.1",
@@ -411,6 +422,7 @@ describe("state", () => {
           },
         ],
         phases: [{ phase: 1, status: "completed", completedAt: now }],
+        stagnantSettles: 0,
       };
 
       updateUI(ctx, board);
@@ -432,7 +444,9 @@ describe("state", () => {
       const ctx = createMockContext([]);
       const now = new Date().toISOString();
       const board: TaskBoardSnapshot = {
-        version: 1 as const,
+        version: 2,
+        generation: 1,
+        workflowStatus: "inactive",
         tasks: [
           {
             id: "t-1.1",
@@ -447,6 +461,7 @@ describe("state", () => {
           },
         ],
         phases: [], // No phases computed yet
+        stagnantSettles: 0,
       };
 
       updateUI(ctx, board);

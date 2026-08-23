@@ -30,8 +30,7 @@ describe("phaseLabel", () => {
 
   it("returns plain phase number when phase record has no title", () => {
     const board: TaskBoardSnapshot = {
-      version: 1,
-      tasks: [],
+      ...createEmptyBoard(),
       phases: [{ phase: 2, status: "pending" }],
     };
     expect(phaseLabel(board, 2)).toBe("Phase 2");

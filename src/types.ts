@@ -11,6 +11,26 @@ export type TaskStatus =
 
 // ── Domain Records ──
 
+export interface EvidenceRef {
+  kind: "command" | "review" | "artifact" | "diff";
+  label: string;
+  status: "passed" | "fixed" | "deferred";
+  ref?: string;
+  exitCode?: number;
+  digest?: string;
+}
+
+export interface CompletionEvidence {
+  summary: string;
+  refs: EvidenceRef[];
+  residualRisks?: string[];
+}
+
+export interface ExecutionRef {
+  source: "pi-subagents" | "workflow";
+  runId: string;
+}
+
 export interface TaskRecord {
   id: string;
   title: string;
@@ -21,6 +41,8 @@ export interface TaskRecord {
   status: TaskStatus;
   createdAt: string;
   updatedAt: string;
+  executionRef?: ExecutionRef;
+  completionEvidence?: CompletionEvidence;
 }
 
 export interface PhaseRecord {
@@ -32,7 +54,22 @@ export interface PhaseRecord {
 
 // ── Board Snapshot ──
 
-export interface TaskBoardSnapshot {
+export type WorkflowStatus =
+  | "inactive"
+  | "active"
+  | "paused"
+  | "waiting_for_decision"
+  | "completed";
+
+export interface DecisionRecord {
+  id: string;
+  question: string;
+  whyUserOwned: string;
+  options?: string[];
+  createdAt: string;
+}
+
+export interface LegacyTaskBoardSnapshot {
   version: 1;
   tasks: TaskRecord[];
   phases: PhaseRecord[];
@@ -40,6 +77,22 @@ export interface TaskBoardSnapshot {
     phase: number;
     message: string;
   };
+}
+
+export interface TaskBoardSnapshot {
+  version: 2;
+  generation: number;
+  workflowStatus: WorkflowStatus;
+  finalAcceptanceTaskId?: string;
+  tasks: TaskRecord[];
+  phases: PhaseRecord[];
+  pendingPhasePrompt?: {
+    phase: number;
+    message: string;
+  };
+  decision?: DecisionRecord;
+  pauseReason?: string;
+  stagnantSettles: number;
 }
 
 // ── Event Types ──
@@ -110,8 +163,9 @@ export type TaskEdit = DataEdit | BlockersEdit | AdvanceEdit | AbandonEdit;
 export const MAX_TASKS = 100;
 export const MAX_AUTO_CONTINUE = 20;
 
-export const CUSTOM_EVENT_TYPE = "phased-tasks:event";
-export const CUSTOM_SNAPSHOT_TYPE = "phased-tasks:snapshot";
+export const CUSTOM_EVENT_TYPE = "continuous-tasks:event";
+export const CUSTOM_SNAPSHOT_TYPE = "continuous-tasks:snapshot";
+export const LEGACY_CUSTOM_SNAPSHOT_TYPE = "phased-tasks:snapshot";
 
 export const TERMINAL_STATUSES: ReadonlySet<TaskStatus> = new Set(["done", "abandoned"]);
 export const ACTIVE_STATUSES: ReadonlySet<TaskStatus> = new Set(["implementing", "reviewing"]);
@@ -126,7 +180,7 @@ export const ALL_STATUSES: ReadonlySet<TaskStatus> = new Set([
 ]);
 
 /** Status → plain-text icon character */
-export const STATUS_ICONS: Record<TaskStatus, string> = {
+export const STATUS_ICONS = {
   draft: "⚪",
   configured: "🔵",
   ready: "🟢",
@@ -134,4 +188,4 @@ export const STATUS_ICONS: Record<TaskStatus, string> = {
   reviewing: "🔍",
   done: "✅",
   abandoned: "❌",
-};
+} satisfies Record<TaskStatus, string>;

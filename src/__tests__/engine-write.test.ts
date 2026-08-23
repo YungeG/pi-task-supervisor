@@ -9,10 +9,15 @@ import { makeBoardWithStatuses } from "./helpers/engine-helpers";
 describe("createEmptyBoard", () => {
   it("returns correct empty shape", () => {
     const board = createEmptyBoard();
-    expect(board.version).toBe(1);
-    expect(board.tasks).toEqual([]);
-    expect(board.phases).toEqual([]);
-    expect(board.pendingPhasePrompt).toBeUndefined();
+    expect(board).toEqual({
+      version: 2,
+      generation: 0,
+      workflowStatus: "inactive",
+      tasks: [],
+      phases: [],
+      pendingPhasePrompt: undefined,
+      stagnantSettles: 0,
+    });
   });
 });
 

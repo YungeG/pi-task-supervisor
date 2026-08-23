@@ -139,7 +139,7 @@ describe("session_start handler", () => {
   it("reconstructs state from snapshot and updates UI", () => {
     const snapshotBoard = makeBoardWithReadyTask();
     const ctx = createMockContext([
-      { type: "custom", customType: "phased-tasks:snapshot", data: snapshotBoard },
+      { type: "custom", customType: "continuous-tasks:snapshot", data: snapshotBoard },
     ]);
 
     const handler = getHandler(mockAPI, "session_start");
@@ -193,7 +193,7 @@ describe("session_tree handler", () => {
   it("reconstructs state and updates UI", () => {
     const snapshotBoard = makeBoardWithReadyTask();
     const ctx = createMockContext([
-      { type: "custom", customType: "phased-tasks:snapshot", data: snapshotBoard },
+      { type: "custom", customType: "continuous-tasks:snapshot", data: snapshotBoard },
     ]);
 
     const handler = getHandler(mockAPI, "session_tree");

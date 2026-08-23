@@ -11,6 +11,7 @@ import {
 } from "../tools";
 import { resetState } from "../state";
 import * as configModule from "../config";
+import { createEmptyBoard } from "../engine";
 import type { TaskBoardSnapshot } from "../types";
 
 // ── Helpers ──
@@ -253,12 +254,12 @@ describe("write_tasks", () => {
     expect(mockApi.appendEntry).toHaveBeenCalledTimes(2);
     expect(mockApi.appendEntry).toHaveBeenNthCalledWith(
       1,
-      "phased-tasks:event",
+      "continuous-tasks:event",
       expect.objectContaining({ type: "write_tasks" }),
     );
     expect(mockApi.appendEntry).toHaveBeenNthCalledWith(
       2,
-      "phased-tasks:snapshot",
+      "continuous-tasks:snapshot",
       expect.objectContaining({ tasks: expect.any(Array) }),
     );
   });
@@ -1782,7 +1783,7 @@ describe("tool render functions", () => {
     const result = {
       content: [{ type: "text" as const, text: "Success message" }],
       details: {
-        snapshot: { version: 1 as const, tasks: [], phases: [] } as TaskBoardSnapshot,
+        snapshot: createEmptyBoard(),
       },
     };
     const rendered = (tool as any).renderResult(
@@ -1798,7 +1799,7 @@ describe("tool render functions", () => {
     const result = {
       content: [{ type: "text" as const, text: "Some error" }],
       details: {
-        snapshot: { version: 1 as const, tasks: [], phases: [] } as TaskBoardSnapshot,
+        snapshot: createEmptyBoard(),
         error: "Some error",
       },
     };
@@ -1899,7 +1900,7 @@ describe("renderColoredBoardResult branches", () => {
     const result = {
       content: [{ type: "text" as const, text: boardText }],
       details: {
-        snapshot: { version: 1 as const, tasks: [], phases: [] } as TaskBoardSnapshot,
+        snapshot: createEmptyBoard(),
       },
     };
     const rendered = (tool as any).renderResult(
@@ -1921,7 +1922,7 @@ describe("renderColoredBoardResult branches", () => {
     const result = {
       content: [{ type: "text" as const, text: boardText }],
       details: {
-        snapshot: { version: 1 as const, tasks: [], phases: [] } as TaskBoardSnapshot,
+        snapshot: createEmptyBoard(),
       },
     };
     const rendered = (tool as any).renderResult(
@@ -1941,7 +1942,7 @@ describe("renderColoredBoardResult branches", () => {
     const result = {
       content: [{ type: "text" as const, text: boardText }],
       details: {
-        snapshot: { version: 1 as const, tasks: [], phases: [] } as TaskBoardSnapshot,
+        snapshot: createEmptyBoard(),
       },
     };
     const rendered = (tool as any).renderResult(
@@ -1961,7 +1962,7 @@ describe("renderColoredBoardResult branches", () => {
     const result = {
       content: [{ type: "text" as const, text: boardText }],
       details: {
-        snapshot: { version: 1 as const, tasks: [], phases: [] } as TaskBoardSnapshot,
+        snapshot: createEmptyBoard(),
       },
     };
     const rendered = (tool as any).renderResult(
@@ -2001,7 +2002,7 @@ describe("renderColoredBoardResult branches", () => {
     const result = {
       content: [{ type: "image" as const, data: "..." }],
       details: {
-        snapshot: { version: 1 as const, tasks: [], phases: [] } as TaskBoardSnapshot,
+        snapshot: createEmptyBoard(),
       },
     };
     const rendered = (tool as any).renderResult(
@@ -2028,7 +2029,7 @@ describe("renderResult per tool", () => {
     theme = createMockTheme();
   });
 
-  const snapshot: TaskBoardSnapshot = { version: 1, tasks: [], phases: [] };
+  const snapshot: TaskBoardSnapshot = createEmptyBoard();
   const boardText = "─── Phase 1 ───\n● t-1.1: Task\nSummary: 0/1 done";
 
   // ── edit_tasks ──
