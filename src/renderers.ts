@@ -2,7 +2,7 @@ import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import { Text } from "@earendil-works/pi-tui";
 
 export function registerMessageRenderers(pi: ExtensionAPI): void {
-  pi.registerMessageRenderer("phased-tasks-context", (message, _opts, theme) => {
+  pi.registerMessageRenderer("continuous-tasks:context", (message, _opts, theme) => {
     return new Text(
       theme.fg("accent", "📋 ") +
         theme.fg(
@@ -14,7 +14,7 @@ export function registerMessageRenderers(pi: ExtensionAPI): void {
     );
   });
 
-  pi.registerMessageRenderer("phased-tasks-notice", (message, _opts, theme) => {
+  pi.registerMessageRenderer("continuous-tasks:notice", (message, _opts, theme) => {
     return new Text(
       theme.fg("warning", "⚠ ") +
         theme.fg(

@@ -37,14 +37,15 @@ describe("index (default export)", () => {
     expect(toolNames).toContain("get_ready_tasks");
     expect(toolNames).toContain("advance_tasks");
 
-    // Event handlers registered (7 events)
-    expect(mockObj.on).toHaveBeenCalledTimes(7);
+    // Event handlers registered (8 events)
+    expect(mockObj.on).toHaveBeenCalledTimes(8);
     const eventNames = mockObj.on.mock.calls.map((call: unknown) => (call as [string, unknown])[0]);
     expect(eventNames).toContain("session_start");
     expect(eventNames).toContain("session_tree");
     expect(eventNames).toContain("session_shutdown");
     expect(eventNames).toContain("before_agent_start");
     expect(eventNames).toContain("agent_end");
+    expect(eventNames).toContain("agent_settled");
     expect(eventNames).toContain("input");
     expect(eventNames).toContain("tool_result");
 
@@ -53,7 +54,7 @@ describe("index (default export)", () => {
     const rendererTypes = mockObj.registerMessageRenderer.mock.calls.map(
       (call: unknown) => (call as [string, unknown])[0],
     );
-    expect(rendererTypes).toContain("phased-tasks-context");
-    expect(rendererTypes).toContain("phased-tasks-notice");
+    expect(rendererTypes).toContain("continuous-tasks:context");
+    expect(rendererTypes).toContain("continuous-tasks:notice");
   });
 });

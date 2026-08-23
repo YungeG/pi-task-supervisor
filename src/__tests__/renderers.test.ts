@@ -1,92 +1,53 @@
-import { describe, it, expect } from "vitest";
+import { describe, expect, it } from "vitest";
 import { registerMessageRenderers } from "../renderers";
 import { createMockAPI, createMockTheme } from "./helpers/mocks";
 
+function rendererFor(type: string) {
+  const mock = createMockAPI();
+  registerMessageRenderers(mock.api);
+  const call = mock.registerMessageRenderer.mock.calls.find(
+    (candidate: unknown) => (candidate as [string, unknown])[0] === type,
+  );
+  return {
+    mock,
+    renderer: (call as [string, (...args: unknown[]) => unknown])[1],
+  };
+}
+
 describe("registerMessageRenderers", () => {
-  it("registers renderers for both message types", () => {
-    const mockObj = createMockAPI();
-    registerMessageRenderers(mockObj.api);
+  it("registers context and notice renderers", () => {
+    const mock = createMockAPI();
+    registerMessageRenderers(mock.api);
 
-    expect(mockObj.registerMessageRenderer).toHaveBeenCalledTimes(2);
-    const registeredTypes = mockObj.registerMessageRenderer.mock.calls.map(
-      (call: unknown) => (call as [string, unknown])[0],
-    );
-    expect(registeredTypes).toContain("phased-tasks-context");
-    expect(registeredTypes).toContain("phased-tasks-notice");
+    expect(mock.registerMessageRenderer.mock.calls.map(([type]) => type)).toEqual([
+      "continuous-tasks:context",
+      "continuous-tasks:notice",
+    ]);
   });
 
-  it("renders phased-tasks-context with accent icon and dimmed content", () => {
-    const mockObj = createMockAPI();
-    registerMessageRenderers(mockObj.api);
-
-    // Find the context renderer callback
-    const contextCall = mockObj.registerMessageRenderer.mock.calls.find(
-      (call: unknown) => (call as [string, unknown])[0] === "phased-tasks-context",
-    );
-    const renderer = (contextCall as [string, (...args: unknown[]) => unknown])[1];
+  it.each([
+    ["Board context here", "Board context here"],
+    [{ foo: "bar" }, JSON.stringify({ foo: "bar" })],
+  ])("renders context content: %j", (content, expected) => {
+    const { renderer } = rendererFor("continuous-tasks:context");
     const theme = createMockTheme();
-
-    const result = renderer({ content: "Board context here" }, {}, theme) as { toString(): string };
+    const result = renderer({ content }, {}, theme) as { toString(): string };
 
     expect(theme.fg).toHaveBeenCalledWith("accent", "📋 ");
-    expect(theme.fg).toHaveBeenCalledWith("dim", "Board context here");
-    // The result should be a Text instance wrapping the themed output
-    expect(result).toBeDefined();
-    expect(result.toString()).toBe("[accent]📋 [dim]Board context here");
+    expect(theme.fg).toHaveBeenCalledWith("dim", expected);
+    expect(result.toString()).toBe(`[accent]📋 [dim]${expected}`);
   });
 
-  it("renders phased-tasks-context with JSON-stringified content when content is not a string", () => {
-    const mockObj = createMockAPI();
-    registerMessageRenderers(mockObj.api);
-
-    const contextCall = mockObj.registerMessageRenderer.mock.calls.find(
-      (call: unknown) => (call as [string, unknown])[0] === "phased-tasks-context",
-    );
-    const renderer = (contextCall as [string, (...args: unknown[]) => unknown])[1];
+  it.each([
+    ["Limit reached!", "Limit reached!"],
+    [{ count: 5 }, JSON.stringify({ count: 5 })],
+  ])("renders notice content: %j", (content, expected) => {
+    const { renderer } = rendererFor("continuous-tasks:notice");
     const theme = createMockTheme();
-
-    const result = renderer({ content: { foo: "bar" } }, {}, theme) as { toString(): string };
-
-    expect(theme.fg).toHaveBeenCalledWith("accent", "📋 ");
-    expect(theme.fg).toHaveBeenCalledWith("dim", JSON.stringify({ foo: "bar" }));
-    expect(result).toBeDefined();
-    expect(result.toString()).toBe(`[accent]📋 [dim]${JSON.stringify({ foo: "bar" })}`);
-  });
-
-  it("renders phased-tasks-notice with warning icon and text content", () => {
-    const mockObj = createMockAPI();
-    registerMessageRenderers(mockObj.api);
-
-    // Find the notice renderer callback
-    const noticeCall = mockObj.registerMessageRenderer.mock.calls.find(
-      (call: unknown) => (call as [string, unknown])[0] === "phased-tasks-notice",
-    );
-    const renderer = (noticeCall as [string, (...args: unknown[]) => unknown])[1];
-    const theme = createMockTheme();
-
-    const result = renderer({ content: "Limit reached!" }, {}, theme) as { toString(): string };
+    const result = renderer({ content }, {}, theme) as { toString(): string };
 
     expect(theme.fg).toHaveBeenCalledWith("warning", "⚠ ");
-    expect(theme.fg).toHaveBeenCalledWith("text", "Limit reached!");
-    expect(result).toBeDefined();
-    expect(result.toString()).toBe("[warning]⚠ [text]Limit reached!");
-  });
-
-  it("renders phased-tasks-notice with JSON-stringified content when content is not a string", () => {
-    const mockObj = createMockAPI();
-    registerMessageRenderers(mockObj.api);
-
-    const noticeCall = mockObj.registerMessageRenderer.mock.calls.find(
-      (call: unknown) => (call as [string, unknown])[0] === "phased-tasks-notice",
-    );
-    const renderer = (noticeCall as [string, (...args: unknown[]) => unknown])[1];
-    const theme = createMockTheme();
-
-    const result = renderer({ content: { count: 5 } }, {}, theme) as { toString(): string };
-
-    expect(theme.fg).toHaveBeenCalledWith("warning", "⚠ ");
-    expect(theme.fg).toHaveBeenCalledWith("text", JSON.stringify({ count: 5 }));
-    expect(result).toBeDefined();
-    expect(result.toString()).toBe(`[warning]⚠ [text]${JSON.stringify({ count: 5 })}`);
+    expect(theme.fg).toHaveBeenCalledWith("text", expected);
+    expect(result.toString()).toBe(`[warning]⚠ [text]${expected}`);
   });
 });

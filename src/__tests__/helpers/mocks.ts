@@ -26,7 +26,10 @@ export function createMockContext(
     },
     sessionManager: {
       getBranch: vi.fn(() => branch),
+      getSessionId: vi.fn(() => "test-session"),
     },
+    isIdle: vi.fn(() => true),
+    hasPendingMessages: vi.fn(() => false),
   } as unknown as ExtensionContext;
 }
 

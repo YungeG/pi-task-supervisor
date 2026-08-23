@@ -1834,6 +1834,7 @@ describe("phase completion prompt", () => {
 
   it("sets pendingPhasePrompt when a phase completes after advance", async () => {
     vi.spyOn(configModule, "loadConfig").mockResolvedValue({
+      ...configModule.DEFAULT_CONFIG,
       phaseCompletionPromptTemplate: "Phase {phase} complete!",
     });
 
