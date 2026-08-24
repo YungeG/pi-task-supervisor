@@ -3,7 +3,6 @@ import { homedir } from "node:os";
 import { join, resolve } from "node:path";
 
 export interface ContinuousTasksConfig {
-  enabledSessionIds: string[];
   countdownMs: number;
   maxStagnantSettles: number;
   requireCompletionEvidence: boolean;
@@ -11,7 +10,6 @@ export interface ContinuousTasksConfig {
 }
 
 export const DEFAULT_CONFIG: ContinuousTasksConfig = {
-  enabledSessionIds: [],
   countdownMs: 3000,
   maxStagnantSettles: 5,
   requireCompletionEvidence: true,
@@ -24,18 +22,6 @@ function configPath(): string {
     ? resolve(process.env.PI_CODING_AGENT_DIR)
     : join(homedir(), ".pi", "agent");
   return join(root, "continuous-tasks.json");
-}
-
-const SESSION_ID = /^[0-9a-f]{8}(?:-[0-9a-f]{4}){3}-[0-9a-f]{12}$/i;
-
-function decodeSessionIds(value: unknown): string[] | null {
-  if (!Array.isArray(value)) return null;
-  const ids: string[] = [];
-  for (const id of value) {
-    if (typeof id !== "string" || !SESSION_ID.test(id)) return null;
-    ids.push(id);
-  }
-  return [...new Set(ids)];
 }
 
 function boundedInteger(value: unknown, fallback: number, min: number, max: number): number | null {
@@ -51,7 +37,6 @@ function boundedInteger(value: unknown, fallback: number, min: number, max: numb
 function decodeConfig(value: unknown): ContinuousTasksConfig | null {
   if (typeof value !== "object" || value === null) return null;
   const input = value as Record<string, unknown>;
-  const enabledSessionIds = decodeSessionIds(input.enabledSessionIds);
   const countdownMs = boundedInteger(input.countdownMs, DEFAULT_CONFIG.countdownMs, 0, 60_000);
   const maxStagnantSettles = boundedInteger(
     input.maxStagnantSettles,
@@ -63,7 +48,6 @@ function decodeConfig(value: unknown): ContinuousTasksConfig | null {
     input.requireCompletionEvidence ?? DEFAULT_CONFIG.requireCompletionEvidence;
   const phaseCompletionPromptTemplate = input.phaseCompletionPromptTemplate;
   if (
-    enabledSessionIds === null ||
     countdownMs === null ||
     maxStagnantSettles === null ||
     typeof requireCompletionEvidence !== "boolean" ||
@@ -75,7 +59,6 @@ function decodeConfig(value: unknown): ContinuousTasksConfig | null {
   }
 
   return {
-    enabledSessionIds,
     countdownMs,
     maxStagnantSettles,
     requireCompletionEvidence,
@@ -97,10 +80,6 @@ export async function loadConfig(): Promise<ContinuousTasksConfig> {
   }
   cachedConfig = { ...DEFAULT_CONFIG };
   return cachedConfig;
-}
-
-export function isSessionEnabled(config: ContinuousTasksConfig, sessionId: string): boolean {
-  return config.enabledSessionIds.includes(sessionId);
 }
 
 export function resolvePhasePrompt(

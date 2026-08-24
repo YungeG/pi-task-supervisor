@@ -43,7 +43,7 @@ Current fan-in expectations:
 
 ```text
 npm test                                      PASS (450 tests, 21 files)
-npm run test:coverage                         PASS (90.54% branches)
+npm run test:coverage                         PASS (90.19% branches)
 npm run typecheck                             PASS
 npm run lint                                  PASS
 npm run format:check                          PASS
@@ -56,3 +56,5 @@ packed extension load                         PASS
 Development-only audit findings remain baseline until dependency upgrades can be proven compatible; they are not silently rewritten during the feature fork.
 
 Independent review found one blocker: generation regressed or failed to advance on claim, clear, and reconstruction paths. The fix increments claim/clear generations, rejects persisted generation zero, and fails closed on regressing snapshot history. A fresh fallback re-review returned `PASS` after `npm run check` and the real Pi smoke passed.
+
+Session authorization now uses a typed `continuous-tasks:activation` entry written only by the user command `/continuous-tasks enable`. The real Pi smoke invokes that command through Pi's command runner, persists exactly one activation entry, resumes the saved session, and confirms the task tools are restored. Global configuration no longer stores session IDs.

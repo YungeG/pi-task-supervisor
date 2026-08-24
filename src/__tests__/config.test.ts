@@ -1,7 +1,6 @@
 import { beforeEach, describe, expect, it, vi } from "vitest";
 import {
   DEFAULT_CONFIG,
-  isSessionEnabled,
   loadConfig,
   resetConfig,
   resolvePhasePrompt,
@@ -18,14 +17,9 @@ vi.mock("node:path", () => ({
 import { readFile } from "node:fs/promises";
 
 const mockReadFile = vi.mocked(readFile);
-const SESSION_ID = "01a0228b-ccbb-7fdf-b504-9f815411e609";
 
 function validConfig(overrides: Partial<ContinuousTasksConfig> = {}): ContinuousTasksConfig {
-  return {
-    ...DEFAULT_CONFIG,
-    enabledSessionIds: [SESSION_ID],
-    ...overrides,
-  };
+  return { ...DEFAULT_CONFIG, ...overrides };
 }
 
 describe("config", () => {
@@ -36,7 +30,7 @@ describe("config", () => {
   });
 
   describe("loadConfig", () => {
-    it("returns the default-deny config when the file does not exist", async () => {
+    it("returns defaults when the file does not exist", async () => {
       const error = new Error("missing") as NodeJS.ErrnoException;
       error.code = "ENOENT";
       mockReadFile.mockRejectedValue(error);
@@ -45,16 +39,16 @@ describe("config", () => {
     });
 
     it.each(["not valid json {{{", JSON.stringify("a string"), JSON.stringify(null)])(
-      "returns the default-deny config for invalid input: %s",
+      "returns defaults for invalid input: %s",
       async (raw) => {
         mockReadFile.mockResolvedValue(raw);
         await expect(loadConfig()).resolves.toEqual(DEFAULT_CONFIG);
       },
     );
 
-    it("requires an explicit session allowlist", async () => {
+    it("loads partial settings with defaults", async () => {
       mockReadFile.mockResolvedValue(JSON.stringify({ countdownMs: 10 }));
-      await expect(loadConfig()).resolves.toEqual(DEFAULT_CONFIG);
+      await expect(loadConfig()).resolves.toEqual({ ...DEFAULT_CONFIG, countdownMs: 10 });
     });
 
     it("loads a bounded valid config", async () => {
@@ -69,14 +63,6 @@ describe("config", () => {
       await expect(loadConfig()).resolves.toEqual(expected);
     });
 
-    it("deduplicates session ids", async () => {
-      mockReadFile.mockResolvedValue(
-        JSON.stringify(validConfig({ enabledSessionIds: [SESSION_ID, SESSION_ID] })),
-      );
-
-      await expect(loadConfig()).resolves.toMatchObject({ enabledSessionIds: [SESSION_ID] });
-    });
-
     it.each([
       { countdownMs: -1 },
       { countdownMs: 60_001 },
@@ -84,7 +70,6 @@ describe("config", () => {
       { maxStagnantSettles: 21 },
       { requireCompletionEvidence: "yes" },
       { phaseCompletionPromptTemplate: 123 },
-      { enabledSessionIds: ["not-a-session-id"] },
     ])("fails closed for invalid bounded settings: %j", async (overrides) => {
       mockReadFile.mockResolvedValue(JSON.stringify({ ...validConfig(), ...overrides }));
       await expect(loadConfig()).resolves.toEqual(DEFAULT_CONFIG);
@@ -105,14 +90,6 @@ describe("config", () => {
 
       expect(mockReadFile).toHaveBeenCalledTimes(1);
       expect(first).toBe(second);
-    });
-  });
-
-  describe("isSessionEnabled", () => {
-    it("matches only exact allowlisted session ids", () => {
-      const config = validConfig({ enabledSessionIds: [SESSION_ID] });
-      expect(isSessionEnabled(config, SESSION_ID)).toBe(true);
-      expect(isSessionEnabled(config, "01a0228b-ccbb-7fdf-b504-9f815411e610")).toBe(false);
     });
   });
 

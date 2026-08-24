@@ -6,8 +6,8 @@ This is a pinned local fork of [`@harms-haus/pi-tasks`](https://github.com/harms
 
 ## Safety model
 
-- Default deny: the extension activates only for exact session IDs listed in `~/.pi/agent/continuous-tasks.json`.
-- Non-allowlisted sessions have the task tools removed and blocked.
+- Default deny: task tools activate only after the user runs `/continuous-tasks enable` in that session.
+- Sessions without an activation entry have the task tools removed and blocked.
 - Continuation is scheduled only from Pi's `agent_settled` event, after retry, compaction retry, and queued follow-ups finish.
 - Continuations are hidden typed custom messages, not fake user messages.
 - Review completion requires bounded evidence with at least one passing reference.
@@ -16,18 +16,23 @@ This is a pinned local fork of [`@harms-haus/pi-tasks`](https://github.com/harms
 
 ## Configuration
 
-Create `~/.pi/agent/continuous-tasks.json`:
+Optional settings live in `~/.pi/agent/continuous-tasks.json`:
 
 ```json
 {
-  "enabledSessionIds": ["01a0228b-ccbb-7fdf-b504-9f815411e609"],
   "countdownMs": 3000,
   "maxStagnantSettles": 5,
   "requireCompletionEvidence": true
 }
 ```
 
-Do not create this file until the target board has been reviewed. Missing or invalid configuration disables the extension.
+Enable a session once with:
+
+```text
+/continuous-tasks enable
+```
+
+The extension stores a typed activation entry in that session. Reloading or resuming the same session restores activation; a new independent session remains disabled. Ending a session requires no cleanup. Missing or invalid settings use safe defaults.
 
 ## Task lifecycle
 
@@ -71,6 +76,7 @@ It does not start, stop, resume, or inspect the external run itself.
 ## Human command
 
 ```text
+/continuous-tasks enable
 /continuous-tasks status
 /continuous-tasks pause [reason]
 /continuous-tasks resume

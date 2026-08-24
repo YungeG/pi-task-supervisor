@@ -1,6 +1,6 @@
 import type { ExtensionAPI, ExtensionCommandContext } from "@earendil-works/pi-coding-agent";
 import { formatContinuePrompt, formatSummaryLine } from "./formatting";
-import { isSessionScopeEnabled } from "./scope";
+import { enableSessionScope, isSessionScopeEnabled } from "./scope";
 import { getBoardRef, persistEntries, setBoard, updateUI } from "./state";
 import { cloneBoard, hasActionableTasks, isSafeBoundedText } from "./validation";
 
@@ -96,13 +96,22 @@ function status(ctx: ExtensionCommandContext): void {
 
 export function registerCommands(pi: ExtensionAPI): void {
   pi.registerCommand("continuous-tasks", {
-    description: "Continuous Tasks status, pause, resume, or decision resolution",
+    description: "Enable or control Continuous Tasks for this session",
     handler(args, ctx) {
-      if (!isSessionScopeEnabled()) {
-        notifyError(ctx, "Continuous Tasks is disabled for this session");
+      const [action = "status", id, ...answerParts] = args.trim().split(/\s+/);
+      if (action === "enable") {
+        if (isSessionScopeEnabled()) {
+          ctx.ui.notify("Continuous Tasks is already enabled for this session", "info");
+          return Promise.resolve();
+        }
+        enableSessionScope(pi);
+        ctx.ui.notify("Continuous Tasks enabled for this session", "info");
         return Promise.resolve();
       }
-      const [action = "status", id, ...answerParts] = args.trim().split(/\s+/);
+      if (!isSessionScopeEnabled()) {
+        notifyError(ctx, "Continuous Tasks is disabled; run /continuous-tasks enable");
+        return Promise.resolve();
+      }
       if (action === "status") {
         status(ctx);
         return Promise.resolve();
@@ -121,7 +130,7 @@ export function registerCommands(pi: ExtensionAPI): void {
       }
       notifyError(
         ctx,
-        "Usage: /continuous-tasks status|pause [reason]|resume|resolve <id> <answer>",
+        "Usage: /continuous-tasks enable|status|pause [reason]|resume|resolve <id> <answer>",
       );
       return Promise.resolve();
     },

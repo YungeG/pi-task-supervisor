@@ -36,6 +36,17 @@ function latestSnapshot(sessionManager) {
     ?.data;
 }
 
+async function loadExtension(settingsManager) {
+  const loader = new DefaultResourceLoader({
+    cwd: sandbox,
+    agentDir: sandbox,
+    settingsManager,
+    additionalExtensionPaths: [extensionPath],
+  });
+  await loader.reload();
+  return loader;
+}
+
 async function waitForCompletion(sessionManager) {
   for (let attempt = 0; attempt < 500; attempt++) {
     const snapshot = latestSnapshot(sessionManager);
@@ -49,11 +60,10 @@ const settingsDigestBefore = digest(realSettings);
 process.env.PI_CODING_AGENT_DIR = sandbox;
 
 try {
-  const sessionManager = SessionManager.inMemory();
+  const sessionManager = SessionManager.create(sandbox, join(sandbox, "sessions"));
   writeFileSync(
     join(sandbox, "continuous-tasks.json"),
     JSON.stringify({
-      enabledSessionIds: [sessionManager.getSessionId()],
       countdownMs: 0,
       maxStagnantSettles: 5,
       requireCompletionEvidence: true,
@@ -61,13 +71,7 @@ try {
   );
 
   const settingsManager = SettingsManager.inMemory();
-  const loader = new DefaultResourceLoader({
-    cwd: sandbox,
-    agentDir: sandbox,
-    settingsManager,
-    additionalExtensionPaths: [extensionPath],
-  });
-  await loader.reload();
+  const loader = await loadExtension(settingsManager);
 
   const evidence = {
     summary: "Reviewed and validated in the real Pi smoke",
@@ -130,6 +134,12 @@ try {
   session = created.session;
   const extensionErrors = [];
   await session.bindExtensions({ onError: (error) => extensionErrors.push(error) });
+  if (session.extensionRunner.getActiveTools().includes("workflow_gate")) {
+    throw new Error("A fresh session exposed task tools before user activation");
+  }
+  const enableCommand = session.extensionRunner.getCommand("continuous-tasks");
+  if (!enableCommand) throw new Error("Continuous Tasks command was not registered");
+  await enableCommand.handler("enable", session.extensionRunner.createCommandContext());
 
   let agentStarts = 0;
   const toolSequence = [];
@@ -149,6 +159,9 @@ try {
   const continuationMessages = branch.filter(
     (entry) => entry.type === "custom_message" && entry.customType === "continuous-tasks:continue",
   );
+  const activationEntries = branch.filter(
+    (entry) => entry.type === "custom" && entry.customType === "continuous-tasks:activation",
+  );
 
   if (extensionErrors.length > 0)
     throw new Error(`Extension errors: ${JSON.stringify(extensionErrors)}`);
@@ -157,6 +170,12 @@ try {
   if (userMessages.length !== 1) throw new Error("Auto-continuation forged a user message");
   if (continuationMessages.length !== 1) {
     throw new Error(`Expected one hidden continuation, got ${continuationMessages.length}`);
+  }
+  if (
+    activationEntries.length !== 1 ||
+    JSON.stringify(activationEntries[0].data) !== JSON.stringify({ version: 1, enabled: true })
+  ) {
+    throw new Error("The enable command did not persist one valid session activation entry");
   }
   if (!snapshot.tasks.every((task) => task.status === "done" && task.completionEvidence)) {
     throw new Error("Completed tasks are missing evidence");
@@ -179,6 +198,69 @@ try {
     throw new Error("Real Pi settings changed during isolated smoke test");
   }
 
+  const sessionFile = sessionManager.getSessionFile();
+  if (!sessionFile) throw new Error("Persistent smoke session was not created");
+  session.dispose();
+  const reopened = SessionManager.open(sessionFile);
+  const resumedLoader = await loadExtension(settingsManager);
+  const resumed = await createAgentSession({
+    cwd: sandbox,
+    agentDir: sandbox,
+    modelRuntime,
+    model,
+    resourceLoader: resumedLoader,
+    settingsManager,
+    sessionManager: reopened,
+    noTools: "builtin",
+  });
+  session = resumed.session;
+  await session.bindExtensions({ onError: (error) => extensionErrors.push(error) });
+  if (!session.extensionRunner.getActiveTools().includes("workflow_gate")) {
+    throw new Error("Resuming the session did not restore activated task tools");
+  }
+
+  session.dispose();
+  const forkedManager = SessionManager.forkFrom(
+    sessionFile,
+    sandbox,
+    join(sandbox, "fork-sessions"),
+  );
+  const forkedLoader = await loadExtension(settingsManager);
+  const forked = await createAgentSession({
+    cwd: sandbox,
+    agentDir: sandbox,
+    modelRuntime,
+    model,
+    resourceLoader: forkedLoader,
+    settingsManager,
+    sessionManager: forkedManager,
+    noTools: "builtin",
+  });
+  session = forked.session;
+  await session.bindExtensions({ onError: (error) => extensionErrors.push(error) });
+  if (!session.extensionRunner.getActiveTools().includes("workflow_gate")) {
+    throw new Error("Forking the session did not inherit activated task tools");
+  }
+
+  session.dispose();
+  const independentManager = SessionManager.create(sandbox, join(sandbox, "independent-sessions"));
+  const independentLoader = await loadExtension(settingsManager);
+  const independent = await createAgentSession({
+    cwd: sandbox,
+    agentDir: sandbox,
+    modelRuntime,
+    model,
+    resourceLoader: independentLoader,
+    settingsManager,
+    sessionManager: independentManager,
+    noTools: "builtin",
+  });
+  session = independent.session;
+  await session.bindExtensions({ onError: (error) => extensionErrors.push(error) });
+  if (session.extensionRunner.getActiveTools().includes("workflow_gate")) {
+    throw new Error("An independent session inherited activation");
+  }
+
   console.log(
     JSON.stringify({
       result: "PASS",
@@ -188,6 +270,10 @@ try {
       finalStatus: snapshot.workflowStatus,
       userMessages: userMessages.length,
       hiddenContinuations: continuationMessages.length,
+      activationEntries: activationEntries.length,
+      resumedActivation: true,
+      forkedActivation: true,
+      independentDefaultDeny: true,
       realSettingsUntouched: true,
     }),
   );

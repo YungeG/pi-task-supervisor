@@ -2,6 +2,7 @@ import type { ExtensionContext } from "@earendil-works/pi-coding-agent";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { DEFAULT_CONFIG } from "../config";
 import { registerEventHandlers } from "../events";
+import { setSessionScopeEnabled } from "../scope";
 import { getBoard, resetState, setBoard } from "../state";
 import type { TaskBoardSnapshot } from "../types";
 import { createMockAPI, createMockContext } from "./helpers/mocks";
@@ -76,10 +77,8 @@ describe("settled continuation", () => {
 
   it("queues one hidden custom continuation only after agent_settled", async () => {
     const mockAPI = createMockAPI();
-    registerEventHandlers(mockAPI.api, async () => ({
-      ...DEFAULT_CONFIG,
-      enabledSessionIds: [SESSION_ID],
-    }));
+    registerEventHandlers(mockAPI.api, async () => DEFAULT_CONFIG);
+    setSessionScopeEnabled(true);
     setBoard(activeBoard());
     const context = settledContext();
 
@@ -107,7 +106,7 @@ describe("settled continuation", () => {
     );
   });
 
-  it("is a complete no-op for a session outside the allowlist", async () => {
+  it("is a complete no-op for a session without activation", async () => {
     const mockAPI = createMockAPI();
     registerEventHandlers(mockAPI.api, async () => DEFAULT_CONFIG);
     setBoard(activeBoard());
@@ -125,12 +124,35 @@ describe("settled continuation", () => {
     expect(getBoard()).toEqual(activeBoard());
   });
 
+  it("does not continue a disabled branch selected while config loads", async () => {
+    const mockAPI = createMockAPI();
+    let resolveConfig!: (value: typeof DEFAULT_CONFIG) => void;
+    const deferredConfig = new Promise<typeof DEFAULT_CONFIG>((resolve) => {
+      resolveConfig = resolve;
+    });
+    registerEventHandlers(mockAPI.api, () => deferredConfig);
+    setSessionScopeEnabled(true);
+    setBoard(activeBoard());
+    const enabledContext = settledContext();
+    await getHandler(mockAPI, "agent_end")(
+      { messages: [{ role: "assistant", stopReason: "stop" }] },
+      enabledContext,
+    );
+
+    const settled = getHandler(mockAPI, "agent_settled")({}, enabledContext);
+    await getHandler(mockAPI, "session_tree")({}, createMockContext());
+    resolveConfig(DEFAULT_CONFIG);
+    await settled;
+    await vi.advanceTimersByTimeAsync(3000);
+
+    expect(mockAPI.sendMessage).not.toHaveBeenCalled();
+    expect(getBoard().tasks).toEqual([]);
+  });
+
   it("discards a countdown when the board generation changes", async () => {
     const mockAPI = createMockAPI();
-    registerEventHandlers(mockAPI.api, async () => ({
-      ...DEFAULT_CONFIG,
-      enabledSessionIds: [SESSION_ID],
-    }));
+    registerEventHandlers(mockAPI.api, async () => DEFAULT_CONFIG);
+    setSessionScopeEnabled(true);
     setBoard(activeBoard());
     const context = settledContext();
 
@@ -150,10 +172,8 @@ describe("settled continuation", () => {
     ["error", "The last run still failed after Pi retries"],
   ])("pauses instead of continuing after %s", async (stopReason, reason) => {
     const mockAPI = createMockAPI();
-    registerEventHandlers(mockAPI.api, async () => ({
-      ...DEFAULT_CONFIG,
-      enabledSessionIds: [SESSION_ID],
-    }));
+    registerEventHandlers(mockAPI.api, async () => DEFAULT_CONFIG);
+    setSessionScopeEnabled(true);
     setBoard(activeBoard());
     const context = settledContext();
 
@@ -176,10 +196,8 @@ describe("settled continuation", () => {
 
   it("resumes auto-continuation after answering a progress question", async () => {
     const mockAPI = createMockAPI();
-    registerEventHandlers(mockAPI.api, async () => ({
-      ...DEFAULT_CONFIG,
-      enabledSessionIds: [SESSION_ID],
-    }));
+    registerEventHandlers(mockAPI.api, async () => DEFAULT_CONFIG);
+    setSessionScopeEnabled(true);
     setBoard(activeBoard());
     const context = settledContext();
 

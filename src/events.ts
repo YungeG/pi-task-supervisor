@@ -1,8 +1,13 @@
 import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
 import type { ContinuousTasksConfig } from "./config";
-import { isSessionEnabled, loadConfig, resetConfig } from "./config";
+import { loadConfig, resetConfig } from "./config";
 import { formatContinuePrompt, formatHiddenContext } from "./formatting";
-import { isSessionScopeEnabled, setSessionScopeEnabled } from "./scope";
+import {
+  isSessionScopeEnabled,
+  restoreSessionScope,
+  TASK_TOOL_NAMES,
+  setSessionScopeEnabled,
+} from "./scope";
 import {
   getBoardRef,
   persistEntries,
@@ -20,23 +25,8 @@ type ConfigLoader = () => Promise<ContinuousTasksConfig>;
 
 let activeCountdown: ReturnType<typeof setInterval> | null = null;
 let activeTimeout: ReturnType<typeof setTimeout> | null = null;
-const TOOL_NAMES = new Set([
-  "write_tasks",
-  "edit_tasks",
-  "compile_tasks",
-  "clear_tasks",
-  "get_ready_tasks",
-  "advance_tasks",
-  "workflow_gate",
-]);
-
 let lastRunOutcome: RunOutcome = "normal";
 let extensionContinuationGeneration: number | null = null;
-
-function updateActiveTools(pi: ExtensionAPI, enabled: boolean): void {
-  const active = pi.getActiveTools().filter((name) => !TOOL_NAMES.has(name));
-  pi.setActiveTools(enabled ? [...active, ...TOOL_NAMES] : active);
-}
 
 function clearCountdown(ctx: ExtensionContext): void {
   if (activeCountdown !== null) clearInterval(activeCountdown);
@@ -44,10 +34,6 @@ function clearCountdown(ctx: ExtensionContext): void {
   activeCountdown = null;
   activeTimeout = null;
   if (ctx.hasUI) ctx.ui.setWidget("continuous-tasks-countdown", undefined);
-}
-
-function sessionId(ctx: ExtensionContext): string {
-  return ctx.sessionManager.getSessionId();
 }
 
 function runOutcome(messages: { role: string; stopReason?: string }[]): RunOutcome {
@@ -210,12 +196,7 @@ function recordStagnation(
   return false;
 }
 
-async function restoreSession(
-  pi: ExtensionAPI,
-  ctx: ExtensionContext,
-  configLoader: ConfigLoader,
-  resetOutcome: boolean,
-): Promise<void> {
+function restoreSession(pi: ExtensionAPI, ctx: ExtensionContext, resetOutcome: boolean): void {
   clearCountdown(ctx);
   setLastToolWasAdvance(false);
   extensionContinuationGeneration = null;
@@ -223,9 +204,7 @@ async function restoreSession(
   const board = reconstructState(ctx);
   setBoard(board);
   updateUI(ctx, board);
-  const enabled = isSessionEnabled(await configLoader(), sessionId(ctx));
-  setSessionScopeEnabled(enabled);
-  updateActiveTools(pi, enabled);
+  restoreSessionScope(pi, ctx);
 }
 
 export function registerEventHandlers(
@@ -236,13 +215,13 @@ export function registerEventHandlers(
   lastRunOutcome = "normal";
   extensionContinuationGeneration = null;
 
-  pi.on("session_start", async (_event, ctx) => {
+  pi.on("session_start", (_event, ctx) => {
     resetConfig();
-    await restoreSession(pi, ctx, configLoader, true);
+    restoreSession(pi, ctx, true);
   });
 
-  pi.on("session_tree", async (_event, ctx) => {
-    await restoreSession(pi, ctx, configLoader, false);
+  pi.on("session_tree", (_event, ctx) => {
+    restoreSession(pi, ctx, false);
   });
 
   pi.on("session_shutdown", (_event, ctx) => {
@@ -268,8 +247,10 @@ export function registerEventHandlers(
   });
 
   pi.on("agent_settled", async (_event, ctx) => {
+    if (!isSessionScopeEnabled()) return;
+    const boardBeforeConfig = getBoardRef();
     const config = await configLoader();
-    if (!isSessionEnabled(config, sessionId(ctx))) return;
+    if (!isSessionScopeEnabled() || getBoardRef() !== boardBeforeConfig) return;
     const board = getBoardRef();
     if (board.workflowStatus !== "active") return;
     if (lastRunOutcome === "aborted") {
@@ -302,7 +283,7 @@ export function registerEventHandlers(
   });
 
   pi.on("tool_call", (event) => {
-    if (!isSessionScopeEnabled() && TOOL_NAMES.has(event.toolName)) {
+    if (!isSessionScopeEnabled() && TASK_TOOL_NAMES.includes(event.toolName)) {
       return {
         block: true,
         reason: "Continuous Tasks is disabled for this session",

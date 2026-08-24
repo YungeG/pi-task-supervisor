@@ -12,8 +12,12 @@ import {
 import type { TaskBoardSnapshot } from "../types";
 import { createMockAPI, createMockContext } from "./helpers/mocks";
 
-const SESSION_ID = "test-session";
 const NOW = "2026-08-23T00:00:00.000Z";
+const ACTIVATION_ENTRY = {
+  type: "custom",
+  customType: "continuous-tasks:activation",
+  data: { version: 1, enabled: true },
+};
 
 type Handler = (event: any, ctx: ExtensionContext) => unknown;
 
@@ -28,11 +32,7 @@ function context(branch: Array<{ type: string; customType?: string; data?: unkno
 }
 
 function config(overrides: Partial<ContinuousTasksConfig> = {}): ContinuousTasksConfig {
-  return {
-    ...DEFAULT_CONFIG,
-    enabledSessionIds: [SESSION_ID],
-    ...overrides,
-  };
+  return { ...DEFAULT_CONFIG, ...overrides };
 }
 
 function activeBoard(overrides: Partial<TaskBoardSnapshot> = {}): TaskBoardSnapshot {
@@ -75,6 +75,12 @@ function activeBoard(overrides: Partial<TaskBoardSnapshot> = {}): TaskBoardSnaps
 }
 
 async function registerAllowed(mockAPI: ReturnType<typeof createMockAPI>, ctx = context()) {
+  const branch = ctx.sessionManager.getBranch() as Array<{
+    type: string;
+    customType?: string;
+    data?: unknown;
+  }>;
+  branch.unshift(ACTIVATION_ENTRY);
   registerEventHandlers(mockAPI.api, async () => config());
   await getHandler(mockAPI, "session_start")({}, ctx);
   return ctx;
@@ -113,7 +119,7 @@ describe("continuous task lifecycle events", () => {
     ]);
   });
 
-  it("removes task tools and blocks calls outside the allowlist", async () => {
+  it("removes task tools and blocks calls without session activation", async () => {
     const mockAPI = createMockAPI();
     const ctx = context();
     registerEventHandlers(mockAPI.api, async () => DEFAULT_CONFIG);
@@ -127,7 +133,22 @@ describe("continuous task lifecycle events", () => {
     expect(await getHandler(mockAPI, "tool_call")({ toolName: "read" }, ctx)).toBeUndefined();
   });
 
-  it("enables all task tools for an allowlisted session", async () => {
+  it("rejects malformed activation entries", async () => {
+    const mockAPI = createMockAPI();
+    const ctx = context([
+      {
+        type: "custom",
+        customType: "continuous-tasks:activation",
+        data: { version: 1, enabled: false },
+      },
+    ]);
+    registerEventHandlers(mockAPI.api, async () => DEFAULT_CONFIG);
+
+    await getHandler(mockAPI, "session_start")({}, ctx);
+    expect(mockAPI.setActiveTools).toHaveBeenLastCalledWith(["read"]);
+  });
+
+  it("enables all task tools for an activated session", async () => {
     const mockAPI = createMockAPI();
     await registerAllowed(mockAPI);
 
@@ -147,17 +168,23 @@ describe("continuous task lifecycle events", () => {
     expect(ctx.ui.setStatus).toHaveBeenCalled();
   });
 
-  it("restores the selected branch on session_tree", async () => {
+  it("restores activation and board state from the selected branch", async () => {
     const board = activeBoard({ generation: 9 });
-    const ctx = context([{ type: "custom", customType: "continuous-tasks:snapshot", data: board }]);
+    const ctx = context([
+      ACTIVATION_ENTRY,
+      { type: "custom", customType: "continuous-tasks:snapshot", data: board },
+    ]);
     const mockAPI = createMockAPI();
     registerEventHandlers(mockAPI.api, async () => config());
 
     await getHandler(mockAPI, "session_tree")({}, ctx);
     expect(getBoard().generation).toBe(9);
+    expect(mockAPI.setActiveTools).toHaveBeenLastCalledWith(
+      expect.arrayContaining(["read", "write_tasks", "workflow_gate"]),
+    );
   });
 
-  it("injects hidden context only for an active allowlisted workflow", async () => {
+  it("injects hidden context only for an active enabled workflow", async () => {
     const mockAPI = createMockAPI();
     const ctx = await registerAllowed(mockAPI);
     setBoard(activeBoard());
@@ -374,10 +401,11 @@ describe("continuous task lifecycle events", () => {
 
   it("pauses after the configured number of stagnant automatic continuations", async () => {
     const mockAPI = createMockAPI();
-    const ctx = context();
+    const ctx = context([ACTIVATION_ENTRY]);
     registerEventHandlers(mockAPI.api, async () =>
       config({ countdownMs: 0, maxStagnantSettles: 2 }),
     );
+    await getHandler(mockAPI, "session_start")({}, ctx);
     setBoard(activeBoard());
 
     await recordNormalEnd(mockAPI, ctx);

@@ -97,7 +97,37 @@ describe("continuous-tasks command", () => {
     );
   });
 
-  it("rejects commands while the session is outside the allowlist", async () => {
+  it("enables only the current session and does not duplicate the marker", async () => {
+    const mockAPI = createMockAPI();
+    registerCommands(mockAPI.api);
+    const ctx = createMockContext() as ExtensionCommandContext;
+    const handler = commandHandler(mockAPI);
+    setSessionScopeEnabled(false);
+
+    await handler("enable", ctx);
+    await handler("enable", ctx);
+
+    expect(mockAPI.appendEntry).toHaveBeenCalledTimes(1);
+    expect(mockAPI.appendEntry).toHaveBeenCalledWith("continuous-tasks:activation", {
+      version: 1,
+      enabled: true,
+    });
+    expect(mockAPI.setActiveTools).toHaveBeenCalledWith(
+      expect.arrayContaining(["read", "write_tasks", "workflow_gate"]),
+    );
+    expect(ctx.ui.notify).toHaveBeenNthCalledWith(
+      1,
+      "Continuous Tasks enabled for this session",
+      "info",
+    );
+    expect(ctx.ui.notify).toHaveBeenNthCalledWith(
+      2,
+      "Continuous Tasks is already enabled for this session",
+      "info",
+    );
+  });
+
+  it("rejects control commands until the session is enabled", async () => {
     const mockAPI = createMockAPI();
     registerCommands(mockAPI.api);
     const ctx = createMockContext() as ExtensionCommandContext;
@@ -106,7 +136,7 @@ describe("continuous-tasks command", () => {
     await commandHandler(mockAPI)("status", ctx);
 
     expect(ctx.ui.notify).toHaveBeenCalledWith(
-      "Continuous Tasks is disabled for this session",
+      "Continuous Tasks is disabled; run /continuous-tasks enable",
       "error",
     );
     expect(mockAPI.sendMessage).not.toHaveBeenCalled();
