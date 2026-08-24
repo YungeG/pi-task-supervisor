@@ -37,6 +37,7 @@ Implemented commits:
 f2a6da9 feat: continue only after agent settles
 33087da feat: require evidence for task completion
 21f2cfc feat: add decision and execution receipt gates
+28d9e2e feat: enable continuous tasks per session
 ```
 
 Current fan-in expectations:

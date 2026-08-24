@@ -2,6 +2,7 @@
 
 - Date: 2026-08-23
 - Baseline candidate: `2b2fb3567abd8ce569e10d4aa966e9d8c7b943a5`
+- Session activation candidate: `28d9e2eb188d324c3c87750349b66858fc47f65e`
 - Pi: `0.84.2`
 - Node: `24.14.1`, `25.9.0`
 - Real user settings/session modified: no
