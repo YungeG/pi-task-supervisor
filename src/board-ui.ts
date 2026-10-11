@@ -1,8 +1,13 @@
-import type { ExtensionContext } from "@earendil-works/pi-coding-agent";
-import { stripTerminalSequences, truncateToWidth } from "@earendil-works/pi-tui";
+import type { ExtensionContext, Theme, ThemeColor } from "@earendil-works/pi-coding-agent";
+import { stripTerminalSequences, truncateToWidth, visibleWidth } from "@earendil-works/pi-tui";
 import { phaseLabel } from "./formatting";
 import { currentRuntime } from "./runtime";
-import { TERMINAL_STATUSES, type TaskBoardSnapshot, type TaskRecord } from "./types";
+import {
+  TERMINAL_STATUSES,
+  type TaskBoardSnapshot,
+  type TaskRecord,
+  type TaskStatus,
+} from "./types";
 
 export const TASK_WIDGET_KEY = "continuous-tasks:board";
 const MAX_WIDGET_LINES = 8;
@@ -15,6 +20,17 @@ const STATUS_ORDER = {
   done: 4,
   abandoned: 5,
 };
+
+// Monochrome glyphs avoid emoji width/font differences; color is never the only status cue.
+const STATUS_STYLE = {
+  implementing: { icon: "▶", label: "doing", color: "accent" },
+  reviewing: { icon: "◇", label: "review", color: "warning" },
+  ready: { icon: "●", label: "ready", color: "success" },
+  configured: { icon: "○", label: "queued", color: "muted" },
+  draft: { icon: "·", label: "draft", color: "dim" },
+  done: { icon: "✓", label: "done", color: "success" },
+  abandoned: { icon: "×", label: "dropped", color: "dim" },
+} satisfies Record<TaskStatus, { icon: string; label: string; color: ThemeColor }>;
 
 /** Display-only normalization: never change the task or its evidence. */
 function text(value: string): string {
@@ -52,27 +68,43 @@ function taskRow(board: Readonly<TaskBoardSnapshot>, task: TaskRecord): string {
   return `[${task.status}] ${text(task.id)} ${text(task.title)}${notes.length ? ` — ${notes.join("; ")}` : ""}`;
 }
 
-function boardHeader(board: Readonly<TaskBoardSnapshot>): string[] {
+function boardHeader(board: Readonly<TaskBoardSnapshot>): { text: string; color: ThemeColor }[] {
   const done = board.tasks.filter((task) => task.status === "done").length;
   const abandoned = board.tasks.filter((task) => task.status === "abandoned").length;
   const unfinished = board.tasks.length - done - abandoned;
   const activePhase = board.phases.find((phase) => phase.status === "active");
-  const lines = [
-    `Tasks: ${done}/${board.tasks.length} done · ${unfinished} unfinished${abandoned ? ` · ${abandoned} abandoned` : ""}`,
-    `Workflow: ${board.workflowStatus} · ${activePhase ? text(phaseLabel(board, activePhase.phase)) : "No active phase"}`,
+  const lines: { text: string; color: ThemeColor }[] = [
+    {
+      text: `Tasks: ${done}/${board.tasks.length} done · ${unfinished} unfinished${abandoned ? ` · ${abandoned} abandoned` : ""}`,
+      color: "muted",
+    },
+    {
+      text: `Workflow: ${board.workflowStatus} · ${activePhase ? text(phaseLabel(board, activePhase.phase)) : "No active phase"}`,
+      color: board.workflowStatus === "completed" ? "success" : "muted",
+    },
   ];
   const { supervisor, journalFault } = currentRuntime();
-  if (supervisor)
-    lines.push(
-      `Supervisor: ${supervisor.status}${supervisor.reason ? ` — ${text(supervisor.reason)}` : ""}`,
-    );
-  if (journalFault) lines.push(`Fault: ${text(journalFault)}`);
+  if (supervisor) {
+    let color: ThemeColor = "warning";
+    if (supervisor.status === "fault") color = "error";
+    else if (supervisor.status === "completed") color = "success";
+    else if (supervisor.status === "active" || supervisor.status === "reviewing") color = "accent";
+    lines.push({
+      text: `Supervisor: ${supervisor.status}${supervisor.reason ? ` — ${text(supervisor.reason)}` : ""}`,
+      color,
+    });
+  }
+  if (journalFault) lines.push({ text: `Fault: ${text(journalFault)}`, color: "error" });
   if (board.workflowStatus === "paused")
-    lines.push(`Paused: ${text(board.pauseReason ?? "Paused by user")}`);
+    lines.push({
+      text: `Paused: ${text(board.pauseReason ?? "Paused by user")}`,
+      color: "warning",
+    });
   if (board.decision)
-    lines.push(
-      `Decision ${text(board.decision.id)} (${text(board.decision.taskId)}): ${text(board.decision.question)}`,
-    );
+    lines.push({
+      text: `Decision ${text(board.decision.id)} (${text(board.decision.taskId)}): ${text(board.decision.question)}`,
+      color: "warning",
+    });
   return lines;
 }
 
@@ -85,17 +117,47 @@ export function updateTaskWidget(ctx: ExtensionContext, board: Readonly<TaskBoar
     return;
   }
   const unfinished = orderedTasks(board).filter((task) => !TERMINAL_STATUSES.has(task.status));
-  const lines = boardHeader(board);
-  const visible = unfinished.slice(0, MAX_WIDGET_LINES - lines.length - 1);
-  lines.push(...visible.map((task) => taskRow(board, task)));
+  const header = boardHeader(board);
+  const visible = unfinished.slice(0, MAX_WIDGET_LINES - header.length - 1);
+  const idWidth = Math.min(14, Math.max(4, ...visible.map((task) => visibleWidth(text(task.id)))));
+  // Capture data here: Pi can render later, outside this session's AsyncLocalStorage scope.
+  const rows = visible.map((task) => ({
+    style: STATUS_STYLE[task.status],
+    id: stripTerminalSequences(truncateToWidth(text(task.id), idWidth, "…", true)),
+    title: text(task.title),
+    notes: taskNotes(board, task).join("; "),
+    active: task.status === "implementing" || task.status === "reviewing",
+  }));
   const hidden = unfinished.length - visible.length;
   const folded = board.tasks.length - unfinished.length;
-  lines.push(`/task-supervisor tasks · ${hidden} more unfinished · ${folded} terminal folded`);
-  // Capture strings here: Pi can render later, outside this session's AsyncLocalStorage scope.
+  const footer = `/task-supervisor tasks${hidden ? ` · +${hidden} more` : ""}${folded ? ` · ${folded} folded` : ""}`;
   ctx.ui.setWidget(
     TASK_WIDGET_KEY,
-    () => ({
-      render: (width) => lines.map((line) => truncateToWidth(line, width)),
+    (_tui, theme: Theme) => ({
+      render(width) {
+        const rail = theme.fg("borderMuted", "│  ");
+        const lines = header.map((line, index) =>
+          index === 0
+            ? theme.fg("borderMuted", "╭─ ") +
+              theme.fg("accent", theme.bold("Tasks")) +
+              theme.fg(line.color, `  ${line.text.slice("Tasks: ".length)}`)
+            : rail + theme.fg(line.color, line.text),
+        );
+        lines.push(
+          ...rows.map(({ style, id, title, notes, active }) => {
+            let row =
+              rail +
+              theme.fg(style.color, `${style.icon} ${style.label.padEnd(7)}`) +
+              theme.fg("dim", `${id}  `) +
+              theme.fg("text", active ? theme.bold(title) : title);
+            if (notes)
+              row += theme.fg(notes.includes("waiting for") ? "warning" : "dim", ` · ${notes}`);
+            return row;
+          }),
+          theme.fg("borderMuted", "╰─ ") + theme.fg("dim", footer),
+        );
+        return lines.map((line) => truncateToWidth(line, width));
+      },
       invalidate() {},
     }),
     { placement: "aboveEditor" },
@@ -109,7 +171,7 @@ export async function showTaskList(
 ): Promise<void> {
   if (!ctx.hasUI) return;
   const board = structuredClone(snapshot);
-  const header = boardHeader(board);
+  const header = boardHeader(board).map((line) => line.text);
   if (!board.tasks.length) {
     ctx.ui.notify([...header, "No tasks"].join("\n"), "info");
     return;

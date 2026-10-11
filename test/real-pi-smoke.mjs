@@ -24,6 +24,19 @@ import {
   SettingsManager,
 } from "@earendil-works/pi-coding-agent";
 
+// Native built-in themes, resolved from this SDK; no theme/settings mutation.
+const { getThemeByName } = await import(
+  new URL(
+    "./modes/interactive/theme/theme.js",
+    import.meta.resolve("@earendil-works/pi-coding-agent"),
+  ).href
+);
+const widgetThemes = ["system", "dark", "light"].map((name) => {
+  const theme = getThemeByName(name);
+  if (!theme) throw new Error(`Native theme unavailable: ${name}`);
+  return theme;
+});
+
 const packageRoot = resolve(dirname(fileURLToPath(import.meta.url)), "..");
 const extensionPath = join(packageRoot, "src", "index.ts");
 const sandbox = mkdtempSync(join(tmpdir(), "pi-task-supervisor-smoke-"));
@@ -319,18 +332,24 @@ try {
       if (content) {
         if (typeof content !== "function" || options?.placement !== "aboveEditor")
           throw new Error("Widget did not use the bounded above-editor component");
-        const component = content(undefined, undefined);
-        for (const width of [1, 35, 72]) {
-          const lines = component.render(width);
-          if (
-            lines.length > 8 ||
-            lines.some(
-              (line) => visibleWidth(line) > width || /\p{Cc}/u.test(stripTerminalSequences(line)),
+        for (const theme of widgetThemes) {
+          const component = content(undefined, theme);
+          for (const width of [0, 1, 2, 35, 72, 120]) {
+            const lines = component.render(width);
+            if (
+              lines.length > 8 ||
+              lines.some(
+                (line) =>
+                  visibleWidth(line) > width || /\p{Cc}/u.test(stripTerminalSequences(line)),
+              )
             )
-          )
-            throw new Error("Widget exceeded terminal width/row limits");
+              throw new Error(`Widget exceeded terminal width/row limits in ${theme.name}`);
+          }
+          const plain = component.render(72).map(stripTerminalSequences);
+          if (widgetLines.length && JSON.stringify(plain) !== JSON.stringify(widgetLines))
+            throw new Error("Theme changed task-board content or alignment");
+          widgetLines = plain;
         }
-        widgetLines = component.render(72).map(stripTerminalSequences);
       }
       widgetHistory.push([...widgetLines]);
     },
@@ -403,10 +422,10 @@ try {
   await session.agent.waitForIdle();
 
   if (
-    !widgetHistory.some((lines) => lines.some((line) => line.includes("[implementing]"))) ||
-    !widgetHistory.some((lines) => lines.some((line) => line.includes("[reviewing]"))) ||
+    !widgetHistory.some((lines) => lines.some((line) => line.includes("▶ doing"))) ||
+    !widgetHistory.some((lines) => lines.some((line) => line.includes("◇ review"))) ||
     !widgetLines.some((line) => line.includes("2/2 done · 0 unfinished")) ||
-    widgetLines.some((line) => line.includes("[done]"))
+    widgetLines.some((line) => line.includes("✓ done"))
   )
     throw new Error("Widget missed lifecycle progress or failed to fold completed tasks");
   if (

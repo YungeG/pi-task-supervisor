@@ -1,4 +1,5 @@
 import { beforeEach, describe, expect, it, vi } from "vitest";
+import type { Theme } from "@earendil-works/pi-coding-agent";
 import { stripTerminalSequences, visibleWidth, type TUI } from "@earendil-works/pi-tui";
 import { showTaskList, TASK_WIDGET_KEY, updateTaskWidget } from "../board-ui";
 import { createEmptyBoard } from "../engine";
@@ -36,10 +37,15 @@ function board(tasks: TaskRecord[]): TaskBoardSnapshot {
   };
 }
 
-function widget(ctx: ReturnType<typeof createMockContext>) {
+function widget(ctx: ReturnType<typeof createMockContext>, theme?: Theme) {
   const content = vi.mocked(ctx.ui.setWidget).mock.calls.at(-1)?.[1];
   if (typeof content !== "function") throw new Error("Task widget was not installed");
-  return content({} as TUI, createMockTheme());
+  if (!theme) {
+    theme = createMockTheme();
+    vi.mocked(theme.fg).mockImplementation((_color, value) => value);
+    vi.mocked(theme.bold).mockImplementation((value) => value);
+  }
+  return content({} as TUI, theme);
 }
 
 function supervisedContext() {
@@ -72,20 +78,20 @@ describe("visible task board", () => {
     updateUI(ctx, snapshot);
     const lines = widget(ctx).render(200);
     expect(lines).toHaveLength(8);
-    expect(lines[0]).toBe("Tasks: 1/7 done · 5 unfinished · 1 abandoned");
+    expect(lines[0]).toBe("╭─ Tasks  1/7 done · 5 unfinished · 1 abandoned");
     expect(lines[1]).toContain("Phase 1: Implement");
-    expect(lines.slice(2, 7).map((line) => line.split("]")[0])).toEqual([
-      "[reviewing",
-      "[implementing",
-      "[ready",
-      "[configured",
-      "[draft",
+    expect(lines.slice(2, 7).map((line) => line.split(/\s+/u)[2])).toEqual([
+      "review",
+      "doing",
+      "ready",
+      "queued",
+      "draft",
     ]);
     expect(lines.join("\n")).toContain("waiting for abandoned; waiting for phase 2");
     expect(lines.join("\n")).not.toContain("waiting for done");
     expect(lines.join("\n")).toContain("plan not compiled");
     expect(lines.join("\n")).toContain("run pi-subagents:run-1");
-    expect(lines.at(-1)).toBe("/task-supervisor tasks · 0 more unfinished · 2 terminal folded");
+    expect(lines.at(-1)).toBe("╰─ /task-supervisor tasks · 2 folded");
     expect(ctx.ui.setWidget).toHaveBeenCalledWith(TASK_WIDGET_KEY, expect.any(Function), {
       placement: "aboveEditor",
     });
@@ -96,7 +102,7 @@ describe("visible task board", () => {
     const snapshot = board(Array.from({ length: 100 }, (_, i) => task(`t-${i}`, "ready")));
     const ctx = createMockContext();
     updateTaskWidget(ctx, snapshot);
-    expect(widget(ctx).render(120).at(-1)).toContain("95 more unfinished");
+    expect(widget(ctx).render(120).at(-1)).toContain("+95 more");
     await showTaskList(ctx, snapshot);
     expect(vi.mocked(ctx.ui.select).mock.calls[0]?.[1]).toHaveLength(100);
     expect(ctx.ui.notify).not.toHaveBeenCalled();
@@ -215,7 +221,10 @@ describe("visible task board", () => {
         }),
       ]),
     );
-    const component = widget(ctx);
+    const theme = createMockTheme();
+    vi.mocked(theme.fg).mockImplementation((_color, value) => `\u001b[36m${value}\u001b[39m`);
+    vi.mocked(theme.bold).mockImplementation((value) => `\u001b[1m${value}\u001b[22m`);
+    const component = widget(ctx, theme);
     component.invalidate();
     for (const width of [0, 1, 2, 10, 35, 120]) {
       const lines = component.render(width);
@@ -230,11 +239,54 @@ describe("visible task board", () => {
     expect(component.render(120).join("\n")).not.toContain("unwanted title");
   });
 
+  it("uses native theme roles and aligned columns without relying on color for status", () => {
+    const ctx = createMockContext();
+    const snapshot = board([
+      task("短", "implementing", { title: "Implement login" }),
+      task("longer-id", "ready", { title: "Verify login", dependencies: ["missing"] }),
+    ]);
+    updateTaskWidget(ctx, snapshot);
+    const plain = widget(ctx).render(150);
+    const firstTitle = plain[2]!.indexOf("Implement login");
+    const secondTitle = plain[3]!.indexOf("Verify login");
+    expect(visibleWidth(plain[2]!.slice(0, firstTitle))).toBe(
+      visibleWidth(plain[3]!.slice(0, secondTitle)),
+    );
+    expect(plain[2]).toContain("▶ doing");
+    expect(plain[3]).toContain("● ready");
+    expect(plain.at(-1)).not.toContain("0 more");
+    expect(plain.at(-1)).not.toContain("0 folded");
+    const theme = createMockTheme();
+    widget(ctx, theme).render(200);
+    expect(theme.fg).toHaveBeenCalledWith("accent", "**Tasks**");
+    expect(theme.fg).toHaveBeenCalledWith("success", expect.stringContaining("● ready"));
+    expect(theme.fg).toHaveBeenCalledWith("warning", " · waiting for missing");
+    expect(theme.bold).toHaveBeenCalledWith("Implement login");
+    currentRuntime().journalFault = "Invalid journal";
+    updateTaskWidget(ctx, snapshot);
+    widget(ctx, theme).render(200);
+    expect(theme.fg).toHaveBeenCalledWith("error", "Fault: Invalid journal");
+  });
+
+  it("caps long IDs so they cannot consume the title column", () => {
+    const ctx = createMockContext();
+    updateTaskWidget(ctx, board([task("编号".repeat(30), "ready", { title: "Readable title" })]));
+    const row = stripTerminalSequences(widget(ctx).render(72)[2]!);
+    expect(row).toMatch(/…\s+Readable title/u);
+    expect(visibleWidth(row.slice(0, row.indexOf("Readable title")))).toBeLessThanOrEqual(28);
+  });
+
   it("captures session UI data before deferred render and modal awaits", async () => {
     const { ctx } = supervisedContext();
     const snapshot = board([task("t-1", "ready")]);
     updateTaskWidget(ctx, snapshot);
     const component = widget(ctx);
+    const captured = component.render(120);
+    snapshot.tasks[0]!.title = "Changed after widget capture";
+    snapshot.tasks[0]!.id = "Changed ID";
+    expect(component.render(120)).toEqual(captured);
+    snapshot.tasks[0]!.title = "Task t-1";
+    snapshot.tasks[0]!.id = "t-1";
     const saved = currentRuntime().supervisor;
     currentRuntime().supervisor = undefined;
     expect(component.render(120).join("\n")).toContain("Supervisor: active");

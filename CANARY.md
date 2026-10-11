@@ -1,17 +1,39 @@
 # Local supervisor validation report
 
 - Validated: 2026-10-11 (UTC)
-- Candidate: `pi-task-supervisor/`, prepublication task-board UI validation snapshot on `local/continuous-tasks`, based on published `9dd5e4d8cce1d28d25e1b8ad96bef8c88f9106e5`
+- Candidate: `pi-task-supervisor/`, native-board appearance validation snapshot on `local/continuous-tasks`, based on published/installed `e6725ba74d2d01e2cb586ba6a823a62b6471d41f`
 - Public name/command: **Pi Task Supervisor**, `/task-supervisor`; `/continuous-tasks` remains an alias
 - Pi: `1.1.0` (`pi-ai`, `pi-coding-agent`, `pi-tui`); `typebox@1.3.7`
 - Node: `25.9.0`
 - Result: local acceptance checks pass, subject to the limitations below; **not production certification**
-- Installed/deployed plugins, business sessions, and global settings changed: **no**
+- Installed/deployed plugins, business sessions, and global settings changed during this polish validation: **no**
 - Live model calls: **none**; all advisor/Main responses are local mocks or faux-provider fixtures
 
 This replaces the earlier Pi 0.84.2 board-only canary. Historical results are retained in `UPSTREAM.md` and are not current validation evidence.
 
-## Current task-board UI checks
+## Current native-board appearance checks
+
+`npm run check` passed after theme-aware appearance changes. Only `src/board-ui.ts` production code changed: task ordering, read-only list/details, activation, gates, execution, persistence, and evidence semantics remain unchanged. The widget uses built-in theme roles, monochrome status glyphs, aligned status/ID columns, bold active titles, and a subtle left rail. Display IDs are capped at 14 columns; the full list retains exact IDs. Empty overflow/fold counts are omitted. Session-derived strings and row data are still captured before deferred rendering.
+
+| Check                                         | Result                                                                                                        |
+| --------------------------------------------- | ------------------------------------------------------------------------------------------------------------- |
+| TypeScript, ESLint, source formatting         | PASS                                                                                                          |
+| Unit/integration suite                        | **525 tests, 27 files PASS**                                                                                  |
+| Branch coverage                               | **90.79% (1124/1238)**; unchanged 90% threshold                                                               |
+| Statement / function / line coverage          | 95.52% / 97.83% / 97.57%                                                                                      |
+| Five isolated real-Pi SDK smokes with UI stub | PASS                                                                                                          |
+| Native theme rendering                        | PASS: `system`, `dark`, `light`; widths 0, 1, 2, 35, 72, 120; identical plain content/alignment across themes |
+| Native preview fixtures                       | PASS: three themes at 35, 72, 120 columns, including CJK titles                                               |
+| Package dry-run manifest                      | PASS: 23 files, all 16 production TypeScript files; tests and dependencies excluded                           |
+| `git diff --check`                            | PASS                                                                                                          |
+
+Active LSP probes covered both changed TypeScript files and the SDK smoke script: no errors; three auxiliary warnings remain for the existing extensionless-relative-import convention. This is not a zero-warning claim. Full TypeScript checking passed.
+
+Focused tests passed (28 tests across board UI and commands), including color-role calls, glyph/status cues, CJK column alignment, long-ID truncation, ANSI/control safety, overflow, gate visibility, deferred-session capture, read-only commands, and unchanged evidence. The five SDK modes retain all prior lifecycle, restoration, isolation, gate, and no-live-inference checks while rendering with actual built-in themes instead of an undefined theme stub.
+
+The temporary preview HTML contains actual widget output and native theme colors, not an independently designed UI. Browser screenshot inspection was unavailable: the installed agent-browser version is unsupported by its Pi tool. No browser/extension upgrade was attempted. Theme/text/width checks are **not human visual acceptance in the user's real terminal**, and no business session was reloaded. At this local validation point, the candidate had not been committed, pushed, or installed. Publication and installation are separate user-authorized follow-up operations, not evidence of real-terminal visual acceptance.
+
+## Previous visible-board checks (historical)
 
 `npm run check` passed after the visible-board changes and final empty-paused-board regression fix. The existing snapshot remains the sole task store; no task schema, completion gate, dependency, or activation contract changed. At this validation point, the UI changes had not been committed, published, or installed. Subsequent publication or installation does not constitute live-model or production certification.
 
@@ -95,4 +117,4 @@ For immediate advisor cancellation, use **`/task-supervisor pause` before manual
 - Node 24 and clean peer-dependency installation were not retested for this candidate. Current execution evidence is Node 25.9.0 with existing local dependencies.
 - Redaction is not general DLP, and task gates are not an OS/tool permission sandbox. Other Main tools retain host controls.
 
-The controlling agent completed the authorized local validation. This report records the prepublication validation snapshot; publication and installation are separately authorized follow-up operations, not additional validation evidence. No user action is needed for these checks. Live/business validation, credential changes, and business-session activation remain outside this validation scope.
+The controlling agent completed the authorized local validation. This report records local validation snapshots; publishing and installing the appearance polish are separately authorized follow-up operations and do not constitute additional validation evidence. No user action is needed for these checks. Live/business validation, credential changes, and business-session activation remain outside this validation scope.

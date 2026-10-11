@@ -36,14 +36,16 @@ Activation is a durable session entry. Resuming restores it; independent session
 In the interactive terminal, a persistent board appears above the editor. It uses the existing session snapshot, not a separate task store:
 
 ```text
-Tasks: 2/6 done · 4 unfinished
-Workflow: active · Phase 2: Implement
-[implementing] t-2.1 Login endpoint
-[reviewing] t-2.2 Error handling
-[configured] t-3.1 Documentation — waiting for t-2.1; waiting for phase 3
-[configured] t-3.2 Final acceptance — waiting for t-2.2, t-3.1; waiting for phase 3
-/task-supervisor tasks · 0 more unfinished · 2 terminal folded
+╭─ Tasks  2/6 done · 4 unfinished
+│  Workflow: active · Phase 2: Implement
+│  ▶ doing  t-2.1  Login endpoint
+│  ◇ review t-2.2  Error handling
+│  ○ queued t-3.1  Documentation · waiting for t-2.1; waiting for phase 3
+│  ○ queued t-3.2  Final acceptance · waiting for t-2.2, t-3.1; waiting for phase 3
+╰─ /task-supervisor tasks · 2 folded
 ```
+
+The widget uses Pi's active theme, a subtle left rail, aligned status/ID columns, and bold titles for implementing/reviewing tasks. Monochrome glyphs and labels keep status readable without color: `▶ doing` (implementing), `◇ review` (reviewing), `● ready`, `○ queued` (configured), and `· draft`. IDs are capped at 14 display columns; full IDs remain in the read-only list. Zero overflow/fold counts are omitted from the footer; overflow appears as `+N more`.
 
 The widget is capped at eight single terminal lines and prioritizes implementing/reviewing tasks, then ready and planned tasks. It shows unmet dependencies, later-phase gates, execution references, pending decisions, pause reasons, and supervisor holds/faults. Long lines are truncated to terminal width; the full list/details remain available through `/task-supervisor tasks` (also `/continuous-tasks tasks`). Completed and abandoned tasks are folded, never auto-deleted; abandoned tasks are counted separately from verified completion. Empty fresh sessions have no widget. RPC/print modes have no custom widget; RPC can use the native list command.
 
