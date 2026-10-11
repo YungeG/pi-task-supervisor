@@ -5,15 +5,11 @@ import { createEmptyBoard } from "../engine";
 import {
   getBoard,
   setBoard,
-  setBoardQuiet,
   getBoardRef,
-  incrementAutoContinue,
   resetState,
   reconstructState,
   persistEntries,
   updateUI,
-  getLastToolWasAdvance,
-  setLastToolWasAdvance,
 } from "../state";
 import { createMockContext, createMockAPI } from "./helpers/mocks";
 
@@ -208,20 +204,6 @@ describe("state", () => {
       expect(board).toEqual(newBoard);
     });
 
-    it("setBoard resets auto-continue counter", () => {
-      // Increment a few times
-      incrementAutoContinue();
-      incrementAutoContinue();
-      incrementAutoContinue();
-
-      // Set board should reset counter
-      setBoard(makeSampleBoard());
-
-      // First increment after reset should be 1
-      const count = incrementAutoContinue();
-      expect(count).toBe(1);
-    });
-
     it("getBoard returns a deep copy", () => {
       setBoard(makeSampleBoard());
       const board1 = getBoard();
@@ -255,47 +237,6 @@ describe("state", () => {
       const ref1 = getBoardRef();
       const ref2 = getBoardRef();
       expect(ref1).toBe(ref2);
-    });
-  });
-
-  // ── setBoardQuiet ──
-
-  describe("setBoardQuiet", () => {
-    it("replaces board without resetting auto-continue counter", () => {
-      incrementAutoContinue(); // 1
-      incrementAutoContinue(); // 2
-      incrementAutoContinue(); // 3
-
-      setBoardQuiet(makeSampleBoard());
-
-      // Counter should NOT have been reset
-      expect(incrementAutoContinue()).toBe(4);
-    });
-
-    it("returns deep copy via getBoard", () => {
-      const board = makeSampleBoard();
-      setBoardQuiet(board);
-
-      // getBoard should return the same data
-      const retrieved = getBoard();
-      expect(retrieved).toEqual(board);
-
-      // Mutating getBoard result should not affect stored state
-      retrieved.tasks[0]!.title = "MUTATED";
-      const fresh = getBoard();
-      expect(fresh.tasks[0]!.title).not.toBe("MUTATED");
-    });
-
-    it("stores a deep copy (mutations to original don't affect state)", () => {
-      const original = makeSampleBoard();
-      setBoardQuiet(original);
-
-      // Mutate the original
-      original.tasks[0]!.title = "MUTATED";
-
-      // getBoard should not reflect the mutation
-      const board = getBoard();
-      expect(board.tasks[0]!.title).not.toBe("MUTATED");
     });
   });
 
@@ -492,54 +433,6 @@ describe("state", () => {
       updateUI(ctx, board);
 
       expect(ctx.ui.setStatus).toHaveBeenCalledWith("til-done-active", undefined);
-    });
-  });
-
-  // ── Auto-continue counter ──
-
-  describe("auto-continue counter", () => {
-    it("incrementAutoContinue accumulates", () => {
-      expect(incrementAutoContinue()).toBe(1);
-      expect(incrementAutoContinue()).toBe(2);
-      expect(incrementAutoContinue()).toBe(3);
-    });
-
-    it("setBoard resets counter", () => {
-      incrementAutoContinue();
-      incrementAutoContinue();
-      expect(incrementAutoContinue()).toBe(3);
-
-      setBoard(makeSampleBoard());
-
-      expect(incrementAutoContinue()).toBe(1);
-    });
-
-    it("resetState resets counter", () => {
-      incrementAutoContinue();
-      incrementAutoContinue();
-
-      resetState();
-
-      expect(incrementAutoContinue()).toBe(1);
-    });
-  });
-
-  // ── Double-usage tracking state ──
-
-  describe("double-usage tracking state", () => {
-    it("getLastToolWasAdvance returns false initially", () => {
-      expect(getLastToolWasAdvance()).toBe(false);
-    });
-
-    it("setLastToolWasAdvance sets the flag", () => {
-      setLastToolWasAdvance(true);
-      expect(getLastToolWasAdvance()).toBe(true);
-    });
-
-    it("resetState clears flag", () => {
-      setLastToolWasAdvance(true);
-      resetState();
-      expect(getLastToolWasAdvance()).toBe(false);
     });
   });
 });

@@ -19,14 +19,8 @@ export function getBoard(): TaskBoardSnapshot {
   return cloneBoard(currentRuntime().board);
 }
 
-/** Replaces the board state. Resets auto-continue counter. */
+/** Replaces the board state with a deep copy. */
 export function setBoard(newBoard: TaskBoardSnapshot): void {
-  currentRuntime().board = cloneBoard(newBoard);
-  currentRuntime().autoContinueCount = 0;
-}
-
-/** Replaces the board state without resetting the auto-continue counter. Used internally by the auto-continue loop. */
-export function setBoardQuiet(newBoard: TaskBoardSnapshot): void {
   currentRuntime().board = cloneBoard(newBoard);
 }
 
@@ -35,26 +29,9 @@ export function getBoardRef(): Readonly<TaskBoardSnapshot> {
   return currentRuntime().board;
 }
 
-/** Increments and returns the auto-continue counter. */
-export function incrementAutoContinue(): number {
-  return ++currentRuntime().autoContinueCount;
-}
-
-/** Returns whether the last tool result was from advance_tasks. */
-export function getLastToolWasAdvance(): boolean {
-  return currentRuntime().lastToolWasAdvance;
-}
-
-/** Set the last-tool-was-advance flag. */
-export function setLastToolWasAdvance(value: boolean): void {
-  currentRuntime().lastToolWasAdvance = value;
-}
-
 /** Resets all mutable state. For testing only. */
 export function resetState(): void {
   currentRuntime().board = createEmptyBoard();
-  currentRuntime().autoContinueCount = 0;
-  currentRuntime().lastToolWasAdvance = false;
   currentRuntime().supervisor = undefined;
   currentRuntime().journalFault = undefined;
 }

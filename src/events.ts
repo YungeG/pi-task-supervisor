@@ -15,15 +15,7 @@ import {
   setSessionScopeEnabled,
   updateActiveTools,
 } from "./scope";
-import {
-  getBoardRef,
-  persistEntries,
-  reconstructState,
-  setBoard,
-  setBoardQuiet,
-  setLastToolWasAdvance,
-  updateUI,
-} from "./state";
+import { getBoardRef, persistEntries, reconstructState, setBoard, updateUI } from "./state";
 import { cloneBoard, hasActionableTasks, hasBlockedNonTerminalTasks } from "./validation";
 import {
   digest,
@@ -99,7 +91,7 @@ function consumePhasePrompt(pi: ExtensionAPI): string {
   const updated = cloneBoard(board);
   updated.pendingPhasePrompt = undefined;
   updated.generation++;
-  setBoardQuiet(updated);
+  setBoard(updated);
   pi.appendEntry("continuous-tasks:snapshot", updated);
   return prompt;
 }
@@ -237,7 +229,6 @@ function makeController(pi: ExtensionAPI, configLoader: ConfigLoader, advisor?: 
 function registerSessionHandlers(pi: ExtensionAPI, control: Control): void {
   const restore = (ctx: ExtensionContext) => {
     control.cancel();
-    setLastToolWasAdvance(false);
     const board = reconstructState(ctx);
     setBoard(board);
     updateUI(ctx, board);
@@ -293,7 +284,6 @@ function registerSessionHandlers(pi: ExtensionAPI, control: Control): void {
       state.status = "active";
       saveSupervisor(pi);
     }
-    setLastToolWasAdvance(false);
   });
 }
 
@@ -395,7 +385,6 @@ function registerWorkHandlers(pi: ExtensionAPI, control: Control): void {
     return reason ? { block: true, reason } : undefined;
   });
   pi.on("tool_result", (event, ctx) => {
-    if (event.toolName !== "advance_tasks") setLastToolWasAdvance(false);
     try {
       observeTool(pi, event);
       const receipt = supervisorState()?.receipts.find(

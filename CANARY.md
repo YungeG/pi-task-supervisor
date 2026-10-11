@@ -1,7 +1,7 @@
 # Local supervisor validation report
 
 - Validated: 2026-10-11 (UTC)
-- Candidate: `pi-task-supervisor/`, validation snapshot before Git publication on `local/continuous-tasks`, based on `e5455d90237bfbdea83d4dc6a58dd0887716e704`
+- Candidate: `pi-task-supervisor/`, local subtraction-review snapshot on `local/continuous-tasks`, based on `c3589da718329350c943a50e0981da2d69a8bde6`
 - Public name/command: **Pi Task Supervisor**, `/task-supervisor`; `/continuous-tasks` remains an alias
 - Pi: `1.1.0` (`pi-ai`, `pi-coding-agent`, `pi-tui`); `typebox@1.3.7`
 - Node: `25.9.0`
@@ -13,16 +13,16 @@ This replaces the earlier Pi 0.84.2 board-only canary. Historical results are re
 
 ## Current checks
 
-`npm run check` passed from the renamed directory after the final bounds fix and command-compatibility regressions:
+`npm run check` passed after the scoped subtraction review. The review removed two unused, non-persisted legacy fields (`autoContinueCount`, `lastToolWasAdvance`), their accessors/resets, and the redundant `setBoardQuiet` setter. Eleven obsolete or duplicate internal-state tests were removed; actual budget, stagnation, cancellation, evidence, recovery, cloning, and compatibility regressions remain. The existing phase-prompt test now also checks generation advancement and legacy snapshot persistence. No automation, dependency, public behavior, or journal/config contract was added or changed.
 
 | Check                                                         | Result                                          |
 | ------------------------------------------------------------- | ----------------------------------------------- |
 | TypeScript (`tsc --noEmit`)                                   | PASS                                            |
 | ESLint                                                        | PASS                                            |
 | Source formatting                                             | PASS                                            |
-| Unit/integration suite                                        | **521 tests, 26 files PASS**                    |
-| Branch coverage                                               | **90.39% (1045/1156)**; unchanged 90% threshold |
-| Statement / function / line coverage                          | 95.37% / 97.7% / 97.5%                          |
+| Unit/integration suite                                        | **510 tests, 26 files PASS**                    |
+| Branch coverage                                               | **90.38% (1043/1154)**; unchanged 90% threshold |
+| Statement / function / line coverage                          | 95.27% / 97.68% / 97.49%                        |
 | Five isolated real-Pi SDK smokes                              | PASS                                            |
 | Package dry-run manifest                                      | PASS                                            |
 | Actual packed source loaded by Pi 1.1 `DefaultResourceLoader` | PASS, without installation                      |
@@ -30,7 +30,7 @@ This replaces the earlier Pi 0.84.2 board-only canary. Historical results are re
 
 The packed-source check included all 15 production TypeScript files, including `runtime.ts` and `supervisor.ts`; tests and `node_modules` were excluded. It registered all seven task tools, verified default-disabled activation and explicit human enablement, and left real settings unchanged. Extracted source resolved the checkout's existing local peer dependencies: this was **not** a clean dependency installation test. Temporary packaging artifacts were removed after the process exited.
 
-Active error-level LSP probes covered all 21 changed/new TypeScript paths at the renamed location and reported no errors. The final batch confirmed eleven paths clean; ten were **inconclusive** because the push-only server did not publish a fresh clean result. Those ten paths are not certified clean by LSP. The full TypeScript check passed after these changes. Auxiliary scans reported stylistic warnings/hints, including the repository's extensionless-import convention; this is not a zero-warning report.
+Active error-level LSP probes covered all five TypeScript paths changed by the subtraction review and reported no errors. Some paths remained **inconclusive** because the push-only server did not publish a fresh clean result; they are not certified clean by LSP. The full TypeScript check passed after these changes. This is not a zero-warning report.
 
 ## Real SDK scenarios (local faux provider only)
 

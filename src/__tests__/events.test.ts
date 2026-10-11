@@ -2,13 +2,7 @@ import { beforeEach, describe, expect, it, vi } from "vitest";
 import { DEFAULT_CONFIG } from "../config";
 import { registerEventHandlers } from "../events";
 import { isSessionScopeEnabled, setSessionScopeEnabled } from "../scope";
-import {
-  getBoard,
-  getLastToolWasAdvance,
-  resetState,
-  setBoard,
-  setLastToolWasAdvance,
-} from "../state";
+import { getBoard, resetState, setBoard } from "../state";
 import {
   activeBoard,
   ACTIVATION,
@@ -193,7 +187,8 @@ describe("continuous task lifecycle events", () => {
     setBoard(activeBoard({ pendingPhasePrompt: { phase: 1, message: "Verify the next phase" } }));
     const result = await h.fire("agent_before_settle", BOUNDARY);
     expect(result.entries[0].content).toContain("Verify the next phase");
-    expect(getBoard().pendingPhasePrompt).toBeUndefined();
+    expect(getBoard()).toMatchObject({ generation: 4, pendingPhasePrompt: undefined });
+    expect(h.mock.appendEntry).toHaveBeenCalledWith("continuous-tasks:snapshot", getBoard());
     expect(h.mock.sendMessage).toHaveBeenCalledWith(
       expect.objectContaining({ content: "Phase 1 complete." }),
       { triggerTurn: false },
@@ -247,15 +242,5 @@ describe("continuous task lifecycle events", () => {
     setBoard(activeBoard({ generation: 9 }));
     config.resolve(DEFAULT_CONFIG);
     expect(await pending).toBeUndefined();
-  });
-
-  it("resets the legacy advance marker on input or another tool result", async () => {
-    const h = lifecycle();
-    setLastToolWasAdvance(true);
-    await h.fire("tool_result", { toolName: "read" });
-    expect(getLastToolWasAdvance()).toBe(false);
-    setLastToolWasAdvance(true);
-    await h.fire("input");
-    expect(getLastToolWasAdvance()).toBe(false);
   });
 });
