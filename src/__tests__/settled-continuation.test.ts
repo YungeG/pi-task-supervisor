@@ -1,225 +1,118 @@
-import type { ExtensionContext } from "@earendil-works/pi-coding-agent";
-import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-import { DEFAULT_CONFIG } from "../config";
-import { registerEventHandlers } from "../events";
+import { beforeEach, describe, expect, it, vi } from "vitest";
 import { setSessionScopeEnabled } from "../scope";
 import { getBoard, resetState, setBoard } from "../state";
-import type { TaskBoardSnapshot } from "../types";
-import { createMockAPI, createMockContext } from "./helpers/mocks";
+import { supervisorState, type Advisor, type Advice } from "../supervisor";
+import { activeBoard, BOUNDARY, deferred, lifecycle } from "./helpers/lifecycle";
 
-const SESSION_ID = "01a0228b-ccbb-7fdf-b504-9f815411e609";
-const NOW = "2026-08-23T00:00:00.000Z";
+const guide: Advice = {
+  action: "guide",
+  message: "Finish the approved implementation and validation",
+  taskIds: ["t-1.1"],
+  evidenceRefs: [],
+};
 
-function getHandler(mockAPI: ReturnType<typeof createMockAPI>, eventName: string) {
-  const call = mockAPI.on.mock.calls.find(([name]) => name === eventName);
-  if (!call) throw new Error(`Handler not registered: ${eventName}`);
-  return call[1] as (event: any, ctx: ExtensionContext) => void | Promise<void>;
-}
-
-function activeBoard(): TaskBoardSnapshot {
-  return {
-    version: 2,
-    generation: 3,
-    workflowStatus: "active",
-    finalAcceptanceTaskId: "t-2.1",
-    stagnantSettles: 0,
-    tasks: [
-      {
-        id: "t-1.1",
-        title: "Implement",
-        prompt: "Implement the change",
-        profile: "worker",
-        phase: 1,
-        dependencies: [],
-        status: "ready",
-        createdAt: NOW,
-        updatedAt: NOW,
-      },
-      {
-        id: "t-2.1",
-        title: "Final acceptance",
-        prompt: "Verify the change",
-        profile: "reviewer",
-        phase: 2,
-        dependencies: ["t-1.1"],
-        status: "configured",
-        createdAt: NOW,
-        updatedAt: NOW,
-      },
-    ],
-    phases: [
-      { phase: 1, status: "active", title: "Implement" },
-      { phase: 2, status: "pending", title: "Accept" },
-    ],
-  };
-}
-
-function settledContext(): ExtensionContext {
-  const context = createMockContext() as ExtensionContext & {
-    isIdle: () => boolean;
-    hasPendingMessages: () => boolean;
-  };
-  context.isIdle = () => true;
-  context.hasPendingMessages = () => false;
-  Object.assign(context.sessionManager, { getSessionId: () => SESSION_ID });
-  return context;
-}
-
-describe("settled continuation", () => {
+describe("native supervisor continuation and compaction", () => {
   beforeEach(() => {
-    vi.useFakeTimers();
     resetState();
-  });
-
-  afterEach(() => {
-    vi.useRealTimers();
-  });
-
-  it("queues one hidden custom continuation only after agent_settled", async () => {
-    const mockAPI = createMockAPI();
-    registerEventHandlers(mockAPI.api, async () => DEFAULT_CONFIG);
     setSessionScopeEnabled(true);
     setBoard(activeBoard());
-    const context = settledContext();
-
-    await getHandler(mockAPI, "agent_end")(
-      { messages: [{ role: "assistant", stopReason: "stop" }] },
-      context,
-    );
-    vi.advanceTimersByTime(3000);
-
-    expect(mockAPI.sendMessage).not.toHaveBeenCalled();
-    expect(mockAPI.sendUserMessage).not.toHaveBeenCalled();
-
-    await getHandler(mockAPI, "agent_settled")({}, context);
-    await vi.advanceTimersByTimeAsync(3000);
-
-    expect(mockAPI.sendUserMessage).not.toHaveBeenCalled();
-    expect(mockAPI.sendMessage).toHaveBeenCalledTimes(1);
-    expect(mockAPI.sendMessage).toHaveBeenCalledWith(
-      expect.objectContaining({
-        customType: "continuous-tasks:continue",
-        display: false,
-        details: expect.objectContaining({ generation: 3 }),
-      }),
-      { triggerTurn: true, deliverAs: "followUp" },
-    );
   });
 
-  it("is a complete no-op for a session without activation", async () => {
-    const mockAPI = createMockAPI();
-    registerEventHandlers(mockAPI.api, async () => DEFAULT_CONFIG);
-    setBoard(activeBoard());
-    const context = settledContext();
-
-    await getHandler(mockAPI, "agent_end")(
-      { messages: [{ role: "assistant", stopReason: "stop" }] },
-      context,
-    );
-    await getHandler(mockAPI, "agent_settled")({}, context);
-    await vi.advanceTimersByTimeAsync(3000);
-
-    expect(mockAPI.sendMessage).not.toHaveBeenCalled();
-    expect(mockAPI.sendUserMessage).not.toHaveBeenCalled();
-    expect(getBoard()).toEqual(activeBoard());
-  });
-
-  it("does not continue a disabled branch selected while config loads", async () => {
-    const mockAPI = createMockAPI();
-    let resolveConfig!: (value: typeof DEFAULT_CONFIG) => void;
-    const deferredConfig = new Promise<typeof DEFAULT_CONFIG>((resolve) => {
-      resolveConfig = resolve;
+  it("returns concrete guidance through a native boundary, never as a user message", async () => {
+    const advisor = vi.fn<Advisor>(async () => ({ advice: guide }));
+    const h = lifecycle(advisor);
+    await h.command("supervise Finish and verify the approved work");
+    h.mock.sendMessage.mockClear();
+    const result = await h.fire("agent_before_settle", BOUNDARY);
+    expect(result).toMatchObject({
+      continue: true,
+      entries: [
+        {
+          type: "custom_message",
+          customType: "continuous-tasks:continue",
+          display: false,
+          content: expect.stringContaining("NOT USER APPROVAL"),
+        },
+      ],
     });
-    registerEventHandlers(mockAPI.api, () => deferredConfig);
-    setSessionScopeEnabled(true);
-    setBoard(activeBoard());
-    const enabledContext = settledContext();
-    await getHandler(mockAPI, "agent_end")(
-      { messages: [{ role: "assistant", stopReason: "stop" }] },
-      enabledContext,
-    );
-
-    const settled = getHandler(mockAPI, "agent_settled")({}, enabledContext);
-    await getHandler(mockAPI, "session_tree")({}, createMockContext());
-    resolveConfig(DEFAULT_CONFIG);
-    await settled;
-    await vi.advanceTimersByTimeAsync(3000);
-
-    expect(mockAPI.sendMessage).not.toHaveBeenCalled();
-    expect(getBoard().tasks).toEqual([]);
+    expect(result.entries[0].content).toContain(guide.message);
+    expect(h.mock.sendUserMessage).not.toHaveBeenCalled();
+    expect(supervisorState()).toMatchObject({ status: "active", pending: true, continuations: 1 });
   });
 
-  it("discards a countdown when the board generation changes", async () => {
-    const mockAPI = createMockAPI();
-    registerEventHandlers(mockAPI.api, async () => DEFAULT_CONFIG);
-    setSessionScopeEnabled(true);
-    setBoard(activeBoard());
-    const context = settledContext();
-
-    await getHandler(mockAPI, "agent_end")(
-      { messages: [{ role: "assistant", stopReason: "stop" }] },
-      context,
-    );
-    await getHandler(mockAPI, "agent_settled")({}, context);
-    setBoard({ ...activeBoard(), generation: 4 });
-    await vi.advanceTimersByTimeAsync(3000);
-
-    expect(mockAPI.sendMessage).not.toHaveBeenCalled();
+  it("preserves the durable goal through compaction before the settlement boundary", async () => {
+    const advisor = vi.fn<Advisor>(async () => ({ advice: guide }));
+    const h = lifecycle(advisor);
+    await h.command("supervise Finish and verify the approved work");
+    await h.fire("session_before_compact");
+    const result = await h.fire("agent_before_settle", BOUNDARY);
+    expect(result?.continue).toBe(true);
+    expect(advisor.mock.calls[0]?.[0]).toContain("Finish and verify the approved work");
+    expect(getBoard()).toEqual(activeBoard());
+    expect(supervisorState()?.status).toBe("active");
   });
 
-  it.each([
-    ["aborted", "The user aborted the last run"],
-    ["error", "The last run still failed after Pi retries"],
-  ])("pauses instead of continuing after %s", async (stopReason, reason) => {
-    const mockAPI = createMockAPI();
-    registerEventHandlers(mockAPI.api, async () => DEFAULT_CONFIG);
-    setSessionScopeEnabled(true);
-    setBoard(activeBoard());
-    const context = settledContext();
-
-    await getHandler(mockAPI, "agent_end")(
-      { messages: [{ role: "assistant", stopReason }] },
-      context,
-    );
-    await getHandler(mockAPI, "agent_settled")({}, context);
-
-    expect(getBoard()).toMatchObject({ workflowStatus: "paused", pauseReason: reason });
-    expect(mockAPI.sendMessage).toHaveBeenCalledWith(
+  it("interrupts an in-flight review visibly and ignores its late result after compaction", async () => {
+    const reply = deferred<Awaited<ReturnType<Advisor>>>();
+    const h = lifecycle(() => reply.promise);
+    await h.command("supervise Finish approved work");
+    const pending = h.fire("agent_before_settle", BOUNDARY);
+    await h.fire("session_before_compact");
+    expect(await pending).toBeUndefined();
+    reply.resolve({ advice: guide });
+    await Promise.resolve();
+    expect(supervisorState()).toMatchObject({ status: "fault", pending: false, continuations: 0 });
+    expect(h.mock.sendMessage).toHaveBeenCalledWith(
       expect.objectContaining({
-        customType: "continuous-tasks:notice",
-        content: `Continuous Tasks paused: ${reason}`,
+        display: true,
+        content: expect.stringContaining("stale advice discarded"),
       }),
       { triggerTurn: false },
     );
-    expect(mockAPI.sendUserMessage).not.toHaveBeenCalled();
+    expect(await h.fire("agent_before_settle", BOUNDARY)).toBeUndefined();
   });
 
-  it("resumes auto-continuation after answering a progress question", async () => {
-    const mockAPI = createMockAPI();
-    registerEventHandlers(mockAPI.api, async () => DEFAULT_CONFIG);
+  it("reconciles a native abort during the boundary instead of leaving an active-idle supervisor", async () => {
+    const h = lifecycle(async () => ({ advice: guide }));
+    await h.command("supervise Finish approved work");
+    await h.fire("agent_before_settle", BOUNDARY);
+    await h.fire("agent_settled", { type: "agent_settled", aborted: true });
+    expect(supervisorState()).toMatchObject({ status: "paused", pending: false });
+    expect(getBoard().workflowStatus).toBe("paused");
+  });
+
+  it("faults visibly if Pi settles an unfinished supervisor instead of executing its continuation", async () => {
+    const h = lifecycle(async () => ({ advice: guide }));
+    await h.command("supervise Finish approved work");
+    await h.fire("agent_before_settle", BOUNDARY);
+    h.mock.sendMessage.mockClear();
+    await h.fire("agent_settled", { type: "agent_settled", aborted: false });
+    expect(supervisorState()).toMatchObject({ status: "fault", pending: false });
+    expect(h.mock.sendMessage).toHaveBeenLastCalledWith(
+      expect.objectContaining({ display: true }),
+      { triggerTurn: false },
+    );
+    expect(await h.fire("before_agent_start")).toBeUndefined();
+  });
+
+  it("does not act on settlement notifications outside an enabled supervised session", async () => {
+    const h = lifecycle();
+    setSessionScopeEnabled(false);
+    await h.fire("agent_settled", { aborted: true });
     setSessionScopeEnabled(true);
-    setBoard(activeBoard());
-    const context = settledContext();
+    await h.fire("agent_settled", { aborted: false });
+    expect(getBoard().workflowStatus).toBe("active");
+    expect(h.mock.sendMessage).not.toHaveBeenCalled();
+  });
 
-    await getHandler(mockAPI, "agent_end")(
-      { messages: [{ role: "assistant", stopReason: "stop" }] },
-      context,
-    );
-    await getHandler(mockAPI, "agent_settled")({}, context);
-    await getHandler(mockAPI, "input")({ source: "interactive", text: "进度如何" }, context);
-    await vi.advanceTimersByTimeAsync(3000);
-    expect(mockAPI.sendMessage).not.toHaveBeenCalled();
-
-    await getHandler(mockAPI, "agent_end")(
-      { messages: [{ role: "assistant", stopReason: "stop" }] },
-      context,
-    );
-    await getHandler(mockAPI, "agent_settled")({}, context);
-    await vi.advanceTimersByTimeAsync(3000);
-
-    expect(mockAPI.sendMessage).toHaveBeenCalledWith(
-      expect.objectContaining({ customType: "continuous-tasks:continue" }),
-      { triggerTurn: true, deliverAs: "followUp" },
-    );
+  it("rejects advice whose session branch changed while the model was reviewing", async () => {
+    const reply = deferred<Awaited<ReturnType<Advisor>>>();
+    const h = lifecycle(() => reply.promise);
+    await h.command("supervise Finish approved work");
+    const pending = h.fire("agent_before_settle", BOUNDARY);
+    vi.mocked(h.ctx.sessionManager.getLeafId).mockReturnValue("different-branch");
+    reply.resolve({ advice: guide });
+    expect(await pending).toBeUndefined();
+    expect(supervisorState()?.status).toBe("fault");
   });
 });

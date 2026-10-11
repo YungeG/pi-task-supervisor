@@ -25,6 +25,8 @@ import { writeTasks, applyEdits, compileBoard, createEmptyBoard, claimReadyTasks
 import { cloneBoard, getStatusCounts, isSafeBoundedText } from "./validation";
 import { getBoardRef, setBoard, persistEntries, updateUI } from "./state";
 import { loadConfig, resolvePhasePrompt } from "./config";
+import { assertObservedEvidence, bindCompletion } from "./supervisor";
+import { isSessionScopeEnabled } from "./scope";
 import {
   formatBoardText,
   formatSummaryLine,
@@ -58,6 +60,7 @@ function makeErrorResult(
   return {
     content: [{ type: "text", text: errorText }],
     details: { snapshot, error: errorText },
+    isError: true,
   };
 }
 
@@ -89,6 +92,15 @@ async function checkAndSetPhaseCompletion(
       return; // Only handle the first newly completed phase
     }
   }
+}
+
+function assertBoardCurrent(
+  board: Readonly<TaskBoardSnapshot>,
+  signal: AbortSignal | undefined,
+  enabled: boolean,
+): void {
+  if (signal?.aborted || getBoardRef() !== board || isSessionScopeEnabled() !== enabled)
+    throw new Error("Task update cancelled; session or task board changed before commit");
 }
 
 // ── Shared Result Renderer ──
@@ -235,8 +247,9 @@ export function createEditTasksTool(
     promptSnippet: undefined,
     promptGuidelines: undefined,
 
-    async execute(_toolCallId, params, _signal, _onUpdate, ctx) {
+    async execute(_toolCallId, params, signal, _onUpdate, ctx) {
       const board = getBoardRef();
+      const enabled = isSessionScopeEnabled();
       const now = new Date().toISOString();
 
       // Snapshot before-phases for phase completion detection
@@ -267,6 +280,7 @@ export function createEditTasksTool(
 
         // Detect phase completion and set pending prompt
         await checkAndSetPhaseCompletion(beforePhases, newBoard);
+        assertBoardCurrent(board, signal, enabled);
 
         setBoard(newBoard);
 
@@ -339,8 +353,9 @@ export function createCompileTasksTool(
     promptSnippet: undefined,
     promptGuidelines: undefined,
 
-    async execute(_toolCallId, params, _signal, _onUpdate, ctx) {
+    async execute(_toolCallId, params, signal, _onUpdate, ctx) {
       const board = getBoardRef();
+      const enabled = isSessionScopeEnabled();
       const now = new Date().toISOString();
 
       // Snapshot before-phases for phase completion detection
@@ -351,6 +366,7 @@ export function createCompileTasksTool(
 
         // Detect phase completion and set pending prompt
         await checkAndSetPhaseCompletion(beforePhases, newBoard);
+        assertBoardCurrent(board, signal, enabled);
 
         setBoard(newBoard);
 
@@ -558,8 +574,9 @@ export function createAdvanceTasksTool(
       "Do not mark reviewing tasks done until review and required validation evidence are available.",
     ],
 
-    async execute(_toolCallId, params, _signal, _onUpdate, ctx) {
+    async execute(_toolCallId, params, signal, _onUpdate, ctx) {
       const board = getBoardRef();
+      const enabled = isSessionScopeEnabled();
       const now = new Date().toISOString();
       const beforePhases = board.phases.map((p) => ({ ...p }));
       const ids = params.transitions.map((transition) => transition.id);
@@ -573,8 +590,13 @@ export function createAdvanceTasksTool(
       }));
 
       try {
+        for (const edit of edits) {
+          if (board.tasks.find((task) => task.id === edit.id)?.status === "reviewing")
+            assertObservedEvidence(edit.id, edit.data?.evidence);
+        }
         const newBoard = applyEdits(board, edits, now);
         await checkAndSetPhaseCompletion(beforePhases, newBoard);
+        assertBoardCurrent(board, signal, enabled);
 
         setBoard(newBoard);
 
@@ -582,6 +604,7 @@ export function createAdvanceTasksTool(
           pi.appendEntry(CUSTOM_EVENT_TYPE, advanceEvent(edit, board, newBoard));
         }
         pi.appendEntry(CUSTOM_SNAPSHOT_TYPE, newBoard);
+        bindCompletion(pi, newBoard, ids);
         updateUI(ctx, newBoard);
 
         const counts = getStatusCounts(newBoard);

@@ -1,5 +1,11 @@
-import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
+import type {
+  AgentBeforeSettleEvent,
+  BoundaryResult,
+  ExtensionAPI,
+  ExtensionContext,
+} from "@earendil-works/pi-coding-agent";
 import type { ContinuousTasksConfig } from "./config";
+import { currentRuntime } from "./runtime";
 import { loadConfig, resetConfig } from "./config";
 import { formatContinuePrompt, formatHiddenContext } from "./formatting";
 import {
@@ -7,6 +13,7 @@ import {
   restoreSessionScope,
   TASK_TOOL_NAMES,
   setSessionScopeEnabled,
+  updateActiveTools,
 } from "./scope";
 import {
   getBoardRef,
@@ -17,134 +24,64 @@ import {
   setLastToolWasAdvance,
   updateUI,
 } from "./state";
-import type { TaskBoardSnapshot } from "./types";
-import { hasActionableTasks, hasBlockedNonTerminalTasks, cloneBoard } from "./validation";
+import { cloneBoard, hasActionableTasks, hasBlockedNonTerminalTasks } from "./validation";
+import {
+  digest,
+  holdSupervisor,
+  observeTool,
+  redact,
+  restoreSupervisor,
+  reviewSupervisor,
+  saveSupervisor,
+  supervisorPlanError,
+  supervisorState,
+  type Advisor,
+} from "./supervisor";
 
-type RunOutcome = "normal" | "aborted" | "error";
 type ConfigLoader = () => Promise<ContinuousTasksConfig>;
+type Control = {
+  cancel: () => void;
+  boundary: (
+    event: AgentBeforeSettleEvent,
+    ctx: ExtensionContext,
+  ) => Promise<BoundaryResult | undefined>;
+};
 
-let activeCountdown: ReturnType<typeof setInterval> | null = null;
-let activeTimeout: ReturnType<typeof setTimeout> | null = null;
-let lastRunOutcome: RunOutcome = "normal";
-let extensionContinuationGeneration: number | null = null;
-
-function clearCountdown(ctx: ExtensionContext): void {
-  if (activeCountdown !== null) clearInterval(activeCountdown);
-  if (activeTimeout !== null) clearTimeout(activeTimeout);
-  activeCountdown = null;
-  activeTimeout = null;
-  if (ctx.hasUI) ctx.ui.setWidget("continuous-tasks-countdown", undefined);
-}
-
-function runOutcome(messages: { role: string; stopReason?: string }[]): RunOutcome {
-  for (let index = messages.length - 1; index >= 0; index--) {
-    const message = messages[index];
-    if (message?.role !== "assistant") continue;
-    if (message.stopReason === "aborted") return "aborted";
-    if (message.stopReason === "error") return "error";
-    return "normal";
-  }
-  return "normal";
-}
-
-function pause(
-  pi: ExtensionAPI,
-  ctx: ExtensionContext,
-  reason: string,
-  eventType: "abort" | "error" | "deadlock" | "stagnation",
-): void {
-  const current = getBoardRef();
-  if (current.workflowStatus !== "active") return;
-  const updated = cloneBoard(current);
-  updated.workflowStatus = "paused";
-  updated.pauseReason = reason;
-  updated.generation++;
-  persistEntries(pi, { type: `pause_${eventType}`, reason }, updated);
-  setBoard(updated);
-  updateUI(ctx, updated);
-  pi.sendMessage(
-    {
-      customType: "continuous-tasks:notice",
-      content: `Continuous Tasks paused: ${reason}`,
-      display: true,
-    },
-    { triggerTurn: false },
-  );
-}
-
-function continuationMessage(board: Readonly<TaskBoardSnapshot>, prefix = ""): string {
-  return `${prefix}${formatContinuePrompt(board)}`;
-}
-
-function sendContinuation(
-  pi: ExtensionAPI,
-  board: Readonly<TaskBoardSnapshot>,
-  prompt: string,
-): void {
-  extensionContinuationGeneration = board.generation;
-  pi.sendMessage(
-    {
-      customType: "continuous-tasks:continue",
-      content: prompt,
-      display: false,
-      details: {
-        generation: board.generation,
-        actionableTaskIds: board.tasks.flatMap((task) =>
-          ["ready", "implementing", "reviewing"].includes(task.status) ? [task.id] : [],
-        ),
+function pauseBoard(pi: ExtensionAPI, ctx: ExtensionContext, reason: string): void {
+  const board = getBoardRef();
+  if (board.workflowStatus === "active") {
+    const updated = cloneBoard(board);
+    updated.workflowStatus = "paused";
+    updated.pauseReason = reason;
+    updated.generation++;
+    persistEntries(pi, { type: "pause_controller", reason }, updated);
+    setBoard(updated);
+    updateUI(ctx, updated);
+    pi.sendMessage(
+      {
+        customType: "continuous-tasks:notice",
+        content: `Pi Task Supervisor paused: ${reason}`,
+        display: true,
       },
-    },
-    { triggerTurn: true, deliverAs: "followUp" },
-  );
+      { triggerTurn: false },
+    );
+  }
+  holdSupervisor(pi, ctx, "paused", reason);
 }
 
-function scheduleContinuation(
-  pi: ExtensionAPI,
-  ctx: ExtensionContext,
-  config: ContinuousTasksConfig,
-  prompt: string,
-): void {
-  clearCountdown(ctx);
-  const scheduledGeneration = getBoardRef().generation;
-  const fire = () => {
-    const board = getBoardRef();
-    if (
-      board.generation !== scheduledGeneration ||
-      board.workflowStatus !== "active" ||
-      !hasActionableTasks(board)
-    ) {
-      return;
-    }
-    sendContinuation(pi, board, prompt);
+function continuation(prompt: string): BoundaryResult {
+  return {
+    continue: true,
+    entries: [
+      {
+        type: "custom_message",
+        customType: "continuous-tasks:continue",
+        content: prompt,
+        display: false,
+        details: { generation: getBoardRef().generation },
+      },
+    ],
   };
-
-  if (!ctx.hasUI || config.countdownMs === 0) {
-    activeTimeout = setTimeout(() => {
-      activeTimeout = null;
-      fire();
-    }, config.countdownMs);
-    return;
-  }
-
-  let remaining = Math.ceil(config.countdownMs / 1000);
-  ctx.ui.setWidget(
-    "continuous-tasks-countdown",
-    [`⏳ Auto-continuing in ${remaining}s... (type anything to interrupt)`],
-    { placement: "aboveEditor" },
-  );
-  activeCountdown = setInterval(() => {
-    remaining--;
-    if (remaining > 0) {
-      ctx.ui.setWidget(
-        "continuous-tasks-countdown",
-        [`⏳ Auto-continuing in ${remaining}s... (type anything to interrupt)`],
-        { placement: "aboveEditor" },
-      );
-      return;
-    }
-    clearCountdown(ctx);
-    fire();
-  }, 1000);
 }
 
 function consumePhasePrompt(pi: ExtensionAPI): string {
@@ -167,133 +104,335 @@ function consumePhasePrompt(pi: ExtensionAPI): string {
   return prompt;
 }
 
-function recordStagnation(
-  pi: ExtensionAPI,
-  ctx: ExtensionContext,
-  config: ContinuousTasksConfig,
-): boolean {
-  const board = getBoardRef();
-  if (extensionContinuationGeneration === null) return false;
-  const madeProgress = board.generation !== extensionContinuationGeneration;
-  extensionContinuationGeneration = null;
-  if (madeProgress) return false;
-
-  const updated = cloneBoard(board);
-  updated.stagnantSettles++;
-  updated.generation++;
-  if (updated.stagnantSettles >= config.maxStagnantSettles) {
-    setBoardQuiet(updated);
-    pause(
-      pi,
-      ctx,
-      `No task-board progress across ${config.maxStagnantSettles} automatic continuations`,
-      "stagnation",
-    );
-    return true;
+/** A signal race bounds even a provider that ignores cancellation. No automatic retry on review failure. */
+async function cancellable<T>(operation: Promise<T>, signal: AbortSignal): Promise<T> {
+  let listener: () => void = () => undefined;
+  const aborted = new Promise<never>((_resolve, reject) => {
+    listener = () => {
+      reject(new Error("Supervisor review cancelled or timed out"));
+    };
+    if (signal.aborted) listener();
+    else signal.addEventListener("abort", listener, { once: true });
+  });
+  try {
+    return await Promise.race([operation, aborted]);
+  } finally {
+    signal.removeEventListener("abort", listener);
   }
-  persistEntries(pi, { type: "stagnant_settle", count: updated.stagnantSettles }, updated);
-  setBoardQuiet(updated);
-  return false;
 }
 
-function restoreSession(pi: ExtensionAPI, ctx: ExtensionContext, resetOutcome: boolean): void {
-  clearCountdown(ctx);
-  setLastToolWasAdvance(false);
-  extensionContinuationGeneration = null;
-  if (resetOutcome) lastRunOutcome = "normal";
-  const board = reconstructState(ctx);
-  setBoard(board);
-  updateUI(ctx, board);
-  restoreSessionScope(pi, ctx);
+function reviewSignal(controller: AbortController, ctx: ExtensionContext): AbortSignal {
+  return AbortSignal.any([
+    controller.signal,
+    AbortSignal.timeout(30_000),
+    ...(ctx.signal ? [ctx.signal] : []),
+  ]);
+}
+
+function boundaryAllowed(
+  pi: ExtensionAPI,
+  event: AgentBeforeSettleEvent,
+  ctx: ExtensionContext,
+): boolean {
+  if (event.outcome !== "completed") {
+    pauseBoard(
+      pi,
+      ctx,
+      event.outcome === "aborted"
+        ? "The user aborted the last run"
+        : "The last run still failed after Pi retries",
+    );
+    return false;
+  }
+  return (
+    // Our returned guidance entry creates runnable context when the last message is assistant.
+    !event.continue &&
+    !event.context.pendingMessages.length &&
+    !ctx.hasPendingMessages() &&
+    !["paused", "waiting_for_decision"].includes(getBoardRef().workflowStatus)
+  );
+}
+
+async function supervisedBoundary(
+  pi: ExtensionAPI,
+  ctx: ExtensionContext,
+  signal: AbortSignal,
+  current: () => boolean,
+  advisor?: Advisor,
+): Promise<BoundaryResult | undefined> {
+  const advice = await cancellable(reviewSupervisor(pi, ctx, signal, advisor), signal);
+  if (!advice || !current() || ctx.hasPendingMessages()) return undefined;
+  return continuation(
+    `[SUPERVISOR ADVICE — NOT USER APPROVAL]\n${advice.message}\nTasks: ${advice.taskIds.join(", ") || "prepare/repair the goal's task plan"}\nEvidence: ${advice.evidenceRefs.join(", ") || "collect fresh tool evidence"}\nPreserve all real approvals, pauses, budgets and existing execution receipts.`,
+  );
+}
+
+function makeController(pi: ExtensionAPI, configLoader: ConfigLoader, advisor?: Advisor): Control {
+  let serial = 0;
+  let inFlight: AbortController | undefined;
+  let lastProgress: string | undefined;
+  let stagnant = 0;
+  const cancel = () => {
+    serial++;
+    inFlight?.abort();
+    inFlight = undefined;
+  };
+  const baseBoundary = async (
+    ticket: number,
+    ctx: ExtensionContext,
+  ): Promise<BoundaryResult | undefined> => {
+    const board = getBoardRef();
+    if (board.workflowStatus !== "active") return undefined;
+    const config = await configLoader();
+    if (ticket !== serial || getBoardRef() !== board) return undefined;
+    const progress = digest(
+      board.tasks.map((task) => [task.id, task.status, task.completionEvidence]),
+    );
+    stagnant = lastProgress === progress ? stagnant + 1 : 0;
+    lastProgress = progress;
+    if (stagnant >= config.maxStagnantSettles) {
+      pauseBoard(
+        pi,
+        ctx,
+        `No task-board progress across ${config.maxStagnantSettles} automatic continuations`,
+      );
+      return undefined;
+    }
+    if (hasActionableTasks(board))
+      return continuation(`${consumePhasePrompt(pi)}${formatContinuePrompt(getBoardRef())}`);
+    if (hasBlockedNonTerminalTasks(board))
+      pauseBoard(pi, ctx, "Non-terminal tasks remain but none are actionable");
+    return undefined;
+  };
+  const boundary = async (
+    event: AgentBeforeSettleEvent,
+    ctx: ExtensionContext,
+  ): Promise<BoundaryResult | undefined> => {
+    if (!isSessionScopeEnabled() || inFlight) return undefined;
+    if (!boundaryAllowed(pi, event, ctx)) return undefined;
+    const controller = new AbortController();
+    inFlight = controller;
+    const ticket = serial;
+    const signal = reviewSignal(controller, ctx);
+    try {
+      const state = supervisorState();
+      if (state && state.status !== "stopped")
+        return await supervisedBoundary(pi, ctx, signal, () => ticket === serial, advisor);
+      return await baseBoundary(ticket, ctx);
+    } catch (error) {
+      if (ticket === serial) {
+        const reason = redact(error instanceof Error ? error.message : "Continuation failed");
+        if (supervisorState() && supervisorState()?.status !== "stopped")
+          holdSupervisor(pi, ctx, "fault", reason);
+        else pauseBoard(pi, ctx, reason);
+      }
+      return undefined;
+    } finally {
+      if (inFlight === controller) inFlight = undefined;
+    }
+  };
+  return { cancel, boundary };
+}
+
+function registerSessionHandlers(pi: ExtensionAPI, control: Control): void {
+  const restore = (ctx: ExtensionContext) => {
+    control.cancel();
+    setLastToolWasAdvance(false);
+    const board = reconstructState(ctx);
+    setBoard(board);
+    updateUI(ctx, board);
+    restoreSessionScope(pi, ctx);
+    currentRuntime().journalFault = undefined;
+    try {
+      restoreSupervisor(pi, ctx);
+    } catch {
+      // Do not reinterpret malformed durable state as an inactive, safe-to-continue supervisor.
+      currentRuntime().journalFault =
+        "Invalid supervisor journal; inspect session state before recovery";
+      setSessionScopeEnabled(false);
+      updateActiveTools(pi, false);
+      if (ctx.hasUI)
+        ctx.ui.setStatus("continuous-supervisor", "Supervisor: fault (invalid journal)");
+      pi.sendMessage(
+        {
+          customType: "continuous-tasks:notice",
+          content:
+            "Invalid supervisor journal; task continuation disabled. Inspect session state before recovery.",
+          display: true,
+        },
+        { triggerTurn: false },
+      );
+    }
+  };
+  pi.on("session_start", (_event, ctx) => {
+    resetConfig();
+    restore(ctx);
+  });
+  pi.on("session_tree", (_event, ctx) => {
+    restore(ctx);
+  });
+  pi.on("session_shutdown", (_event, ctx) => {
+    control.cancel();
+    setSessionScopeEnabled(false);
+    if (ctx.hasUI) ctx.ui.setStatus("continuous-supervisor", undefined);
+  });
+  pi.on("session_before_compact", (_event, ctx) => {
+    control.cancel();
+    if (supervisorState()?.status === "reviewing")
+      holdSupervisor(
+        pi,
+        ctx,
+        "fault",
+        "Context changed during supervisor review; stale advice discarded. Recover after compaction.",
+      );
+  });
+  pi.on("input", () => {
+    control.cancel();
+    const state = supervisorState();
+    if (state?.status === "reviewing") {
+      state.status = "active";
+      saveSupervisor(pi);
+    }
+    setLastToolWasAdvance(false);
+  });
+}
+
+function editsCompletedTask(toolName: string, input: Record<string, unknown>): boolean {
+  return (
+    toolName === "edit_tasks" &&
+    Array.isArray(input.tasks) &&
+    input.tasks.some(
+      (item: unknown) =>
+        typeof item === "object" &&
+        item !== null &&
+        "id" in item &&
+        getBoardRef().tasks.some((task) => task.id === item.id && task.status === "done"),
+    )
+  );
+}
+
+function supervisedWriteLimitError(
+  toolName: string,
+  input: Record<string, unknown>,
+): string | undefined {
+  if (toolName !== "write_tasks" || !Array.isArray(input.phases)) return undefined;
+  const added = input.phases.reduce<number>(
+    (total, phase: unknown) =>
+      total +
+      (typeof phase === "object" && phase !== null && "tasks" in phase && Array.isArray(phase.tasks)
+        ? phase.tasks.length
+        : 0),
+    0,
+  );
+  return supervisorPlanError(added + (input.mode === "replace" ? 0 : getBoardRef().tasks.length));
+}
+
+function taskGate(toolName: string, input: Record<string, unknown>): string | undefined {
+  if (!TASK_TOOL_NAMES.includes(toolName)) return undefined;
+  if (!isSessionScopeEnabled()) return "Pi Task Supervisor is disabled for this session";
+  if (["paused", "waiting_for_decision"].includes(getBoardRef().workflowStatus))
+    return "Task-board gate must be resolved by its human command";
+  const state = supervisorState();
+  if (!state || state.status === "stopped") return undefined;
+  if (["paused", "fault", "reviewing", "completed"].includes(state.status))
+    return `Supervisor is ${state.status}; explicit human recovery is required`;
+  if (editsCompletedTask(toolName, input))
+    return "Completed supervised tasks are frozen; stop before changing their scope";
+  if (
+    toolName === "clear_tasks" ||
+    (toolName === "write_tasks" && input.mode === "replace" && getBoardRef().tasks.length > 0)
+  )
+    return "A supervised goal cannot discard its task board";
+  if (
+    toolName === "edit_tasks" &&
+    Array.isArray(input.tasks) &&
+    input.tasks.some(
+      (item: unknown) =>
+        typeof item === "object" && item !== null && "type" in item && item.type === "abandon",
+    )
+  )
+    return "A supervised goal cannot abandon required tasks";
+  return supervisedWriteLimitError(toolName, input);
+}
+
+function registerWorkHandlers(pi: ExtensionAPI, control: Control): void {
+  pi.on("before_agent_start", () => {
+    const board = getBoardRef();
+    const state = supervisorState();
+    if (
+      !isSessionScopeEnabled() ||
+      (state && !["active", "stopped"].includes(state.status)) ||
+      (board.workflowStatus !== "active" && state?.status !== "active")
+    )
+      return undefined;
+    return {
+      message: {
+        customType: "continuous-tasks:context",
+        content: `${formatHiddenContext(board)}\n${state?.status === "active" ? `User-recorded supervisor goal: ${state.goal}\nEvidence refs must use real host receipts tool:<id>, observed during review. Supervisor guidance is never user approval.` : ""}`,
+        display: false,
+      },
+    };
+  });
+  pi.on("agent_before_settle", control.boundary);
+  // Native aborts during an awaited boundary are reported only after it returns.
+  // This notification reconciles state; it never schedules another turn.
+  pi.on("agent_settled", (event, ctx) => {
+    if (!isSessionScopeEnabled()) return;
+    if (event.aborted) {
+      control.cancel();
+      pauseBoard(pi, ctx, "The user aborted the last run; inspect before resuming");
+    } else if (["active", "reviewing"].includes(supervisorState()?.status ?? "")) {
+      holdSupervisor(
+        pi,
+        ctx,
+        "fault",
+        "Pi settled with an unfinished goal; inspect the blocked continuation before explicit recovery",
+      );
+    }
+  });
+  pi.on("tool_call", (event) => {
+    const reason = taskGate(event.toolName, event.input);
+    return reason ? { block: true, reason } : undefined;
+  });
+  pi.on("tool_result", (event, ctx) => {
+    if (event.toolName !== "advance_tasks") setLastToolWasAdvance(false);
+    try {
+      observeTool(pi, event);
+      const receipt = supervisorState()?.receipts.find(
+        (item) => item.id === `tool:${event.toolCallId}`,
+      );
+      if (receipt)
+        return {
+          content: [
+            ...event.content,
+            {
+              type: "text" as const,
+              text: `Host evidence receipt: ${receipt.id}; epoch ${receipt.epoch}; observed exit_code ${receipt.exitCode ?? "unavailable"}. Use only fresh successful receipts captured during this task's review.`,
+            },
+          ],
+          ...(event.structuredContent === undefined
+            ? {}
+            : { structuredContent: event.structuredContent }),
+        };
+    } catch (error) {
+      holdSupervisor(
+        pi,
+        ctx,
+        "fault",
+        error instanceof Error ? error.message : "Evidence capture failed",
+      );
+    }
+    return undefined;
+  });
 }
 
 export function registerEventHandlers(
   pi: ExtensionAPI,
   configLoader: ConfigLoader = loadConfig,
+  advisor?: Advisor,
 ): void {
-  setSessionScopeEnabled(false);
-  lastRunOutcome = "normal";
-  extensionContinuationGeneration = null;
-
-  pi.on("session_start", (_event, ctx) => {
-    resetConfig();
-    restoreSession(pi, ctx, true);
-  });
-
-  pi.on("session_tree", (_event, ctx) => {
-    restoreSession(pi, ctx, false);
-  });
-
-  pi.on("session_shutdown", (_event, ctx) => {
-    clearCountdown(ctx);
-    setSessionScopeEnabled(false);
-    extensionContinuationGeneration = null;
-  });
-
-  pi.on("before_agent_start", () => {
-    const board = getBoardRef();
-    if (!isSessionScopeEnabled() || board.workflowStatus !== "active") return;
-    return {
-      message: {
-        customType: "continuous-tasks:context",
-        content: formatHiddenContext(board),
-        display: false,
-      },
-    };
-  });
-
-  pi.on("agent_end", (event) => {
-    lastRunOutcome = runOutcome(event.messages);
-  });
-
-  pi.on("agent_settled", async (_event, ctx) => {
-    if (!isSessionScopeEnabled()) return;
-    const boardBeforeConfig = getBoardRef();
-    const config = await configLoader();
-    if (!isSessionScopeEnabled() || getBoardRef() !== boardBeforeConfig) return;
-    const board = getBoardRef();
-    if (board.workflowStatus !== "active") return;
-    if (lastRunOutcome === "aborted") {
-      pause(pi, ctx, "The user aborted the last run", "abort");
-      return;
-    }
-    if (lastRunOutcome === "error") {
-      pause(pi, ctx, "The last run still failed after Pi retries", "error");
-      return;
-    }
-    if (!ctx.isIdle() || ctx.hasPendingMessages()) return;
-    if (recordStagnation(pi, ctx, config)) return;
-
-    const current = getBoardRef();
-    if (hasActionableTasks(current)) {
-      const phasePrompt = consumePhasePrompt(pi);
-      const refreshed = getBoardRef();
-      scheduleContinuation(pi, ctx, config, continuationMessage(refreshed, phasePrompt));
-      return;
-    }
-    if (hasBlockedNonTerminalTasks(current)) {
-      pause(pi, ctx, "Non-terminal tasks remain but none are actionable", "deadlock");
-    }
-  });
-
-  pi.on("input", (_event, ctx) => {
-    clearCountdown(ctx);
-    extensionContinuationGeneration = null;
-    setLastToolWasAdvance(false);
-  });
-
-  pi.on("tool_call", (event) => {
-    if (!isSessionScopeEnabled() && TASK_TOOL_NAMES.includes(event.toolName)) {
-      return {
-        block: true,
-        reason: "Continuous Tasks is disabled for this session",
-      };
-    }
-    return undefined;
-  });
-
-  pi.on("tool_result", (event) => {
-    const toolName = (event as { toolName?: string }).toolName;
-    if (toolName !== "advance_tasks") setLastToolWasAdvance(false);
-  });
+  const control = makeController(pi, configLoader, advisor);
+  currentRuntime().cancel = control.cancel;
+  registerSessionHandlers(pi, control);
+  registerWorkHandlers(pi, control);
 }

@@ -1,7 +1,7 @@
-import type { ExtensionContext } from "@earendil-works/pi-coding-agent";
-import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-import { DEFAULT_CONFIG, type ContinuousTasksConfig } from "../config";
+import { beforeEach, describe, expect, it, vi } from "vitest";
+import { DEFAULT_CONFIG } from "../config";
 import { registerEventHandlers } from "../events";
+import { isSessionScopeEnabled, setSessionScopeEnabled } from "../scope";
 import {
   getBoard,
   getLastToolWasAdvance,
@@ -9,436 +9,253 @@ import {
   setBoard,
   setLastToolWasAdvance,
 } from "../state";
-import type { TaskBoardSnapshot } from "../types";
+import {
+  activeBoard,
+  ACTIVATION,
+  BOUNDARY,
+  deferred,
+  getHandler,
+  lifecycle,
+} from "./helpers/lifecycle";
 import { createMockAPI, createMockContext } from "./helpers/mocks";
 
-const NOW = "2026-08-23T00:00:00.000Z";
-const ACTIVATION_ENTRY = {
-  type: "custom",
-  customType: "continuous-tasks:activation",
-  data: { version: 1, enabled: true },
-};
-
-type Handler = (event: any, ctx: ExtensionContext) => unknown;
-
-function getHandler(mockAPI: ReturnType<typeof createMockAPI>, eventName: string): Handler {
-  const call = mockAPI.on.mock.calls.find(([name]) => name === eventName);
-  if (!call) throw new Error(`Handler not registered: ${eventName}`);
-  return call[1] as Handler;
-}
-
-function context(branch: Array<{ type: string; customType?: string; data?: unknown }> = []) {
-  return createMockContext(branch);
-}
-
-function config(overrides: Partial<ContinuousTasksConfig> = {}): ContinuousTasksConfig {
-  return { ...DEFAULT_CONFIG, ...overrides };
-}
-
-function activeBoard(overrides: Partial<TaskBoardSnapshot> = {}): TaskBoardSnapshot {
-  return {
-    version: 2,
-    generation: 3,
-    workflowStatus: "active",
-    finalAcceptanceTaskId: "t-2.1",
-    stagnantSettles: 0,
-    tasks: [
-      {
-        id: "t-1.1",
-        title: "Implement",
-        prompt: "Implement the change",
-        profile: "worker",
-        phase: 1,
-        dependencies: [],
-        status: "ready",
-        createdAt: NOW,
-        updatedAt: NOW,
-      },
-      {
-        id: "t-2.1",
-        title: "Final acceptance",
-        prompt: "Verify the change",
-        profile: "reviewer",
-        phase: 2,
-        dependencies: ["t-1.1"],
-        status: "configured",
-        createdAt: NOW,
-        updatedAt: NOW,
-      },
-    ],
-    phases: [
-      { phase: 1, status: "active", title: "Implement" },
-      { phase: 2, status: "pending", title: "Accept" },
-    ],
-    ...overrides,
-  };
-}
-
-async function registerAllowed(mockAPI: ReturnType<typeof createMockAPI>, ctx = context()) {
-  const branch = ctx.sessionManager.getBranch() as Array<{
-    type: string;
-    customType?: string;
-    data?: unknown;
-  }>;
-  branch.unshift(ACTIVATION_ENTRY);
-  registerEventHandlers(mockAPI.api, async () => config());
-  await getHandler(mockAPI, "session_start")({}, ctx);
-  return ctx;
-}
-
-async function recordNormalEnd(mockAPI: ReturnType<typeof createMockAPI>, ctx: ExtensionContext) {
-  await getHandler(mockAPI, "agent_end")(
-    { messages: [{ role: "assistant", stopReason: "stop" }] },
-    ctx,
-  );
-}
-
+// These tests exercise Pi 1.1's actionable boundary; agent_settled is notification-only.
 describe("continuous task lifecycle events", () => {
   beforeEach(() => {
-    vi.useFakeTimers();
     resetState();
+    setSessionScopeEnabled(false);
   });
 
-  afterEach(() => {
-    vi.useRealTimers();
-  });
-
-  it("registers the complete lifecycle surface", () => {
-    const mockAPI = createMockAPI();
-    registerEventHandlers(mockAPI.api, async () => config());
-    expect(mockAPI.on.mock.calls.map(([name]) => name)).toEqual([
+  it("registers native settlement and compaction hooks, not delayed settled wakeups", () => {
+    const { mock } = lifecycle();
+    expect(mock.on.mock.calls.map(([name]) => name)).toEqual([
       "session_start",
       "session_tree",
       "session_shutdown",
-      "before_agent_start",
-      "agent_end",
-      "agent_settled",
+      "session_before_compact",
       "input",
+      "before_agent_start",
+      "agent_before_settle",
+      "agent_settled",
       "tool_call",
       "tool_result",
     ]);
   });
 
-  it("removes task tools and blocks calls without session activation", async () => {
-    const mockAPI = createMockAPI();
-    const ctx = context();
-    registerEventHandlers(mockAPI.api, async () => DEFAULT_CONFIG);
-
-    await getHandler(mockAPI, "session_start")({}, ctx);
-    expect(mockAPI.setActiveTools).toHaveBeenCalledWith(["read"]);
-    expect(await getHandler(mockAPI, "tool_call")({ toolName: "write_tasks" }, ctx)).toEqual({
+  it("removes task tools and blocks calls in an unactivated session", async () => {
+    const h = lifecycle();
+    await h.fire("session_start");
+    expect(h.mock.setActiveTools).toHaveBeenCalledWith(["read"]);
+    expect(await h.fire("tool_call", { toolName: "write_tasks", input: {} })).toMatchObject({
       block: true,
-      reason: "Continuous Tasks is disabled for this session",
+      reason: expect.stringContaining("disabled"),
     });
-    expect(await getHandler(mockAPI, "tool_call")({ toolName: "read" }, ctx)).toBeUndefined();
+    expect(await h.fire("tool_call", { toolName: "read", input: {} })).toBeUndefined();
+    expect(await h.fire("agent_before_settle", BOUNDARY)).toBeUndefined();
+    expect(await h.fire("before_agent_start")).toBeUndefined();
   });
 
-  it("rejects malformed activation entries", async () => {
-    const mockAPI = createMockAPI();
-    const ctx = context([
-      {
-        type: "custom",
-        customType: "continuous-tasks:activation",
-        data: { version: 1, enabled: false },
-      },
-    ]);
-    registerEventHandlers(mockAPI.api, async () => DEFAULT_CONFIG);
-
-    await getHandler(mockAPI, "session_start")({}, ctx);
-    expect(mockAPI.setActiveTools).toHaveBeenLastCalledWith(["read"]);
-  });
-
-  it("enables all task tools for an activated session", async () => {
-    const mockAPI = createMockAPI();
-    await registerAllowed(mockAPI);
-
-    const enabled = mockAPI.setActiveTools.mock.calls.at(-1)?.[0] as string[];
-    expect(enabled).toContain("read");
-    expect(enabled).toContain("workflow_gate");
-    expect(enabled).toContain("advance_tasks");
-  });
-
-  it("restores a version-2 board on session start", async () => {
-    const board = activeBoard();
-    const ctx = context([{ type: "custom", customType: "continuous-tasks:snapshot", data: board }]);
-    const mockAPI = createMockAPI();
-    await registerAllowed(mockAPI, ctx);
-
-    expect(getBoard()).toEqual(board);
-    expect(ctx.ui.setStatus).toHaveBeenCalled();
-  });
-
-  it("restores activation and board state from the selected branch", async () => {
-    const board = activeBoard({ generation: 9 });
-    const ctx = context([
-      ACTIVATION_ENTRY,
-      { type: "custom", customType: "continuous-tasks:snapshot", data: board },
-    ]);
-    const mockAPI = createMockAPI();
-    registerEventHandlers(mockAPI.api, async () => config());
-
-    await getHandler(mockAPI, "session_tree")({}, ctx);
-    expect(getBoard().generation).toBe(9);
-    expect(mockAPI.setActiveTools).toHaveBeenLastCalledWith(
-      expect.arrayContaining(["read", "write_tasks", "workflow_gate"]),
-    );
-  });
-
-  it("injects hidden context only for an active enabled workflow", async () => {
-    const mockAPI = createMockAPI();
-    const ctx = await registerAllowed(mockAPI);
-    setBoard(activeBoard());
-
-    const result = (await getHandler(mockAPI, "before_agent_start")({}, ctx)) as {
-      message?: { customType: string; display: boolean; content: string };
-    };
-    expect(result.message).toMatchObject({
-      customType: "continuous-tasks:context",
-      display: false,
-    });
-    expect(result.message?.content).toContain("Active Phase");
-  });
-
-  it.each(["inactive", "paused", "waiting_for_decision", "completed"] as const)(
-    "does not inject context while workflow status is %s",
-    async (workflowStatus) => {
-      const mockAPI = createMockAPI();
-      const ctx = await registerAllowed(mockAPI);
-      setBoard(
-        activeBoard({
-          workflowStatus,
-          decision:
-            workflowStatus === "waiting_for_decision"
-              ? {
-                  id: "d1",
-                  taskId: "t-1.1",
-                  question: "Choose",
-                  whyUserOwned: "Product decision",
-                  createdAt: NOW,
-                }
-              : undefined,
-        }),
+  it.each(["session_start", "session_tree"])(
+    "restores activation and board on %s",
+    async (name) => {
+      const mock = createMockAPI();
+      const ctx = createMockContext([
+        ACTIVATION,
+        { type: "custom", customType: "continuous-tasks:snapshot", data: activeBoard() },
+      ]);
+      registerEventHandlers(mock.api);
+      await getHandler(mock, name)({}, ctx);
+      expect(getBoard()).toEqual(activeBoard());
+      expect(isSessionScopeEnabled()).toBe(true);
+      expect(mock.setActiveTools).toHaveBeenLastCalledWith(
+        expect.arrayContaining(["workflow_gate", "advance_tasks"]),
       );
-
-      const result = await getHandler(mockAPI, "before_agent_start")({}, ctx);
-      expect(result).toBeUndefined();
     },
   );
 
-  it("records agent_end without scheduling work", async () => {
-    const mockAPI = createMockAPI();
-    const ctx = await registerAllowed(mockAPI);
-    setBoard(activeBoard());
-
-    await recordNormalEnd(mockAPI, ctx);
-    await vi.advanceTimersByTimeAsync(5000);
-    expect(mockAPI.sendMessage).not.toHaveBeenCalled();
-    expect(mockAPI.sendUserMessage).not.toHaveBeenCalled();
+  it("rejects malformed activation", async () => {
+    const mock = createMockAPI();
+    const ctx = createMockContext([{ ...ACTIVATION, data: { version: 1, enabled: false } }]);
+    registerEventHandlers(mock.api);
+    await getHandler(mock, "session_start")({}, ctx);
+    expect(isSessionScopeEnabled()).toBe(false);
   });
 
-  it("shows a 3-2-1 countdown and sends one hidden continuation", async () => {
-    const mockAPI = createMockAPI();
-    const ctx = await registerAllowed(mockAPI);
+  it("injects hidden active board context", async () => {
+    const h = lifecycle();
+    setSessionScopeEnabled(true);
     setBoard(activeBoard());
-    await recordNormalEnd(mockAPI, ctx);
-
-    await getHandler(mockAPI, "agent_settled")({}, ctx);
-    expect(ctx.ui.setWidget).toHaveBeenCalledWith(
-      "continuous-tasks-countdown",
-      ["⏳ Auto-continuing in 3s... (type anything to interrupt)"],
-      { placement: "aboveEditor" },
-    );
-    await vi.advanceTimersByTimeAsync(1000);
-    expect(ctx.ui.setWidget).toHaveBeenCalledWith(
-      "continuous-tasks-countdown",
-      ["⏳ Auto-continuing in 2s... (type anything to interrupt)"],
-      { placement: "aboveEditor" },
-    );
-    await vi.advanceTimersByTimeAsync(1000);
-    expect(ctx.ui.setWidget).toHaveBeenCalledWith(
-      "continuous-tasks-countdown",
-      ["⏳ Auto-continuing in 1s... (type anything to interrupt)"],
-      { placement: "aboveEditor" },
-    );
-    await vi.advanceTimersByTimeAsync(1000);
-
-    expect(mockAPI.sendUserMessage).not.toHaveBeenCalled();
-    expect(mockAPI.sendMessage).toHaveBeenCalledWith(
-      expect.objectContaining({
-        customType: "continuous-tasks:continue",
-        display: false,
-      }),
-      { triggerTurn: true, deliverAs: "followUp" },
-    );
+    expect(await h.fire("before_agent_start")).toMatchObject({
+      message: { display: false, content: expect.stringContaining("Active Phase") },
+    });
+    for (const workflowStatus of [
+      "inactive",
+      "paused",
+      "waiting_for_decision",
+      "completed",
+    ] as const) {
+      setBoard(activeBoard({ workflowStatus }));
+      expect(await h.fire("before_agent_start")).toBeUndefined();
+    }
   });
 
-  it("uses a timeout without a widget in headless mode", async () => {
-    const mockAPI = createMockAPI();
-    const ctx = context();
-    (ctx as { hasUI: boolean }).hasUI = false;
-    await registerAllowed(mockAPI, ctx);
+  it("returns one hidden native continuation without a countdown or sendMessage wakeup", async () => {
+    const h = lifecycle();
+    setSessionScopeEnabled(true);
     setBoard(activeBoard());
-    await recordNormalEnd(mockAPI, ctx);
-
-    await getHandler(mockAPI, "agent_settled")({}, ctx);
-    expect(ctx.ui.setWidget).not.toHaveBeenCalled();
-    await vi.advanceTimersByTimeAsync(3000);
-    expect(mockAPI.sendMessage).toHaveBeenCalledWith(
-      expect.objectContaining({ customType: "continuous-tasks:continue" }),
-      { triggerTurn: true, deliverAs: "followUp" },
-    );
-  });
-
-  it("does not continue while another message is pending", async () => {
-    const mockAPI = createMockAPI();
-    const ctx = await registerAllowed(mockAPI);
-    (ctx.hasPendingMessages as ReturnType<typeof vi.fn>).mockReturnValue(true);
-    setBoard(activeBoard());
-    await recordNormalEnd(mockAPI, ctx);
-
-    await getHandler(mockAPI, "agent_settled")({}, ctx);
-    await vi.advanceTimersByTimeAsync(3000);
-    expect(mockAPI.sendMessage).not.toHaveBeenCalled();
-  });
-
-  it("cancels the current countdown on interactive input without pausing", async () => {
-    const mockAPI = createMockAPI();
-    const ctx = await registerAllowed(mockAPI);
-    setBoard(activeBoard());
-    await recordNormalEnd(mockAPI, ctx);
-    await getHandler(mockAPI, "agent_settled")({}, ctx);
-
-    await getHandler(mockAPI, "input")({ source: "interactive", text: "status" }, ctx);
-    await vi.advanceTimersByTimeAsync(3000);
-    expect(mockAPI.sendMessage).not.toHaveBeenCalled();
-    expect(getBoard().workflowStatus).toBe("active");
-  });
-
-  it("discards a stale countdown after a generation change", async () => {
-    const mockAPI = createMockAPI();
-    const ctx = await registerAllowed(mockAPI);
-    setBoard(activeBoard());
-    await recordNormalEnd(mockAPI, ctx);
-    await getHandler(mockAPI, "agent_settled")({}, ctx);
-
-    setBoard(activeBoard({ generation: 4 }));
-    await vi.advanceTimersByTimeAsync(3000);
-    expect(mockAPI.sendMessage).not.toHaveBeenCalled();
+    expect(await h.fire("agent_before_settle", BOUNDARY)).toMatchObject({
+      continue: true,
+      entries: [
+        { customType: "continuous-tasks:continue", display: false, details: { generation: 3 } },
+      ],
+    });
+    expect(h.mock.sendMessage).not.toHaveBeenCalled();
+    expect(h.mock.sendUserMessage).not.toHaveBeenCalled();
+    expect(h.ctx.ui.setWidget).not.toHaveBeenCalled();
   });
 
   it.each([
-    ["aborted", "The user aborted the last run"],
-    ["error", "The last run still failed after Pi retries"],
-  ])("pauses after final outcome %s", async (stopReason, reason) => {
-    const mockAPI = createMockAPI();
-    const ctx = await registerAllowed(mockAPI);
+    { ...BOUNDARY, continue: true },
+    { ...BOUNDARY, context: { canContinue: true, pendingMessages: ["pending"] } },
+  ])("yields to an existing boundary continuation or pending work", async (event) => {
+    const h = lifecycle();
+    setSessionScopeEnabled(true);
     setBoard(activeBoard());
-
-    await getHandler(mockAPI, "agent_end")({ messages: [{ role: "assistant", stopReason }] }, ctx);
-    await getHandler(mockAPI, "agent_settled")({}, ctx);
-
-    expect(getBoard()).toMatchObject({ workflowStatus: "paused", pauseReason: reason });
-    expect(mockAPI.sendMessage).toHaveBeenCalledWith(
-      expect.objectContaining({ content: `Continuous Tasks paused: ${reason}` }),
-      { triggerTurn: false },
-    );
+    expect(await h.fire("agent_before_settle", event)).toBeUndefined();
   });
 
-  it("pauses on a non-terminal deadlock", async () => {
-    const mockAPI = createMockAPI();
-    const ctx = await registerAllowed(mockAPI);
+  it("makes an assistant-ended boundary runnable by adding its own guidance entry", async () => {
+    const h = lifecycle();
+    setSessionScopeEnabled(true);
+    setBoard(activeBoard());
+    expect(
+      await h.fire("agent_before_settle", {
+        ...BOUNDARY,
+        context: { canContinue: false, pendingMessages: [] },
+      }),
+    ).toMatchObject({ continue: true, entries: [{ type: "custom_message" }] });
+  });
+
+  it("does not continue when host messages are pending", async () => {
+    const h = lifecycle();
+    setSessionScopeEnabled(true);
+    setBoard(activeBoard());
+    vi.mocked(h.ctx.hasPendingMessages).mockReturnValue(true);
+    expect(await h.fire("agent_before_settle", BOUNDARY)).toBeUndefined();
+  });
+
+  it.each(["paused", "waiting_for_decision", "inactive", "completed"] as const)(
+    "does not continue a %s board",
+    async (workflowStatus) => {
+      const h = lifecycle();
+      setSessionScopeEnabled(true);
+      setBoard(activeBoard({ workflowStatus }));
+      expect(await h.fire("agent_before_settle", BOUNDARY)).toBeUndefined();
+    },
+  );
+
+  it.each([
+    ["aborted", "The user aborted"],
+    ["error", "after Pi retries"],
+  ])("pauses after final outcome %s", async (outcome, reason) => {
+    const h = lifecycle();
+    setSessionScopeEnabled(true);
+    setBoard(activeBoard());
+    expect(await h.fire("agent_before_settle", { ...BOUNDARY, outcome })).toBeUndefined();
+    expect(getBoard()).toMatchObject({
+      workflowStatus: "paused",
+      pauseReason: expect.stringContaining(reason),
+    });
+  });
+
+  it("pauses on deadlock or repeated generation-only churn", async () => {
+    const h = lifecycle();
+    setSessionScopeEnabled(true);
+    setBoard(activeBoard());
+    for (let i = 0; i < 5; i++) {
+      setBoard(activeBoard({ generation: 4 + i }));
+      expect((await h.fire("agent_before_settle", BOUNDARY))?.continue).toBe(true);
+    }
+    expect(await h.fire("agent_before_settle", BOUNDARY)).toBeUndefined();
+    expect(getBoard().workflowStatus).toBe("paused");
     setBoard(
       activeBoard({
         tasks: activeBoard().tasks.map((task) => ({ ...task, status: "configured" })),
       }),
     );
-    await recordNormalEnd(mockAPI, ctx);
-
-    await getHandler(mockAPI, "agent_settled")({}, ctx);
-    expect(getBoard()).toMatchObject({
-      workflowStatus: "paused",
-      pauseReason: "Non-terminal tasks remain but none are actionable",
-    });
+    expect(await h.fire("agent_before_settle", BOUNDARY)).toBeUndefined();
+    expect(getBoard().pauseReason).toContain("none are actionable");
   });
 
-  it("does nothing for a completed board", async () => {
-    const mockAPI = createMockAPI();
-    const ctx = await registerAllowed(mockAPI);
-    setBoard(activeBoard({ workflowStatus: "completed" }));
-    await recordNormalEnd(mockAPI, ctx);
-
-    await getHandler(mockAPI, "agent_settled")({}, ctx);
-    await vi.advanceTimersByTimeAsync(3000);
-    expect(mockAPI.sendMessage).not.toHaveBeenCalled();
-  });
-
-  it("announces and consumes a pending phase prompt before continuing", async () => {
-    const mockAPI = createMockAPI();
-    const ctx = await registerAllowed(mockAPI);
-    setBoard(activeBoard({ pendingPhasePrompt: { phase: 1, message: "Phase 1 accepted." } }));
-    await recordNormalEnd(mockAPI, ctx);
-
-    await getHandler(mockAPI, "agent_settled")({}, ctx);
-    await vi.advanceTimersByTimeAsync(3000);
-
-    expect(mockAPI.sendMessage).toHaveBeenCalledWith(
-      expect.objectContaining({
-        customType: "continuous-tasks:notice",
-        content: "Phase 1 complete.",
-        display: true,
-      }),
+  it("consumes a phase prompt only when a continuation is actually returned", async () => {
+    const h = lifecycle();
+    setSessionScopeEnabled(true);
+    setBoard(activeBoard({ pendingPhasePrompt: { phase: 1, message: "Verify the next phase" } }));
+    const result = await h.fire("agent_before_settle", BOUNDARY);
+    expect(result.entries[0].content).toContain("Verify the next phase");
+    expect(getBoard().pendingPhasePrompt).toBeUndefined();
+    expect(h.mock.sendMessage).toHaveBeenCalledWith(
+      expect.objectContaining({ content: "Phase 1 complete." }),
       { triggerTurn: false },
     );
-    expect(mockAPI.sendMessage).toHaveBeenCalledWith(
-      expect.objectContaining({
-        customType: "continuous-tasks:continue",
-        content: expect.stringContaining("Phase 1 accepted."),
-      }),
-      { triggerTurn: true, deliverAs: "followUp" },
-    );
-    expect(getBoard().pendingPhasePrompt).toBeUndefined();
   });
 
-  it("pauses after the configured number of stagnant automatic continuations", async () => {
-    const mockAPI = createMockAPI();
-    const ctx = context([ACTIVATION_ENTRY]);
-    registerEventHandlers(mockAPI.api, async () =>
-      config({ countdownMs: 0, maxStagnantSettles: 2 }),
-    );
-    await getHandler(mockAPI, "session_start")({}, ctx);
+  it.each(["input", "session_shutdown", "session_tree", "session_before_compact"])(
+    "cancels a boundary while loading configuration on %s",
+    async (name) => {
+      const mock = createMockAPI();
+      const config = deferred<typeof DEFAULT_CONFIG>();
+      registerEventHandlers(mock.api, () => config.promise);
+      const ctx = createMockContext();
+      setSessionScopeEnabled(true);
+      setBoard(activeBoard());
+      const pending = getHandler(mock, "agent_before_settle")(BOUNDARY, ctx);
+      expect(await getHandler(mock, "agent_before_settle")(BOUNDARY, ctx)).toBeUndefined();
+      await getHandler(mock, name)({}, ctx);
+      config.resolve(DEFAULT_CONFIG);
+      expect(await pending).toBeUndefined();
+    },
+  );
+
+  it("pauses visibly when unsupervised continuation configuration fails", async () => {
+    const mock = createMockAPI();
+    registerEventHandlers(mock.api, async () => {
+      throw new Error("api_key=private-secret config failed");
+    });
+    const ctx = createMockContext();
+    setSessionScopeEnabled(true);
     setBoard(activeBoard());
-
-    await recordNormalEnd(mockAPI, ctx);
-    await getHandler(mockAPI, "agent_settled")({}, ctx);
-    await vi.runAllTimersAsync();
-    await recordNormalEnd(mockAPI, ctx);
-    await getHandler(mockAPI, "agent_settled")({}, ctx);
-    await vi.runAllTimersAsync();
-    await recordNormalEnd(mockAPI, ctx);
-    await getHandler(mockAPI, "agent_settled")({}, ctx);
-
-    expect(getBoard()).toMatchObject({ workflowStatus: "paused", stagnantSettles: 2 });
+    expect(await getHandler(mock, "agent_before_settle")(BOUNDARY, ctx)).toBeUndefined();
+    expect(getBoard()).toMatchObject({
+      workflowStatus: "paused",
+      pauseReason: "[redacted] config failed",
+    });
+    expect(mock.sendMessage).toHaveBeenCalledWith(expect.objectContaining({ display: true }), {
+      triggerTurn: false,
+    });
+    expect(JSON.stringify(mock.appendEntry.mock.calls)).not.toContain("private-secret");
   });
 
-  it("clears a pending countdown during session shutdown", async () => {
-    const mockAPI = createMockAPI();
-    const ctx = await registerAllowed(mockAPI);
+  it("discards an async configuration result after the board changes", async () => {
+    const mock = createMockAPI();
+    const config = deferred<typeof DEFAULT_CONFIG>();
+    registerEventHandlers(mock.api, () => config.promise);
+    const ctx = createMockContext();
+    setSessionScopeEnabled(true);
     setBoard(activeBoard());
-    await recordNormalEnd(mockAPI, ctx);
-    await getHandler(mockAPI, "agent_settled")({}, ctx);
-
-    await getHandler(mockAPI, "session_shutdown")({}, ctx);
-    await vi.advanceTimersByTimeAsync(3000);
-    expect(mockAPI.sendMessage).not.toHaveBeenCalled();
-    expect(ctx.ui.setWidget).toHaveBeenCalledWith("continuous-tasks-countdown", undefined);
+    const pending = getHandler(mock, "agent_before_settle")(BOUNDARY, ctx);
+    setBoard(activeBoard({ generation: 9 }));
+    config.resolve(DEFAULT_CONFIG);
+    expect(await pending).toBeUndefined();
   });
 
-  it("resets the double-advance marker after another tool result", async () => {
-    const mockAPI = createMockAPI();
-    registerEventHandlers(mockAPI.api, async () => config());
+  it("resets the legacy advance marker on input or another tool result", async () => {
+    const h = lifecycle();
     setLastToolWasAdvance(true);
-
-    await getHandler(mockAPI, "tool_result")({ toolName: "read" }, context());
+    await h.fire("tool_result", { toolName: "read" });
+    expect(getLastToolWasAdvance()).toBe(false);
+    setLastToolWasAdvance(true);
+    await h.fire("input");
     expect(getLastToolWasAdvance()).toBe(false);
   });
 });

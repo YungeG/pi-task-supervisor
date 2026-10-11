@@ -150,7 +150,7 @@ const VALID_PHASE_STATUSES = new Set(["pending", "active", "completed"]);
 const VALID_EVIDENCE_KINDS = new Set(["command", "review", "artifact", "diff"]);
 const VALID_EVIDENCE_STATUSES = new Set(["passed", "fixed", "deferred"]);
 const SECRET_LIKE =
-  /\b(?:Bearer\s+[A-Za-z0-9._-]{8,}|(?:api[_-]?key|token|password)\s*[:=]\s*\S+|(?:sk|ghp|pt|dt)_[A-Za-z0-9_-]{8,})/i;
+  /\b(?:Bearer\s+[A-Za-z0-9._-]{8,}|(?:api[_-]?key|(?:access[_-]?|refresh[_-]?)?token|password|authorization|client[_-]?secret)["']?\s*[:=]\s*\S+|(?:sk|ghp|pt|dt)_[A-Za-z0-9_-]{8,})/i;
 
 export function isSafeBoundedText(value: unknown, maxLength: number): value is string {
   return (

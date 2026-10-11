@@ -2,6 +2,7 @@ import type { ExtensionCommandContext } from "@earendil-works/pi-coding-agent";
 import { beforeEach, describe, expect, it } from "vitest";
 import { registerCommands } from "../commands";
 import { setSessionScopeEnabled } from "../scope";
+import { supervisorState } from "../supervisor";
 import { getBoard, resetState, setBoard } from "../state";
 import type { TaskBoardSnapshot } from "../types";
 import { createMockAPI, createMockContext } from "./helpers/mocks";
@@ -32,9 +33,9 @@ function activeBoard(): TaskBoardSnapshot {
   };
 }
 
-function commandHandler(mockAPI: ReturnType<typeof createMockAPI>) {
-  const call = mockAPI.registerCommand.mock.calls.find(([name]) => name === "continuous-tasks");
-  if (!call) throw new Error("continuous-tasks command not registered");
+function commandHandler(mockAPI: ReturnType<typeof createMockAPI>, command = "continuous-tasks") {
+  const call = mockAPI.registerCommand.mock.calls.find(([name]) => name === command);
+  if (!call) throw new Error(`${command} command not registered`);
   return (call[1] as { handler: (args: string, ctx: ExtensionCommandContext) => Promise<void> })
     .handler;
 }
@@ -117,12 +118,33 @@ describe("continuous-tasks command", () => {
     );
     expect(ctx.ui.notify).toHaveBeenNthCalledWith(
       1,
-      "Continuous Tasks enabled for this session",
+      "Pi Task Supervisor enabled for this session",
       "info",
     );
     expect(ctx.ui.notify).toHaveBeenNthCalledWith(
       2,
-      "Continuous Tasks is already enabled for this session",
+      "Pi Task Supervisor is already enabled for this session",
+      "info",
+    );
+  });
+
+  it("shares session activation between the primary command and legacy alias", async () => {
+    const mockAPI = createMockAPI();
+    registerCommands(mockAPI.api);
+    const ctx = createMockContext() as ExtensionCommandContext;
+    setSessionScopeEnabled(false);
+
+    await commandHandler(mockAPI, "task-supervisor")("enable", ctx);
+    await commandHandler(mockAPI)("enable", ctx);
+
+    expect(mockAPI.appendEntry.mock.calls).toEqual([
+      ["continuous-tasks:activation", { version: 1, enabled: true }],
+    ]);
+    expect(mockAPI.setActiveTools).toHaveBeenCalledWith(
+      expect.arrayContaining(["write_tasks", "workflow_gate"]),
+    );
+    expect(ctx.ui.notify).toHaveBeenLastCalledWith(
+      "Pi Task Supervisor is already enabled for this session",
       "info",
     );
   });
@@ -136,17 +158,17 @@ describe("continuous-tasks command", () => {
     await commandHandler(mockAPI)("status", ctx);
 
     expect(ctx.ui.notify).toHaveBeenCalledWith(
-      "Continuous Tasks is disabled; run /continuous-tasks enable",
+      "Pi Task Supervisor is disabled; run /task-supervisor enable",
       "error",
     );
     expect(mockAPI.sendMessage).not.toHaveBeenCalled();
   });
 
   it.each([
-    ["pause", "Continuous Tasks is not active"],
-    ["resume", "Continuous Tasks is not paused"],
+    ["pause", "Pi Task Supervisor is not active"],
+    ["resume", "Pi Task Supervisor is not paused"],
     ["resolve decision-1 answer", "No decision is waiting"],
-    ["unknown", "Usage: /continuous-tasks"],
+    ["unknown", "Usage: /task-supervisor"],
   ])("reports invalid command state for %s", async (args, expected) => {
     const mockAPI = createMockAPI();
     registerCommands(mockAPI.api);
@@ -182,6 +204,60 @@ describe("continuous-tasks command", () => {
     expect(ctx.ui.notify).toHaveBeenCalledWith(
       "Decision answer is empty, too long, or secret-like",
       "error",
+    );
+  });
+
+  it("starts an explicit supervisor goal without a model call or forged user message", async () => {
+    const mockAPI = createMockAPI();
+    const ctx = createMockContext();
+    Object.assign(ctx, { model: { provider: "faux", id: "test" } });
+    registerCommands(mockAPI.api);
+    setSessionScopeEnabled(false);
+
+    await commandHandler(mockAPI)("supervise Verify the approved work", ctx);
+
+    expect(supervisorState()).toMatchObject({
+      status: "active",
+      goal: "Verify the approved work",
+      reviews: 0,
+      sessionId: "test-session",
+      model: { provider: "faux", id: "test" },
+    });
+    expect(mockAPI.sendUserMessage).not.toHaveBeenCalled();
+    expect(mockAPI.sendMessage).toHaveBeenCalledWith(
+      expect.objectContaining({ customType: "continuous-tasks:continue" }),
+      { triggerTurn: true, deliverAs: "followUp" },
+    );
+  });
+
+  it("controls a primary-command supervisor through the legacy alias without replacing its goal", async () => {
+    const mockAPI = createMockAPI();
+    const ctx = createMockContext();
+    Object.assign(ctx, { model: { provider: "faux", id: "test" } });
+    registerCommands(mockAPI.api);
+    setBoard(activeBoard());
+    const primary = commandHandler(mockAPI, "task-supervisor");
+    const legacy = commandHandler(mockAPI);
+
+    await primary("supervise Verify alias compatibility", ctx);
+    await legacy("pause maintenance", ctx);
+    expect(supervisorState()).toMatchObject({
+      status: "paused",
+      goal: "Verify alias compatibility",
+    });
+    expect(getBoard().workflowStatus).toBe("paused");
+
+    await primary("resume", ctx);
+    await legacy("recover", ctx);
+    expect(getBoard().workflowStatus).toBe("active");
+    expect(supervisorState()).toMatchObject({
+      status: "active",
+      goal: "Verify alias compatibility",
+      sessionId: "test-session",
+    });
+    expect(mockAPI.appendEntry).toHaveBeenCalledWith(
+      "continuous-tasks:supervisor",
+      expect.objectContaining({ goal: "Verify alias compatibility", status: "active" }),
     );
   });
 

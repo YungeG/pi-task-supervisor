@@ -39,21 +39,26 @@ describe("index (default export)", () => {
     expect(toolNames).toContain("advance_tasks");
     expect(toolNames).toContain("workflow_gate");
 
-    expect(mockObj.registerCommand).toHaveBeenCalledTimes(1);
+    expect(mockObj.registerCommand).toHaveBeenCalledTimes(2);
+    expect(mockObj.registerCommand).toHaveBeenCalledWith(
+      "task-supervisor",
+      expect.objectContaining({ description: expect.any(String) }),
+    );
     expect(mockObj.registerCommand).toHaveBeenCalledWith(
       "continuous-tasks",
       expect.objectContaining({ description: expect.any(String) }),
     );
 
-    // Event handlers registered (9 events)
-    expect(mockObj.on).toHaveBeenCalledTimes(9);
+    // Native continuation boundary plus notification-only abort reconciliation.
+    expect(mockObj.on).toHaveBeenCalledTimes(10);
     const eventNames = mockObj.on.mock.calls.map((call: unknown) => (call as [string, unknown])[0]);
     expect(eventNames).toContain("session_start");
     expect(eventNames).toContain("session_tree");
     expect(eventNames).toContain("session_shutdown");
     expect(eventNames).toContain("before_agent_start");
-    expect(eventNames).toContain("agent_end");
+    expect(eventNames).toContain("agent_before_settle");
     expect(eventNames).toContain("agent_settled");
+    expect(eventNames).toContain("session_before_compact");
     expect(eventNames).toContain("input");
     expect(eventNames).toContain("tool_call");
     expect(eventNames).toContain("tool_result");

@@ -1,4 +1,5 @@
 import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
+import { currentRuntime } from "./runtime";
 
 export const ACTIVATION_ENTRY_TYPE = "continuous-tasks:activation";
 export const TASK_TOOL_NAMES: readonly string[] = [
@@ -12,14 +13,13 @@ export const TASK_TOOL_NAMES: readonly string[] = [
 ];
 
 const taskTools = new Set(TASK_TOOL_NAMES);
-let enabled = false;
 
 export function setSessionScopeEnabled(value: boolean): void {
-  enabled = value;
+  currentRuntime().enabled = value;
 }
 
 export function isSessionScopeEnabled(): boolean {
-  return enabled;
+  return currentRuntime().enabled;
 }
 
 export function updateActiveTools(pi: ExtensionAPI, value: boolean): void {
@@ -46,7 +46,7 @@ export function restoreSessionScope(pi: ExtensionAPI, ctx: ExtensionContext): bo
 }
 
 export function enableSessionScope(pi: ExtensionAPI): void {
-  if (enabled) return;
+  if (isSessionScopeEnabled()) return;
   pi.appendEntry(ACTIVATION_ENTRY_TYPE, { version: 1, enabled: true });
   setSessionScopeEnabled(true);
   updateActiveTools(pi, true);

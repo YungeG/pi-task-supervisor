@@ -1,8 +1,8 @@
 {
-  "name": "continuous-tasks-local",
+  "name": "pi-task-supervisor",
   "version": "0.1.0-local.0",
   "private": true,
-  "description": "Session-scoped continuous execution with phased tasks, settled continuation, and evidence gates",
+  "description": "Session-scoped phased execution with native supervisor continuation and host evidence gates",
   "keywords": [
     "pi-package"
   ],
@@ -29,7 +29,7 @@
     "test": "vitest run",
     "test:watch": "vitest",
     "test:coverage": "vitest run --coverage",
-    "test:smoke": "node test/real-pi-smoke.mjs",
+    "test:smoke": "node test/real-pi-smoke.mjs && node test/real-pi-smoke.mjs --supervised && node test/real-pi-smoke.mjs --compaction && node test/real-pi-smoke.mjs --interrupt-compaction && node test/real-pi-smoke.mjs --native-abort",
     "check": "npm run typecheck && npm run lint && npm run format:check && npm run test:coverage && npm run test:smoke",
     "format": "prettier --write src/",
     "format:check": "prettier --check src/",
@@ -37,15 +37,15 @@
     "lint:fix": "eslint --fix src/"
   },
   "peerDependencies": {
-    "@earendil-works/pi-ai": "0.84.2",
-    "@earendil-works/pi-coding-agent": "0.84.2",
-    "@earendil-works/pi-tui": "0.84.2",
+    "@earendil-works/pi-ai": "1.1.0",
+    "@earendil-works/pi-coding-agent": "1.1.0",
+    "@earendil-works/pi-tui": "1.1.0",
     "typebox": "1.3.7"
   },
   "devDependencies": {
-    "@earendil-works/pi-ai": "0.84.2",
-    "@earendil-works/pi-coding-agent": "0.84.2",
-    "@earendil-works/pi-tui": "0.84.2",
+    "@earendil-works/pi-ai": "1.1.0",
+    "@earendil-works/pi-coding-agent": "1.1.0",
+    "@earendil-works/pi-tui": "1.1.0",
     "@eslint/js": "^10.0.1",
     "@types/node": "^22.0.0",
     "@vitest/coverage-v8": "^4.1.6",

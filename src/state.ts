@@ -10,55 +10,53 @@ import {
 } from "./validation";
 import { phaseLabel } from "./formatting";
 
-// ── Mutable State ──
-
-let board: TaskBoardSnapshot = createEmptyBoard();
-let autoContinueCount = 0;
-let lastToolWasAdvance = false;
+import { currentRuntime } from "./runtime";
 
 // ── State Accessors ──
 
 /** Returns a deep copy of the current board. */
 export function getBoard(): TaskBoardSnapshot {
-  return cloneBoard(board);
+  return cloneBoard(currentRuntime().board);
 }
 
 /** Replaces the board state. Resets auto-continue counter. */
 export function setBoard(newBoard: TaskBoardSnapshot): void {
-  board = cloneBoard(newBoard);
-  autoContinueCount = 0;
+  currentRuntime().board = cloneBoard(newBoard);
+  currentRuntime().autoContinueCount = 0;
 }
 
 /** Replaces the board state without resetting the auto-continue counter. Used internally by the auto-continue loop. */
 export function setBoardQuiet(newBoard: TaskBoardSnapshot): void {
-  board = cloneBoard(newBoard);
+  currentRuntime().board = cloneBoard(newBoard);
 }
 
 /** Returns a readonly reference to the current board (no clone — caller must not mutate). */
 export function getBoardRef(): Readonly<TaskBoardSnapshot> {
-  return board;
+  return currentRuntime().board;
 }
 
 /** Increments and returns the auto-continue counter. */
 export function incrementAutoContinue(): number {
-  return ++autoContinueCount;
+  return ++currentRuntime().autoContinueCount;
 }
 
 /** Returns whether the last tool result was from advance_tasks. */
 export function getLastToolWasAdvance(): boolean {
-  return lastToolWasAdvance;
+  return currentRuntime().lastToolWasAdvance;
 }
 
 /** Set the last-tool-was-advance flag. */
 export function setLastToolWasAdvance(value: boolean): void {
-  lastToolWasAdvance = value;
+  currentRuntime().lastToolWasAdvance = value;
 }
 
 /** Resets all mutable state. For testing only. */
 export function resetState(): void {
-  board = createEmptyBoard();
-  autoContinueCount = 0;
-  lastToolWasAdvance = false;
+  currentRuntime().board = createEmptyBoard();
+  currentRuntime().autoContinueCount = 0;
+  currentRuntime().lastToolWasAdvance = false;
+  currentRuntime().supervisor = undefined;
+  currentRuntime().journalFault = undefined;
 }
 
 // ── State Reconstruction ──

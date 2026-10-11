@@ -3,6 +3,7 @@ import { homedir } from "node:os";
 import { join, resolve } from "node:path";
 
 export interface ContinuousTasksConfig {
+  /** Legacy setting, parsed for compatibility; native boundaries do not use a countdown. */
   countdownMs: number;
   maxStagnantSettles: number;
   requireCompletionEvidence: boolean;

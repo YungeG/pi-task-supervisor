@@ -1,4 +1,9 @@
-import type { Theme, ExtensionContext, ExtensionAPI } from "@earendil-works/pi-coding-agent";
+import type {
+  Theme,
+  ExtensionToolContext,
+  ExtensionCommandContext,
+  ExtensionAPI,
+} from "@earendil-works/pi-coding-agent";
 import { vi } from "vitest";
 
 /** Creates a mock Theme that returns its arguments wrapped in brackets for assertion */
@@ -17,9 +22,11 @@ export function createMockContext(
     customType?: string;
     data?: unknown;
   }> = [],
-): ExtensionContext {
+): ExtensionToolContext & ExtensionCommandContext {
   return {
     hasUI: true,
+    waitForIdle: vi.fn(async () => undefined),
+    abort: vi.fn(),
     ui: {
       setStatus: vi.fn(),
       setWidget: vi.fn(),
@@ -28,10 +35,11 @@ export function createMockContext(
     sessionManager: {
       getBranch: vi.fn(() => branch),
       getSessionId: vi.fn(() => "test-session"),
+      getLeafId: vi.fn(() => "test-leaf"),
     },
     isIdle: vi.fn(() => true),
     hasPendingMessages: vi.fn(() => false),
-  } as unknown as ExtensionContext;
+  } as unknown as ExtensionToolContext & ExtensionCommandContext;
 }
 
 /** Creates a mock ExtensionAPI */
@@ -68,6 +76,7 @@ export function createMockAPI(): {
       getActiveTools,
       setActiveTools,
       appendEntry,
+      getAllTools: vi.fn(() => []),
     } as unknown as ExtensionAPI,
     sendMessage,
     sendUserMessage,
