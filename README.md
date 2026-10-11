@@ -12,6 +12,7 @@ This is a pinned local fork of [`@harms-haus/pi-tasks`](https://github.com/harms
 /task-supervisor enable
 /task-supervisor supervise <goal>
 /task-supervisor status
+/task-supervisor tasks
 /task-supervisor pause [reason]
 /task-supervisor resume
 /task-supervisor resolve <decision-id> <answer>
@@ -26,8 +27,25 @@ This is a pinned local fork of [`@harms-haus/pi-tasks`](https://github.com/harms
 - `pause` cancels an advisor immediately and pauses Main/the board. `stop` also stops supervision and prevents silent fallback to board continuation.
 - `resume`/`resolve` change only the board gate. They do not reset supervisor holds, faults, or budgets. `recover` explicitly restarts a paused/faulted supervisor after the board gate is resolved; it does not grant approval or restart external writers. Faulted completed boards require stopping and re-planning, not recovery.
 - `status` reports board state, supervisor state, review/resume counts, and recorded usage.
+- `tasks` opens a scrollable full list, including completed/abandoned tasks; select a task to inspect its details and retained evidence. This read-only view works even when task tools are disabled or the supervisor journal is faulted, and never activates supervision or schedules work.
 
 Activation is a durable session entry. Resuming restores it; independent sessions remain disabled. Forks inherit the board/activation but **not the source session's supervisor**. Any unfinished supervisor restored after restart/tree navigation becomes an interrupted fault requiring inspection and explicit recovery, never an active-but-idle badge.
+
+## Visible task board
+
+In the interactive terminal, a persistent board appears above the editor. It uses the existing session snapshot, not a separate task store:
+
+```text
+Tasks: 2/6 done · 4 unfinished
+Workflow: active · Phase 2: Implement
+[implementing] t-2.1 Login endpoint
+[reviewing] t-2.2 Error handling
+[configured] t-3.1 Documentation — waiting for t-2.1; waiting for phase 3
+[configured] t-3.2 Final acceptance — waiting for t-2.2, t-3.1; waiting for phase 3
+/task-supervisor tasks · 0 more unfinished · 2 terminal folded
+```
+
+The widget is capped at eight single terminal lines and prioritizes implementing/reviewing tasks, then ready and planned tasks. It shows unmet dependencies, later-phase gates, execution references, pending decisions, pause reasons, and supervisor holds/faults. Long lines are truncated to terminal width; the full list/details remain available through `/task-supervisor tasks` (also `/continuous-tasks tasks`). Completed and abandoned tasks are folded, never auto-deleted; abandoned tasks are counted separately from verified completion. Empty fresh sessions have no widget. RPC/print modes have no custom widget; RPC can use the native list command.
 
 ## Closed loop and evidence
 

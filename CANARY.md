@@ -1,7 +1,7 @@
 # Local supervisor validation report
 
 - Validated: 2026-10-11 (UTC)
-- Candidate: `pi-task-supervisor/`, local subtraction-review snapshot on `local/continuous-tasks`, based on `c3589da718329350c943a50e0981da2d69a8bde6`
+- Candidate: `pi-task-supervisor/`, prepublication task-board UI validation snapshot on `local/continuous-tasks`, based on published `9dd5e4d8cce1d28d25e1b8ad96bef8c88f9106e5`
 - Public name/command: **Pi Task Supervisor**, `/task-supervisor`; `/continuous-tasks` remains an alias
 - Pi: `1.1.0` (`pi-ai`, `pi-coding-agent`, `pi-tui`); `typebox@1.3.7`
 - Node: `25.9.0`
@@ -11,9 +11,29 @@
 
 This replaces the earlier Pi 0.84.2 board-only canary. Historical results are retained in `UPSTREAM.md` and are not current validation evidence.
 
-## Current checks
+## Current task-board UI checks
 
-`npm run check` passed after the scoped subtraction review. The review removed two unused, non-persisted legacy fields (`autoContinueCount`, `lastToolWasAdvance`), their accessors/resets, and the redundant `setBoardQuiet` setter. Eleven obsolete or duplicate internal-state tests were removed; actual budget, stagnation, cancellation, evidence, recovery, cloning, and compatibility regressions remain. The existing phase-prompt test now also checks generation advancement and legacy snapshot persistence. No automation, dependency, public behavior, or journal/config contract was added or changed.
+`npm run check` passed after the visible-board changes and final empty-paused-board regression fix. The existing snapshot remains the sole task store; no task schema, completion gate, dependency, or activation contract changed. At this validation point, the UI changes had not been committed, published, or installed. Subsequent publication or installation does not constitute live-model or production certification.
+
+| Check                                         | Result                                                                                                        |
+| --------------------------------------------- | ------------------------------------------------------------------------------------------------------------- |
+| TypeScript, ESLint, source formatting         | PASS                                                                                                          |
+| Unit/integration suite                        | **523 tests, 27 files PASS**                                                                                  |
+| Branch coverage                               | **90.69% (1101/1214)**; unchanged 90% threshold                                                               |
+| Statement / function / line coverage          | 95.47% / 97.81% / 97.55%                                                                                      |
+| Five isolated real-Pi SDK smokes with UI stub | PASS                                                                                                          |
+| Package dry-run manifest                      | PASS: 23 files, all 16 production TypeScript files; includes `board-ui.ts`, excludes tests and `node_modules` |
+| `git diff --check`                            | PASS                                                                                                          |
+
+Focused tests cover unfinished states, ordering, dependency/phase blockers, execution references, decisions, pauses, faults, completed evidence retention, all 100 tasks in the full list, and overflow counts. The widget is bounded to eight single terminal lines with actual Pi width/control-sequence utilities, including narrow and CJK text. An empty fresh board clears the widget, while an empty paused board retains its pause reason. Deferred rendering and modal selection capture the session view before asynchronous context changes. Both command aliases provide read-only inspection even when disabled or journal-faulted; inspection neither mutates task state/history nor starts Main.
+
+The existing five SDK modes now also observe live implementing/reviewing/supervisor-review updates, completed folding, full-list evidence, shutdown clearing, resume restoration, fork isolation, and fresh independent clearing. These are real SDK callbacks with a **UI stub**, not a real interactive terminal or human visual certification. No live inference, executor tools, business-session reload, settings changes, or installed-extension coexistence tests were added.
+
+Fresh LSP probes of all nine changed TypeScript paths reported no errors, but auxiliary heuristic warnings/hints remain (including the repository's extensionless relative-import convention). A final two-path recheck reported no errors with one clean result and one **inconclusive** push-only result. This is not an all-LSP-clean or zero-warning claim; full TypeScript checking passed. The new UI candidate was checked by package dry-run only, not by a new actual packed-source load or clean dependency installation.
+
+## Previous subtraction-review checks (historical)
+
+The following checks apply to the earlier subtraction-review snapshot, not the current UI package. `npm run check` passed after the scoped subtraction review. The review removed two unused, non-persisted legacy fields (`autoContinueCount`, `lastToolWasAdvance`), their accessors/resets, and the redundant `setBoardQuiet` setter. Eleven obsolete or duplicate internal-state tests were removed; actual budget, stagnation, cancellation, evidence, recovery, cloning, and compatibility regressions remain. The existing phase-prompt test now also checks generation advancement and legacy snapshot persistence. No automation, dependency, public behavior, or journal/config contract was added or changed.
 
 | Check                                                         | Result                                          |
 | ------------------------------------------------------------- | ----------------------------------------------- |
@@ -75,4 +95,4 @@ For immediate advisor cancellation, use **`/task-supervisor pause` before manual
 - Node 24 and clean peer-dependency installation were not retested for this candidate. Current execution evidence is Node 25.9.0 with existing local dependencies.
 - Redaction is not general DLP, and task gates are not an OS/tool permission sandbox. Other Main tools retain host controls.
 
-The controlling agent completed the authorized local validation; Git publication was separately requested by the user and does not constitute installation or deployment. No user action is needed for these checks. Deployment or live/business validation is outside this authorization and requires a separate explicit decision; nothing here authorizes installation, credential changes, or business-session activation.
+The controlling agent completed the authorized local validation. This report records the prepublication validation snapshot; publication and installation are separately authorized follow-up operations, not additional validation evidence. No user action is needed for these checks. Live/business validation, credential changes, and business-session activation remain outside this validation scope.

@@ -1,6 +1,7 @@
 import type { ExtensionAPI, ExtensionCommandContext } from "@earendil-works/pi-coding-agent";
 import { formatContinuePrompt, formatSummaryLine } from "./formatting";
 import { currentRuntime } from "./runtime";
+import { showTaskList } from "./board-ui";
 import {
   holdSupervisor,
   recoverSupervisor,
@@ -163,6 +164,10 @@ export function registerCommands(pi: ExtensionAPI): void {
     async handler(args: string, ctx: ExtensionCommandContext) {
       const [action = "status", id, ...answerParts] = args.trim().split(/\s+/);
       try {
+        if (action === "tasks") {
+          await showTaskList(ctx, getBoardRef());
+          return;
+        }
         if (currentRuntime().journalFault) throw new Error(currentRuntime().journalFault);
         if (
           await supervisorCommand(pi, ctx, action, [id, ...answerParts].filter(Boolean).join(" "))
@@ -199,7 +204,7 @@ export function registerCommands(pi: ExtensionAPI): void {
         }
         notifyError(
           ctx,
-          "Usage: /task-supervisor enable|supervise <goal>|status|pause [reason]|resume|resolve <id> <answer>|recover|stop",
+          "Usage: /task-supervisor enable|supervise <goal>|status|tasks|pause [reason]|resume|resolve <id> <answer>|recover|stop",
         );
       } catch (error) {
         notifyError(

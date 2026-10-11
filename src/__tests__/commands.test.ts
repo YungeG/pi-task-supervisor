@@ -1,7 +1,8 @@
 import type { ExtensionCommandContext } from "@earendil-works/pi-coding-agent";
-import { beforeEach, describe, expect, it } from "vitest";
+import { beforeEach, describe, expect, it, vi } from "vitest";
 import { registerCommands } from "../commands";
-import { setSessionScopeEnabled } from "../scope";
+import { isSessionScopeEnabled, setSessionScopeEnabled } from "../scope";
+import { currentRuntime } from "../runtime";
 import { supervisorState } from "../supervisor";
 import { getBoard, resetState, setBoard } from "../state";
 import type { TaskBoardSnapshot } from "../types";
@@ -259,6 +260,73 @@ describe("continuous-tasks command", () => {
       "continuous-tasks:supervisor",
       expect.objectContaining({ goal: "Verify alias compatibility", status: "active" }),
     );
+  });
+
+  it.each(["task-supervisor", "continuous-tasks"])(
+    "offers a read-only list through %s while disabled",
+    async (command) => {
+      const mockAPI = createMockAPI();
+      registerCommands(mockAPI.api);
+      const ctx = createMockContext();
+      const snapshot = {
+        ...activeBoard(),
+        workflowStatus: "paused" as const,
+        pauseReason: "User hold",
+      };
+      setBoard(snapshot);
+      setSessionScopeEnabled(false);
+      vi.mocked(ctx.ui.select).mockImplementation(async (_title, options) => options[0]);
+
+      await commandHandler(mockAPI, command)("tasks", ctx);
+
+      expect(ctx.ui.select).toHaveBeenCalledOnce();
+      expect(ctx.ui.notify).toHaveBeenCalledWith(
+        expect.stringContaining("Paused: User hold"),
+        "info",
+      );
+      expect(getBoard()).toEqual(snapshot);
+      expect(isSessionScopeEnabled()).toBe(false);
+      expect(supervisorState()).toBeUndefined();
+      expect(mockAPI.appendEntry).not.toHaveBeenCalled();
+      expect(mockAPI.setActiveTools).not.toHaveBeenCalled();
+      expect(mockAPI.sendMessage).not.toHaveBeenCalled();
+      expect(mockAPI.sendUserMessage).not.toHaveBeenCalled();
+      expect(ctx.waitForIdle).not.toHaveBeenCalled();
+      expect(ctx.abort).not.toHaveBeenCalled();
+    },
+  );
+
+  it("keeps journal-faulted tasks inspectable without granting recovery", async () => {
+    const mockAPI = createMockAPI();
+    registerCommands(mockAPI.api);
+    const ctx = createMockContext();
+    setBoard(activeBoard());
+    currentRuntime().journalFault = "Invalid supervisor journal";
+    setSessionScopeEnabled(false);
+    vi.mocked(ctx.ui.select).mockImplementation(async (_title, options) => options[0]);
+
+    await commandHandler(mockAPI, "task-supervisor")("tasks", ctx);
+
+    expect(ctx.ui.notify).toHaveBeenCalledWith(
+      expect.stringContaining("Fault: Invalid supervisor journal"),
+      "info",
+    );
+    expect(currentRuntime().journalFault).toBe("Invalid supervisor journal");
+    expect(isSessionScopeEnabled()).toBe(false);
+    expect(mockAPI.appendEntry).not.toHaveBeenCalled();
+    expect(mockAPI.sendMessage).not.toHaveBeenCalled();
+  });
+
+  it("does nothing for headless task inspection", async () => {
+    const mockAPI = createMockAPI();
+    registerCommands(mockAPI.api);
+    const ctx = createMockContext();
+    Object.assign(ctx, { hasUI: false });
+    await commandHandler(mockAPI)("tasks", ctx);
+    expect(ctx.ui.select).not.toHaveBeenCalled();
+    expect(ctx.ui.notify).not.toHaveBeenCalled();
+    expect(mockAPI.appendEntry).not.toHaveBeenCalled();
+    expect(mockAPI.sendMessage).not.toHaveBeenCalled();
   });
 
   it("reports status without starting a model turn", async () => {

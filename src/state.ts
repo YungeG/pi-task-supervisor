@@ -9,6 +9,7 @@ import {
   isValidSnapshotV2,
 } from "./validation";
 import { phaseLabel } from "./formatting";
+import { updateTaskWidget } from "./board-ui";
 
 import { currentRuntime } from "./runtime";
 
@@ -94,9 +95,10 @@ export function persistEntries(
 
 // ── UI Sync ──
 
-/** Updates the status bar to reflect current board state. */
+/** Updates the persistent task widget and existing status bar. */
 export function updateUI(ctx: ExtensionContext, snapshot: Readonly<TaskBoardSnapshot>): void {
   if (!ctx.hasUI) return;
+  updateTaskWidget(ctx, snapshot);
 
   if (snapshot.tasks.length === 0) {
     ctx.ui.setStatus("til-done", undefined);

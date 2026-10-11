@@ -25,11 +25,13 @@ export function createMockContext(
 ): ExtensionToolContext & ExtensionCommandContext {
   return {
     hasUI: true,
+    mode: "tui",
     waitForIdle: vi.fn(async () => undefined),
     abort: vi.fn(),
     ui: {
       setStatus: vi.fn(),
       setWidget: vi.fn(),
+      select: vi.fn(async () => undefined),
       notify: vi.fn(),
     },
     sessionManager: {

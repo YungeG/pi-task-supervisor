@@ -1,4 +1,5 @@
 import { vi } from "vitest";
+import type * as PiTUI from "@earendil-works/pi-tui";
 
 /** Mock Text class for testing */
 class MockText {
@@ -20,7 +21,8 @@ class MockText {
   }
 }
 
-// Mock the Text class globally
-vi.mock("@earendil-works/pi-tui", () => ({
+// Mock Text only; exercise real terminal-width and control-sequence utilities.
+vi.mock("@earendil-works/pi-tui", async (importOriginal) => ({
+  ...(await importOriginal<typeof PiTUI>()),
   Text: MockText,
 }));

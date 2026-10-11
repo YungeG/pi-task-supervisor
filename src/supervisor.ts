@@ -8,7 +8,7 @@ import type {
 import { Type, type Static } from "typebox";
 import { Check } from "typebox/value";
 import { currentRuntime } from "./runtime";
-import { getBoardRef } from "./state";
+import { getBoardRef, updateUI } from "./state";
 import { TASK_TOOL_NAMES } from "./scope";
 import type { CompletionEvidence, TaskBoardSnapshot } from "./types";
 import { completionEvidenceError, isSafeBoundedText } from "./validation";
@@ -114,6 +114,7 @@ export function saveSupervisor(pi: ExtensionAPI): void {
 }
 
 function updateSupervisorUI(ctx: ExtensionContext): void {
+  updateUI(ctx, getBoardRef());
   const state = supervisorState();
   if (ctx.hasUI)
     ctx.ui.setStatus(
@@ -516,6 +517,7 @@ function prepareReview(
   state.status = "reviewing";
   state.reviews++;
   saveSupervisor(pi);
+  updateUI(ctx, board);
   if (ctx.hasUI)
     ctx.ui.setStatus("continuous-supervisor", `Supervisor: checking ${state.reviews}/40`);
   return true;

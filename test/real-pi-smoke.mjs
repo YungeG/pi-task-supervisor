@@ -5,6 +5,7 @@ import { dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import { fauxAssistantMessage, fauxProvider, fauxToolCall } from "@earendil-works/pi-ai";
 import { Type } from "typebox";
+import { stripTerminalSequences, visibleWidth } from "@earendil-works/pi-tui";
 
 const compaction = process.argv.includes("--compaction");
 const nativeAbort = process.argv.includes("--native-abort");
@@ -298,7 +299,45 @@ try {
   }
   session = created.session;
   const extensionErrors = [];
-  await session.bindExtensions({ onError: (error) => extensionErrors.push(error) });
+  const widgetHistory = [];
+  let widgetLines = [];
+  let listOptions = [];
+  let taskDetails = "";
+  // Real SDK callbacks with a UI stub, not a real terminal or human visual certification.
+  const uiContext = {
+    setStatus() {},
+    notify(message) {
+      taskDetails = message;
+    },
+    async select(_title, options) {
+      listOptions = options;
+      return options[0];
+    },
+    setWidget(key, content, options) {
+      if (key !== "continuous-tasks:board") throw new Error(`Unexpected widget: ${key}`);
+      widgetLines = [];
+      if (content) {
+        if (typeof content !== "function" || options?.placement !== "aboveEditor")
+          throw new Error("Widget did not use the bounded above-editor component");
+        const component = content(undefined, undefined);
+        for (const width of [1, 35, 72]) {
+          const lines = component.render(width);
+          if (
+            lines.length > 8 ||
+            lines.some(
+              (line) => visibleWidth(line) > width || /\p{Cc}/u.test(stripTerminalSequences(line)),
+            )
+          )
+            throw new Error("Widget exceeded terminal width/row limits");
+        }
+        widgetLines = component.render(72).map(stripTerminalSequences);
+      }
+      widgetHistory.push([...widgetLines]);
+    },
+  };
+  const uiBindings = { mode: "tui", uiContext, onError: (error) => extensionErrors.push(error) };
+  await session.bindExtensions(uiBindings);
+  if (widgetLines.length) throw new Error("Fresh session had a stale task widget");
   if (session.extensionRunner.getActiveTools().includes("workflow_gate")) {
     throw new Error("A fresh session exposed task tools before user activation");
   }
@@ -362,6 +401,29 @@ try {
   }
   const snapshot = await waitForCompletion(sessionManager);
   await session.agent.waitForIdle();
+
+  if (
+    !widgetHistory.some((lines) => lines.some((line) => line.includes("[implementing]"))) ||
+    !widgetHistory.some((lines) => lines.some((line) => line.includes("[reviewing]"))) ||
+    !widgetLines.some((line) => line.includes("2/2 done · 0 unfinished")) ||
+    widgetLines.some((line) => line.includes("[done]"))
+  )
+    throw new Error("Widget missed lifecycle progress or failed to fold completed tasks");
+  if (
+    supervised &&
+    !widgetHistory.some((lines) => lines.some((line) => line.includes("Supervisor: reviewing")))
+  )
+    throw new Error("Widget did not update for a supervisor-only review transition");
+  const branchBeforeList = JSON.stringify(sessionManager.getBranch());
+  const startsBeforeList = agentStarts;
+  await enableCommand.handler("tasks", session.extensionRunner.createCommandContext());
+  if (
+    listOptions.length !== 2 ||
+    !taskDetails.includes("Evidence:") ||
+    JSON.stringify(sessionManager.getBranch()) !== branchBeforeList ||
+    agentStarts !== startsBeforeList
+  )
+    throw new Error("Full task list lost evidence, changed history, or started Main");
 
   const branch = sessionManager.getBranch();
   const userMessages = branch.filter(
@@ -429,6 +491,8 @@ try {
 
   const sessionFile = sessionManager.getSessionFile();
   if (!sessionFile) throw new Error("Persistent smoke session was not created");
+  await session.extensionRunner.emit({ type: "session_shutdown" });
+  if (widgetLines.length) throw new Error("Shutdown did not clear the task widget");
   session.dispose();
   const reopened = SessionManager.open(sessionFile);
   const resumedLoader = await loadExtension(settingsManager);
@@ -443,7 +507,9 @@ try {
     noTools: "builtin",
   });
   session = resumed.session;
-  await session.bindExtensions({ onError: (error) => extensionErrors.push(error) });
+  await session.bindExtensions(uiBindings);
+  if (!widgetLines.some((line) => line.includes("2/2 done · 0 unfinished")))
+    throw new Error("Resume did not restore the task widget from session data");
   if (!session.extensionRunner.getActiveTools().includes("workflow_gate")) {
     throw new Error("Resuming the session did not restore activated task tools");
   }
@@ -478,7 +544,9 @@ try {
     noTools: "builtin",
   });
   session = forked.session;
-  await session.bindExtensions({ onError: (error) => extensionErrors.push(error) });
+  await session.bindExtensions(uiBindings);
+  if (widgetLines.some((line) => line.includes("Supervisor:")))
+    throw new Error("Forked widget inherited the source supervisor");
   if (!session.extensionRunner.getActiveTools().includes("workflow_gate")) {
     throw new Error("Forking the session did not inherit activated task tools");
   }
@@ -506,7 +574,8 @@ try {
     noTools: "builtin",
   });
   session = independent.session;
-  await session.bindExtensions({ onError: (error) => extensionErrors.push(error) });
+  await session.bindExtensions(uiBindings);
+  if (widgetLines.length) throw new Error("Independent session inherited a task widget");
   if (session.extensionRunner.getActiveTools().includes("workflow_gate")) {
     throw new Error("An independent session inherited activation");
   }
@@ -533,6 +602,9 @@ try {
       hiddenContinuations: continuationMessages.length,
       activationEntries: activationEntries.length,
       primaryAndLegacyCommands: true,
+      boundedTaskWidgetLifecycle: true,
+      readOnlyFullTaskList: true,
+      uiStubNotRealTerminal: true,
       resumedActivation: true,
       resumedSupervisorAcceptance: supervised,
       forkSupervisorNotInherited: supervised,

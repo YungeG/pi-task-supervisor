@@ -6,6 +6,7 @@ import type {
 } from "@earendil-works/pi-coding-agent";
 import type { ContinuousTasksConfig } from "./config";
 import { currentRuntime } from "./runtime";
+import { TASK_WIDGET_KEY } from "./board-ui";
 import { loadConfig, resetConfig } from "./config";
 import { formatContinuePrompt, formatHiddenContext } from "./formatting";
 import {
@@ -242,6 +243,7 @@ function registerSessionHandlers(pi: ExtensionAPI, control: Control): void {
         "Invalid supervisor journal; inspect session state before recovery";
       setSessionScopeEnabled(false);
       updateActiveTools(pi, false);
+      updateUI(ctx, board);
       if (ctx.hasUI)
         ctx.ui.setStatus("continuous-supervisor", "Supervisor: fault (invalid journal)");
       pi.sendMessage(
@@ -265,7 +267,10 @@ function registerSessionHandlers(pi: ExtensionAPI, control: Control): void {
   pi.on("session_shutdown", (_event, ctx) => {
     control.cancel();
     setSessionScopeEnabled(false);
-    if (ctx.hasUI) ctx.ui.setStatus("continuous-supervisor", undefined);
+    if (ctx.hasUI) {
+      ctx.ui.setStatus("continuous-supervisor", undefined);
+      if (ctx.mode === "tui") ctx.ui.setWidget(TASK_WIDGET_KEY, undefined);
+    }
   });
   pi.on("session_before_compact", (_event, ctx) => {
     control.cancel();
@@ -277,12 +282,13 @@ function registerSessionHandlers(pi: ExtensionAPI, control: Control): void {
         "Context changed during supervisor review; stale advice discarded. Recover after compaction.",
       );
   });
-  pi.on("input", () => {
+  pi.on("input", (_event, ctx) => {
     control.cancel();
     const state = supervisorState();
     if (state?.status === "reviewing") {
       state.status = "active";
       saveSupervisor(pi);
+      updateUI(ctx, getBoardRef());
     }
   });
 }
