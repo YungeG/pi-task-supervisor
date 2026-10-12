@@ -4,6 +4,10 @@ import { getStatusCounts } from "./validation";
 
 // ── Plain-Text Formatting (for LLM tool output) ──
 
+const BATCH_GUIDANCE =
+  "Batch checkpoint: claim one ready batch when none is active. After verified completion, report results and the next step and finish this run normally before claiming another batch. " +
+  "This is guidance, not a host-enforced phase gate. Do not abort or mark unfinished tasks done to force a checkpoint; inspect existing execution references and do not launch duplicate writers.";
+
 /** Returns a phase label string including the title if available. */
 export function phaseLabel(board: TaskBoardSnapshot, phaseNum: number): string {
   const rec = board.phases.find((p) => p.phase === phaseNum);
@@ -95,7 +99,7 @@ export function formatClaimedTaskDetails(tasks: TaskRecord[]): string {
 
 /** Format the hidden context message for before_agent_start injection. */
 export function formatHiddenContext(board: TaskBoardSnapshot): string {
-  const lines: string[] = ["[CONTINUOUS TASKS ACTIVE]", ""];
+  const lines: string[] = ["[CONTINUOUS TASKS ACTIVE]", "", BATCH_GUIDANCE, ""];
 
   const activePhase = board.phases.find((p) => p.status === "active");
   lines.push(`Active Phase: ${activePhase ? phaseLabel(board, activePhase.phase) : "none"}`);
@@ -164,7 +168,10 @@ export function formatContinuePrompt(board: TaskBoardSnapshot): string {
   const active = board.tasks.filter((t) => t.status === "implementing" || t.status === "reviewing");
 
   if (ready.length > 0 || active.length > 0) {
-    const lines: string[] = ["Tasks remain. Continue working on the phased task board."];
+    const lines: string[] = [
+      "Tasks remain. Continue working on the phased task board.",
+      BATCH_GUIDANCE,
+    ];
     if (active.length > 0) {
       lines.push("");
       lines.push("Currently claimed:");

@@ -42,7 +42,7 @@ describe("extension instance isolation", () => {
     await a.command("pause separate maintenance");
     await b.command("status");
     expect(b.ctx.ui.notify).toHaveBeenLastCalledWith(
-      expect.stringContaining("supervisor active"),
+      expect.stringContaining("Supervisor: active"),
       "info",
     );
     expect(b.ctx.ui.notify).toHaveBeenLastCalledWith(expect.stringContaining("Goal B"), "info");
@@ -94,7 +94,7 @@ describe("extension instance isolation", () => {
     await Promise.resolve();
     await a.command("status");
     expect(a.ctx.ui.notify).toHaveBeenLastCalledWith(
-      expect.stringContaining("supervisor paused"),
+      expect.stringContaining("Supervisor: paused"),
       "info",
     );
   });

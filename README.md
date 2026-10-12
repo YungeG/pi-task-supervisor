@@ -4,7 +4,7 @@ Package and local directory: `pi-task-supervisor`. Primary human command: `/task
 
 Local Pi `1.1.0` extension for session-scoped phased work and evidence-driven supervision. It reuses one task board, preserves human approval gates, and continues authorized unfinished work without repeated `continue` prompts.
 
-This is a pinned local fork of [`@harms-haus/pi-tasks`](https://github.com/harms-haus/pi-tasks). See [`UPSTREAM.md`](./UPSTREAM.md) for provenance. This candidate has only been developed and tested locally; it is not a deployed supervisor replacement.
+This is a maintained fork of [`@harms-haus/pi-tasks`](https://github.com/harms-haus/pi-tasks). See [`UPSTREAM.md`](./UPSTREAM.md) for provenance. Install an explicit Git revision; isolated SDK/faux-provider validation is not certification of every live-model or business workflow.
 
 ## Human commands
 
@@ -25,8 +25,8 @@ This is a pinned local fork of [`@harms-haus/pi-tasks`](https://github.com/harms
 - `enable` activates task tools for this session without starting a supervisor.
 - `supervise` records a bounded, non-secret goal, pins the current session model, activates tools, and starts Main using a hidden custom message. An existing goal must be stopped before replacement. A paused/decision-gated board must be human-resolved first; already completed tasks cannot be reused as proof for a new goal.
 - `pause` cancels an advisor immediately and pauses Main/the board. `stop` also stops supervision and prevents silent fallback to board continuation.
-- `resume`/`resolve` change only the board gate. They do not reset supervisor holds, faults, or budgets. `recover` explicitly restarts a paused/faulted supervisor after the board gate is resolved; it does not grant approval or restart external writers. Faulted completed boards require stopping and re-planning, not recovery.
-- `status` reports board state, supervisor state, review/resume counts, and recorded usage.
+- `resume` jointly resumes a confirmed ordinary human pause of the board and supervisor without resetting counters, usage, epoch, or evidence. Legacy/unknown pauses and stronger holds resume only the board and explicitly require inspection plus `recover`; no automatic Main turn is started. Decisions, pending host work, wrong sessions, and inconsistent state do not gain joint recovery. `resolve` changes only the exact decision gate. `recover` retains its explicit counter-reset semantics and never grants other approvals or restarts external writers. Faulted completed boards require stopping and re-planning.
+- `status` is read-only even while disabled or journal-faulted. It reports the goal, host activity, claimed batch, soft check point, all available gate information, advisor-only usage/limits, unknown external run status, and the next valid human action.
 - `tasks` opens a scrollable full list, including completed/abandoned tasks; select a task to inspect its details and retained evidence. This read-only view works even when task tools are disabled or the supervisor journal is faulted, and never activates supervision or schedules work.
 
 Activation is a durable session entry. Resuming restores it; independent sessions remain disabled. Forks inherit the board/activation but **not the source session's supervisor**. Any unfinished supervisor restored after restart/tree navigation becomes an interrupted fault requiring inspection and explicit recovery, never an active-but-idle badge.
@@ -47,11 +47,11 @@ In the interactive terminal, a persistent board appears above the editor. It use
 
 The widget uses Pi's active theme, a subtle left rail, aligned status/ID columns, and bold titles for implementing/reviewing tasks. Monochrome glyphs and labels keep status readable without color: `▶ doing` (implementing), `◇ review` (reviewing), `● ready`, `○ queued` (configured), and `· draft`. IDs are capped at 14 display columns; full IDs remain in the read-only list. Zero overflow/fold counts are omitted from the footer; overflow appears as `+N more`.
 
-The widget is capped at eight single terminal lines and prioritizes implementing/reviewing tasks, then ready and planned tasks. It shows unmet dependencies, later-phase gates, execution references, pending decisions, pause reasons, and supervisor holds/faults. Long lines are truncated to terminal width; the full list/details remain available through `/task-supervisor tasks` (also `/continuous-tasks tasks`). Completed and abandoned tasks are folded, never auto-deleted; abandoned tasks are counted separately from verified completion. Empty fresh sessions have no widget. RPC/print modes have no custom widget; RPC can use the native list command.
+The widget is capped at eight single terminal lines and prioritizes implementing/reviewing tasks, then ready and planned tasks. It shows unmet dependencies, later-phase gates, execution references (status unknown), pending decisions, pause reasons, supervisor holds/faults, and a compact next-action line. Long lines are truncated to terminal width; the full list/details remain available through `/task-supervisor tasks` (also `/continuous-tasks tasks`). Completed and abandoned tasks are folded, never auto-deleted; abandoned tasks are counted separately from verified completion. Empty fresh sessions have no widget. RPC/print modes have no custom widget; RPC can use the native list command.
 
 ## Closed loop and evidence
 
-1. Main prepares a phased board, implements work, and enters review.
+1. Main prepares a phased board, claims one ready batch, implements work, and enters review. The execution guidance asks it to finish the run normally after verifying that batch, before claiming another; this is not a host-enforced phase gate.
 2. Actual host `tool_result` events create bounded evidence receipts (`tool:<call-id>`).
 3. When Main stops, Pi's actionable `agent_before_settle` boundary runs after automatic compaction, retries, and queued work drain. The read-only advisor examines the durable goal, board, host receipts, and recent transcript.
 4. Valid guidance is returned as a hidden typed boundary entry, and Pi resumes Main automatically. Guidance is **not user approval**. `agent_settled` is notification-only and reconciles native aborts; it never schedules work.
@@ -109,6 +109,10 @@ npm ci --ignore-scripts
 npm run check
 ```
 
-`check` runs type checking, lint, format checks, coverage (unchanged 90% branch gate), and isolated real-Pi **faux-provider** smokes: board-only, supervised, automatic compaction, paused in-flight review plus compaction, and native boundary abort/recovery. Smokes use temporary agent directories, no builtin executor tools or live inference, and verify real settings remain unchanged.
+`check` runs type checking, lint, format checks, coverage (unchanged 90% branch gate), and six isolated real-Pi **faux-provider** smokes: board-only, supervised, automatic compaction, paused in-flight review plus compaction, native boundary abort/recovery, and ordinary pause/single-command resume with retained counters. SDK hosts must bind real command-context actions, including `waitForIdle`; a still-busy host after that callback is rejected rather than treated as settled. Smokes use temporary agent directories, no builtin executor tools or live inference, and verify real settings remain unchanged.
 
 Compatibility evidence and limitations: [`CANARY.md`](./CANARY.md). Original workspace design: [`../docs/continuous-tasks-extension-design.md`](../docs/continuous-tasks-extension-design.md) (outside this standalone repository; not included in a Git checkout or package).
+
+## Flow optimization proposal
+
+[Supervisor flow optimization](./docs/supervisor-flow-optimization.md) records the local first-stage implementation and the deferred external-workflow proposals. The [implementation contract](./docs/supervisor-flow-implementation-packet.md) freezes the authority, recovery semantics, persistence failure handling, and validation scope. Publication and installation require explicit authorization and a pinned revision; the earlier document review is not an implementation review.

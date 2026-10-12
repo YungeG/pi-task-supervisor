@@ -9,6 +9,7 @@ export function createRuntime() {
     board: createEmptyBoard(),
     enabled: false,
     cancel: (): void => undefined,
+    manualPauseDepth: 0,
     supervisor: undefined as SupervisorState | undefined,
     journalFault: undefined as string | undefined,
   };

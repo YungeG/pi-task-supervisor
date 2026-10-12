@@ -9,7 +9,9 @@ import { stripTerminalSequences, visibleWidth } from "@earendil-works/pi-tui";
 
 const compaction = process.argv.includes("--compaction");
 const nativeAbort = process.argv.includes("--native-abort");
-const interruptCompaction = process.argv.includes("--interrupt-compaction") || nativeAbort;
+const ordinaryPause = process.argv.includes("--ordinary-pause");
+const interruptCompaction =
+  process.argv.includes("--interrupt-compaction") || nativeAbort || ordinaryPause;
 const supervised = process.argv.includes("--supervised") || compaction || interruptCompaction;
 let interruptedReviewStarted = false;
 let releaseInterruptedReview;
@@ -354,7 +356,12 @@ try {
       widgetHistory.push([...widgetLines]);
     },
   };
-  const uiBindings = { mode: "tui", uiContext, onError: (error) => extensionErrors.push(error) };
+  const uiBindings = {
+    mode: "tui",
+    uiContext,
+    onError: (error) => extensionErrors.push(error),
+    commandContextActions: { waitForIdle: () => session.waitForIdle() },
+  };
   await session.bindExtensions(uiBindings);
   if (widgetLines.length) throw new Error("Fresh session had a stale task widget");
   if (session.extensionRunner.getActiveTools().includes("workflow_gate")) {
@@ -404,8 +411,30 @@ try {
         "pause compaction maintenance",
         session.extensionRunner.createCommandContext(),
       );
-      await session.compact();
+      if (ordinaryPause) await session.waitForIdle();
+      else await session.compact();
     }
+    if (!nativeAbort && latestSupervisor(sessionManager)?.holdCause !== "user_pause")
+      throw new Error(
+        `Explicit ordinary pause lost its host-correlated origin: ${JSON.stringify(
+          sessionManager
+            .getBranch()
+            .filter(
+              (entry) =>
+                entry.type === "custom" &&
+                ["continuous-tasks:supervisor", "continuous-tasks:event"].includes(
+                  entry.customType,
+                ),
+            )
+            .slice(-8)
+            .map((entry) => ({
+              type: entry.customType,
+              status: entry.data.status,
+              cause: entry.data.holdCause ?? entry.data.cause,
+              reason: entry.data.reason,
+            })),
+        )}`,
+      );
     if (latestSupervisor(sessionManager)?.status !== "paused")
       throw new Error("Interrupted advisor was not visibly paused");
     releaseInterruptedReview();
@@ -416,7 +445,8 @@ try {
     )
       throw new Error("Stale advisor restarted Main after compaction");
     await enableCommand.handler("resume", session.extensionRunner.createCommandContext());
-    await legacyCommand.handler("recover", session.extensionRunner.createCommandContext());
+    if (nativeAbort)
+      await legacyCommand.handler("recover", session.extensionRunner.createCommandContext());
   }
   const snapshot = await waitForCompletion(sessionManager);
   await session.agent.waitForIdle();
@@ -459,7 +489,7 @@ try {
     throw new Error(`Extension errors: ${JSON.stringify(extensionErrors)}`);
   if (agentStarts !== (compaction ? 3 : 2))
     throw new Error(`Unexpected agent run count: ${agentStarts}`);
-  if (completedCompactions !== (compaction || interruptCompaction ? 1 : 0))
+  if (completedCompactions !== ((compaction || interruptCompaction) && !ordinaryPause ? 1 : 0))
     throw new Error("Unexpected automatic compaction count");
   if (faux.getPendingResponseCount() !== 0) throw new Error("Faux responses were not exhausted");
   if (userMessages.length !== (supervised ? 0 : 1))
@@ -500,7 +530,7 @@ try {
     const state = latestSupervisor(sessionManager);
     if (
       state?.status !== "completed" ||
-      state.reviews !== (compaction ? 3 : interruptCompaction ? 1 : 2) ||
+      state.reviews !== (compaction ? 3 : nativeAbort ? 1 : 2) ||
       state.continuations !== (compaction ? 2 : interruptCompaction ? 0 : 1) ||
       state.receipts.length !== 2 ||
       state.bindings.length !== 2
@@ -602,15 +632,17 @@ try {
   console.log(
     JSON.stringify({
       result: "PASS",
-      mode: nativeAbort
-        ? "supervised-native-abort"
-        : interruptCompaction
-          ? "supervised-interrupted-compaction"
-          : compaction
-            ? "supervised-compaction"
-            : supervised
-              ? "supervised"
-              : "board-only",
+      mode: ordinaryPause
+        ? "supervised-ordinary-pause"
+        : nativeAbort
+          ? "supervised-native-abort"
+          : interruptCompaction
+            ? "supervised-interrupted-compaction"
+            : compaction
+              ? "supervised-compaction"
+              : supervised
+                ? "supervised"
+                : "board-only",
       completedCompactions,
       supervisorAccepted: supervised,
       sessionId: sessionManager.getSessionId(),

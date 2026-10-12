@@ -35,6 +35,7 @@ export function resetState(): void {
   currentRuntime().board = createEmptyBoard();
   currentRuntime().supervisor = undefined;
   currentRuntime().journalFault = undefined;
+  currentRuntime().manualPauseDepth = 0;
 }
 
 // ── State Reconstruction ──

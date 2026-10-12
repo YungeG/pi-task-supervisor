@@ -1,5 +1,12 @@
 import type { ExtensionAPI, ExtensionCommandContext } from "@earendil-works/pi-coding-agent";
 import { formatContinuePrompt, formatSummaryLine } from "./formatting";
+import {
+  flowFacts,
+  formatFlowStatus,
+  ordinaryResumeIssue,
+  resumeControlIssue,
+  SUPERVISOR_LIMITS,
+} from "./flow";
 import { currentRuntime } from "./runtime";
 import { showTaskList } from "./board-ui";
 import {
@@ -9,6 +16,7 @@ import {
   startSupervisor,
   supervisorNotice,
   supervisorState,
+  SUPERVISOR_ENTRY,
 } from "./supervisor";
 import { enableSessionScope, isSessionScopeEnabled } from "./scope";
 import { getBoardRef, persistEntries, setBoard, updateUI } from "./state";
@@ -41,7 +49,8 @@ function continueNow(pi: ExtensionAPI): void {
 function pause(pi: ExtensionAPI, ctx: ExtensionCommandContext, reason: string): void {
   const board = getBoardRef();
   if (board.workflowStatus !== "active") {
-    if (supervisorState()) holdSupervisor(pi, ctx, "paused", reason || "Paused by user");
+    if (supervisorState())
+      holdSupervisor(pi, ctx, "paused", reason || "Paused by user", "user_pause");
     else notifyError(ctx, "Pi Task Supervisor is not active");
     return;
   }
@@ -52,7 +61,7 @@ function pause(pi: ExtensionAPI, ctx: ExtensionCommandContext, reason: string): 
   persistEntries(pi, { type: "pause_user", reason: updated.pauseReason }, updated);
   setBoard(updated);
   updateUI(ctx, updated);
-  holdSupervisor(pi, ctx, "paused", updated.pauseReason);
+  holdSupervisor(pi, ctx, "paused", updated.pauseReason, "user_pause");
 }
 
 function resume(pi: ExtensionAPI, ctx: ExtensionCommandContext): void {
@@ -61,15 +70,57 @@ function resume(pi: ExtensionAPI, ctx: ExtensionCommandContext): void {
     notifyError(ctx, "Pi Task Supervisor is not paused");
     return;
   }
+  const facts = flowFacts(ctx);
+  const state = supervisorState();
+  const controlIssue = resumeControlIssue(board, state, facts);
+  if (controlIssue) {
+    notifyError(ctx, controlIssue);
+    return;
+  }
+  const next =
+    state && !ordinaryResumeIssue(board, state, facts)
+      ? {
+          ...structuredClone(state),
+          status: "active" as const,
+          reason: undefined,
+          holdCause: undefined,
+          pending: false,
+        }
+      : undefined;
   const updated = cloneBoard(board);
   updated.workflowStatus = "active";
   updated.pauseReason = undefined;
   updated.generation++;
   updated.stagnantSettles = 0;
-  persistEntries(pi, { type: "resume_user" }, updated);
-  setBoard(updated);
-  updateUI(ctx, updated);
-  continueNow(pi);
+  currentRuntime().cancel();
+  try {
+    // Write Supervisor first: a partial durable restore is interrupted/faulted, never replayed.
+    if (next) pi.appendEntry(SUPERVISOR_ENTRY, next);
+    persistEntries(pi, { type: "resume_user", supervisorResumed: Boolean(next) }, updated);
+    if (next) currentRuntime().supervisor = next;
+    setBoard(updated);
+    updateUI(ctx, updated);
+    if (state && !next) {
+      ctx.ui.notify(
+        `Task board resumed only; Supervisor remains ${state.status}. ${
+          state.status === "stopped" || board.tasks.length > SUPERVISOR_LIMITS.tasks
+            ? "Stop/re-plan a valid goal; no automatic continuation."
+            : "Inspect existing work, then /task-supervisor recover (resets review/continuation limits)."
+        }`,
+        "info",
+      );
+      return;
+    }
+    continueNow(pi);
+  } catch {
+    currentRuntime().supervisor = state;
+    setBoard(cloneBoard(board));
+    const message =
+      "Resume persistence/dispatch failed; inspect journal and pending work before recovery";
+    currentRuntime().journalFault = message;
+    updateUI(ctx, board);
+    notifyError(ctx, message);
+  }
 }
 
 function resolveDecision(
@@ -104,14 +155,11 @@ function resolveDecision(
 
 function status(ctx: ExtensionCommandContext): void {
   const board = getBoardRef();
-  const decision = board.decision ? `; decision ${board.decision.id}` : "";
-  const pauseReason = board.pauseReason ? `; ${board.pauseReason}` : "";
-  const state = supervisorState();
-  const supervisor = state
-    ? `; supervisor ${state.status}; reviews ${state.reviews}/40; resumes ${state.continuations}/20; tokens ${state.tokens}; cost ${state.cost}; ${state.reason ?? state.goal}`
-    : "";
   ctx.ui.notify(
-    `${formatSummaryLine(board)}; ${board.workflowStatus}; generation ${board.generation}; stagnant ${board.stagnantSettles}${decision}${pauseReason}${supervisor}`,
+    [
+      `${formatSummaryLine(board)}; ${board.workflowStatus}; generation ${board.generation}; stagnant ${board.stagnantSettles}`,
+      ...formatFlowStatus(board, supervisorState(), flowFacts(ctx)),
+    ].join("\n"),
     "info",
   );
 }
@@ -129,10 +177,20 @@ async function supervisorCommand(
     continueNow(pi);
     return true;
   }
+  if (action === "pause" && !isSessionScopeEnabled()) return false;
   if (["pause", "stop", "recover"].includes(action)) {
-    currentRuntime().cancel();
-    if (!ctx.isIdle()) ctx.abort();
-    await ctx.waitForIdle();
+    const runtime = currentRuntime();
+    const manual = action === "pause";
+    if (manual) runtime.manualPauseDepth++;
+    try {
+      runtime.cancel();
+      if (!ctx.isIdle()) ctx.abort();
+      await ctx.waitForIdle();
+      if (!ctx.isIdle())
+        throw new Error("Host has not settled; inspect command-context bindings before control");
+    } finally {
+      if (manual) runtime.manualPauseDepth--;
+    }
   }
   if (action === "stop") {
     const state = supervisorState();
@@ -168,6 +226,10 @@ export function registerCommands(pi: ExtensionAPI): void {
           await showTaskList(ctx, getBoardRef());
           return;
         }
+        if (action === "status") {
+          status(ctx);
+          return;
+        }
         if (currentRuntime().journalFault) throw new Error(currentRuntime().journalFault);
         if (
           await supervisorCommand(pi, ctx, action, [id, ...answerParts].filter(Boolean).join(" "))
@@ -184,10 +246,6 @@ export function registerCommands(pi: ExtensionAPI): void {
         }
         if (!isSessionScopeEnabled()) {
           notifyError(ctx, "Pi Task Supervisor is disabled; run /task-supervisor enable");
-          return;
-        }
-        if (action === "status") {
-          status(ctx);
           return;
         }
         if (action === "pause") {

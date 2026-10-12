@@ -85,10 +85,8 @@ describe("supervisor stopping and recovery policy", () => {
     );
     expect(h.mock.sendMessage).not.toHaveBeenCalled();
     await h.command("resume");
-    expect(supervisorState()?.status).toBe("paused");
-    expect(h.mock.sendMessage).not.toHaveBeenCalled();
-    await h.command("recover");
     expect(supervisorState()?.status).toBe("active");
+    expect(h.mock.sendMessage).toHaveBeenCalledOnce();
     expect(h.mock.sendMessage).toHaveBeenCalledWith(
       expect.objectContaining({ customType: "continuous-tasks:continue" }),
       { triggerTurn: true, deliverAs: "followUp" },
@@ -217,6 +215,8 @@ describe("supervisor stopping and recovery policy", () => {
     const h = lifecycle();
     await h.command("supervise Complete approved work");
     await h.command("pause inspect legacy plan");
+    // Legacy paused checkpoints have no proven pause origin.
+    supervisorState()!.holdCause = undefined;
     await h.command("resume");
     const board = activeBoard();
     setBoard(

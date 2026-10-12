@@ -29,6 +29,7 @@ import {
   supervisorPlanError,
   supervisorState,
   type Advisor,
+  type SupervisorHoldCause,
 } from "./supervisor";
 
 type ConfigLoader = () => Promise<ContinuousTasksConfig>;
@@ -40,14 +41,19 @@ type Control = {
   ) => Promise<BoundaryResult | undefined>;
 };
 
-function pauseBoard(pi: ExtensionAPI, ctx: ExtensionContext, reason: string): void {
+function pauseBoard(
+  pi: ExtensionAPI,
+  ctx: ExtensionContext,
+  reason: string,
+  cause: SupervisorHoldCause = "unknown",
+): void {
   const board = getBoardRef();
   if (board.workflowStatus === "active") {
     const updated = cloneBoard(board);
     updated.workflowStatus = "paused";
     updated.pauseReason = reason;
     updated.generation++;
-    persistEntries(pi, { type: "pause_controller", reason }, updated);
+    persistEntries(pi, { type: "pause_controller", reason, cause }, updated);
     setBoard(updated);
     updateUI(ctx, updated);
     pi.sendMessage(
@@ -59,7 +65,7 @@ function pauseBoard(pi: ExtensionAPI, ctx: ExtensionContext, reason: string): vo
       { triggerTurn: false },
     );
   }
-  holdSupervisor(pi, ctx, "paused", reason);
+  holdSupervisor(pi, ctx, "paused", reason, cause);
 }
 
 function continuation(prompt: string): BoundaryResult {
@@ -134,6 +140,11 @@ function boundaryAllowed(
       event.outcome === "aborted"
         ? "The user aborted the last run"
         : "The last run still failed after Pi retries",
+      event.outcome === "aborted"
+        ? currentRuntime().manualPauseDepth > 0
+          ? "user_pause"
+          : "run_aborted"
+        : "run_failed",
     );
     return false;
   }
@@ -188,6 +199,7 @@ function makeController(pi: ExtensionAPI, configLoader: ConfigLoader, advisor?: 
         pi,
         ctx,
         `No task-board progress across ${config.maxStagnantSettles} automatic continuations`,
+        "stagnant",
       );
       return undefined;
     }
@@ -216,7 +228,7 @@ function makeController(pi: ExtensionAPI, configLoader: ConfigLoader, advisor?: 
       if (ticket === serial) {
         const reason = redact(error instanceof Error ? error.message : "Continuation failed");
         if (supervisorState() && supervisorState()?.status !== "stopped")
-          holdSupervisor(pi, ctx, "fault", reason);
+          holdSupervisor(pi, ctx, "fault", reason, "review_failed");
         else pauseBoard(pi, ctx, reason);
       }
       return undefined;
@@ -280,6 +292,7 @@ function registerSessionHandlers(pi: ExtensionAPI, control: Control): void {
         ctx,
         "fault",
         "Context changed during supervisor review; stale advice discarded. Recover after compaction.",
+        "review_failed",
       );
   });
   pi.on("input", (_event, ctx) => {
@@ -376,13 +389,19 @@ function registerWorkHandlers(pi: ExtensionAPI, control: Control): void {
     if (!isSessionScopeEnabled()) return;
     if (event.aborted) {
       control.cancel();
-      pauseBoard(pi, ctx, "The user aborted the last run; inspect before resuming");
+      pauseBoard(
+        pi,
+        ctx,
+        "The user aborted the last run; inspect before resuming",
+        currentRuntime().manualPauseDepth > 0 ? "user_pause" : "run_aborted",
+      );
     } else if (["active", "reviewing"].includes(supervisorState()?.status ?? "")) {
       holdSupervisor(
         pi,
         ctx,
         "fault",
         "Pi settled with an unfinished goal; inspect the blocked continuation before explicit recovery",
+        "interrupted",
       );
     }
   });
@@ -415,6 +434,7 @@ function registerWorkHandlers(pi: ExtensionAPI, control: Control): void {
         ctx,
         "fault",
         error instanceof Error ? error.message : "Evidence capture failed",
+        "review_failed",
       );
     }
     return undefined;

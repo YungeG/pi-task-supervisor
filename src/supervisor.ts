@@ -12,9 +12,10 @@ import { getBoardRef, updateUI } from "./state";
 import { TASK_TOOL_NAMES } from "./scope";
 import type { CompletionEvidence, TaskBoardSnapshot } from "./types";
 import { completionEvidenceError, isSafeBoundedText } from "./validation";
+import { SUPERVISOR_LIMITS } from "./flow";
 
 export const SUPERVISOR_ENTRY = "continuous-tasks:supervisor";
-const MAX_SUPERVISED_TASKS = 100;
+const MAX_SUPERVISED_TASKS = SUPERVISOR_LIMITS.tasks;
 
 export function supervisorPlanError(taskCount: number): string | undefined {
   return taskCount > MAX_SUPERVISED_TASKS
@@ -53,6 +54,20 @@ const SupervisorSchema = Type.Object({
   lastProgress: Type.Optional(text(64)),
   pending: Type.Boolean(),
   reason: Type.Optional(text(2000)),
+  holdCause: Type.Optional(
+    StringEnum([
+      "user_pause",
+      "run_aborted",
+      "run_failed",
+      "advisor_hold",
+      "review_failed",
+      "budget_exhausted",
+      "stagnant",
+      "interrupted",
+      "acceptance_invalid",
+      "unknown",
+    ] as const),
+  ),
   acceptedDigest: Type.Optional(text(64)),
   receipts: Type.Array(ReceiptSchema, { maxItems: 500 }),
   bindings: Type.Array(BindingSchema, { maxItems: MAX_SUPERVISED_TASKS }),
@@ -60,6 +75,7 @@ const SupervisorSchema = Type.Object({
   cost: Type.Number({ minimum: 0 }),
 });
 export type SupervisorState = Static<typeof SupervisorSchema>;
+export type SupervisorHoldCause = NonNullable<SupervisorState["holdCause"]>;
 const AdviceSchema = Type.Object(
   {
     action: Type.Union([Type.Literal("guide"), Type.Literal("accept"), Type.Literal("hold")]),
@@ -140,11 +156,19 @@ export function holdSupervisor(
   ctx: ExtensionContext,
   status: "fault" | "paused",
   reason: string,
+  cause: SupervisorHoldCause = "unknown",
 ): void {
   const state = supervisorState();
   if (!state || state.status === "stopped") return;
-  state.status = status;
-  state.reason = redact(reason);
+  const retain =
+    state.status === "fault" ||
+    (state.status === "paused" && state.holdCause !== "user_pause" && status === "paused");
+  if (!retain) {
+    state.status = status;
+    state.reason = redact(reason);
+    state.holdCause = cause;
+  }
+  state.reason ??= redact(reason);
   state.pending = false;
   saveSupervisor(pi);
   supervisorNotice(pi, ctx, state.reason);
@@ -208,6 +232,7 @@ export function restoreSupervisor(pi: ExtensionAPI, ctx: ExtensionContext): void
       ctx,
       "fault",
       "Restored acceptance does not match its board/evidence; inspect and start a new goal",
+      "acceptance_invalid",
     );
   if (state && (["active", "reviewing"].includes(state.status) || state.pending)) {
     holdSupervisor(
@@ -215,6 +240,7 @@ export function restoreSupervisor(pi: ExtensionAPI, ctx: ExtensionContext): void
       ctx,
       "fault",
       "Interrupted review/continuation. Inspect existing work, then /task-supervisor recover; no automatic replay.",
+      "interrupted",
     );
   }
   updateSupervisorUI(ctx);
@@ -234,6 +260,7 @@ export function recoverSupervisor(pi: ExtensionAPI): void {
   if (planError) throw new Error(planError);
   state.status = "active";
   state.reason = undefined;
+  state.holdCause = undefined;
   state.reviews = 0;
   state.continuations = 0;
   state.stagnant = 0;
@@ -491,12 +518,16 @@ function prepareReview(
   board: Readonly<TaskBoardSnapshot>,
   state: SupervisorState,
 ): boolean {
-  if (state.reviews >= 40 || state.continuations >= 20) {
+  if (
+    state.reviews >= SUPERVISOR_LIMITS.reviews ||
+    state.continuations >= SUPERVISOR_LIMITS.continuations
+  ) {
     holdSupervisor(
       pi,
       ctx,
       "paused",
       "Supervisor call/resume budget exhausted; explicit recovery is required",
+      "budget_exhausted",
     );
     return false;
   }
@@ -505,12 +536,13 @@ function prepareReview(
   else if (state.lastProgress !== progress) state.stagnant = 0;
   state.pending = false;
   state.lastProgress = progress;
-  if (state.stagnant >= 3) {
+  if (state.stagnant >= SUPERVISOR_LIMITS.stagnant) {
     holdSupervisor(
       pi,
       ctx,
       "paused",
       "No task progress across three continuations; inspect the loop before recovery",
+      "stagnant",
     );
     return false;
   }
@@ -556,7 +588,7 @@ function applyAdvice(
   recordUsage(state, result.usage);
   state.status = "active";
   if (result.advice.action === "hold") {
-    holdSupervisor(pi, ctx, "paused", result.advice.message);
+    holdSupervisor(pi, ctx, "paused", result.advice.message, "advisor_hold");
     return undefined;
   }
   if (result.advice.action === "accept") {

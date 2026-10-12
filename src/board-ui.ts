@@ -1,7 +1,9 @@
 import type { ExtensionContext, Theme, ThemeColor } from "@earendil-works/pi-coding-agent";
 import { stripTerminalSequences, truncateToWidth, visibleWidth } from "@earendil-works/pi-tui";
 import { phaseLabel } from "./formatting";
+import { flowFacts, nextFlowStep } from "./flow";
 import { currentRuntime } from "./runtime";
+import type { SupervisorState } from "./supervisor";
 import {
   TERMINAL_STATUSES,
   type TaskBoardSnapshot,
@@ -32,6 +34,15 @@ const STATUS_STYLE = {
   abandoned: { icon: "×", label: "dropped", color: "dim" },
 } satisfies Record<TaskStatus, { icon: string; label: string; color: ThemeColor }>;
 
+const SUPERVISOR_COLORS = {
+  active: "accent",
+  reviewing: "accent",
+  completed: "success",
+  fault: "error",
+  paused: "warning",
+  stopped: "warning",
+} satisfies Record<SupervisorState["status"], ThemeColor>;
+
 /** Display-only normalization: never change the task or its evidence. */
 function text(value: string): string {
   return stripTerminalSequences(value)
@@ -59,7 +70,7 @@ function taskNotes(board: Readonly<TaskBoardSnapshot>, task: TaskRecord): string
   )
     notes.push(`waiting for phase ${task.phase}`);
   if (task.executionRef)
-    notes.push(`run ${task.executionRef.source}:${text(task.executionRef.runId)}`);
+    notes.push(`run ${task.executionRef.source}:${text(task.executionRef.runId)}; status unknown`);
   return notes;
 }
 
@@ -68,7 +79,10 @@ function taskRow(board: Readonly<TaskBoardSnapshot>, task: TaskRecord): string {
   return `[${task.status}] ${text(task.id)} ${text(task.title)}${notes.length ? ` — ${notes.join("; ")}` : ""}`;
 }
 
-function boardHeader(board: Readonly<TaskBoardSnapshot>): { text: string; color: ThemeColor }[] {
+function boardHeader(
+  board: Readonly<TaskBoardSnapshot>,
+  ctx: ExtensionContext,
+): { text: string; color: ThemeColor }[] {
   const done = board.tasks.filter((task) => task.status === "done").length;
   const abandoned = board.tasks.filter((task) => task.status === "abandoned").length;
   const unfinished = board.tasks.length - done - abandoned;
@@ -85,15 +99,16 @@ function boardHeader(board: Readonly<TaskBoardSnapshot>): { text: string; color:
   ];
   const { supervisor, journalFault } = currentRuntime();
   if (supervisor) {
-    let color: ThemeColor = "warning";
-    if (supervisor.status === "fault") color = "error";
-    else if (supervisor.status === "completed") color = "success";
-    else if (supervisor.status === "active" || supervisor.status === "reviewing") color = "accent";
     lines.push({
       text: `Supervisor: ${supervisor.status}${supervisor.reason ? ` — ${text(supervisor.reason)}` : ""}`,
-      color,
+      color: SUPERVISOR_COLORS[supervisor.status],
     });
   }
+  if (supervisor || journalFault)
+    lines.push({
+      text: `Next: ${text(nextFlowStep(board, supervisor, flowFacts(ctx)))}`,
+      color: "muted",
+    });
   if (journalFault) lines.push({ text: `Fault: ${text(journalFault)}`, color: "error" });
   if (board.workflowStatus === "paused")
     lines.push({
@@ -117,7 +132,7 @@ export function updateTaskWidget(ctx: ExtensionContext, board: Readonly<TaskBoar
     return;
   }
   const unfinished = orderedTasks(board).filter((task) => !TERMINAL_STATUSES.has(task.status));
-  const header = boardHeader(board);
+  const header = boardHeader(board, ctx);
   const visible = unfinished.slice(0, MAX_WIDGET_LINES - header.length - 1);
   const idWidth = Math.min(14, Math.max(4, ...visible.map((task) => visibleWidth(text(task.id)))));
   // Capture data here: Pi can render later, outside this session's AsyncLocalStorage scope.
@@ -171,7 +186,7 @@ export async function showTaskList(
 ): Promise<void> {
   if (!ctx.hasUI) return;
   const board = structuredClone(snapshot);
-  const header = boardHeader(board).map((line) => line.text);
+  const header = boardHeader(board, ctx).map((line) => line.text);
   if (!board.tasks.length) {
     ctx.ui.notify([...header, "No tasks"].join("\n"), "info");
     return;

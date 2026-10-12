@@ -156,7 +156,7 @@ describe("continuous-tasks command", () => {
     const ctx = createMockContext() as ExtensionCommandContext;
     setSessionScopeEnabled(false);
 
-    await commandHandler(mockAPI)("status", ctx);
+    await commandHandler(mockAPI)("resume", ctx);
 
     expect(ctx.ui.notify).toHaveBeenCalledWith(
       "Pi Task Supervisor is disabled; run /task-supervisor enable",
@@ -249,7 +249,6 @@ describe("continuous-tasks command", () => {
     expect(getBoard().workflowStatus).toBe("paused");
 
     await primary("resume", ctx);
-    await legacy("recover", ctx);
     expect(getBoard().workflowStatus).toBe("active");
     expect(supervisorState()).toMatchObject({
       status: "active",
