@@ -1,6 +1,20 @@
 # Changelog
 
-## [Unreleased]
+## 0.1.0-beta.1
+
+First npm beta of Pi Task Supervisor, based on the maintained fork and Pi 1.1.0 validation.
+
+- Session-scoped task board, dependency/phase gates, human decisions, and read-only supervision at the native end-of-run check.
+- Host-observed completion evidence, final acceptance coverage, fault/restart protection, and bounded advisor budgets.
+- Ordinary human pause can resume the board and supervisor once without resetting counters, usage, epoch, or evidence; legacy and stronger holds retain explicit recovery.
+- Soft batch-checkpoint guidance, actionable read-only status, and an eight-line theme-aware unfinished-task widget with a complete task/evidence list.
+- Preserve `continuous-tasks:*` journal identifiers and the `/continuous-tasks` alias.
+- Validation: 558 tests, unchanged 90% branch-coverage gate, and six isolated SDK/faux-provider modes. Live-model adherence and business workflow behavior are not certified.
+- External execution waiting and automatic parallel scheduling remain deferred.
+
+The history below belongs to the upstream pi-tasks project and is retained for provenance; it does not describe the current supervisor implementation.
+
+## Upstream history: [Unreleased]
 
 ### Added
 

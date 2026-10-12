@@ -1,7 +1,19 @@
 {
   "name": "pi-task-supervisor",
-  "version": "0.1.0-local.0",
-  "private": true,
+  "version": "0.1.0-beta.1",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/YungeG/pi-task-supervisor.git"
+  },
+  "homepage": "https://github.com/YungeG/pi-task-supervisor#readme",
+  "bugs": {
+    "url": "https://github.com/YungeG/pi-task-supervisor/issues"
+  },
+  "publishConfig": {
+    "access": "public",
+    "tag": "beta",
+    "registry": "https://registry.npmjs.org/"
+  },
   "description": "Session-scoped phased execution with native supervisor continuation and host evidence gates",
   "keywords": [
     "pi-package"
@@ -37,10 +49,10 @@
     "lint:fix": "eslint --fix src/"
   },
   "peerDependencies": {
-    "@earendil-works/pi-ai": "1.1.0",
-    "@earendil-works/pi-coding-agent": "1.1.0",
-    "@earendil-works/pi-tui": "1.1.0",
-    "typebox": "1.3.7"
+    "@earendil-works/pi-ai": "*",
+    "@earendil-works/pi-coding-agent": "*",
+    "@earendil-works/pi-tui": "*",
+    "typebox": "*"
   },
   "devDependencies": {
     "@earendil-works/pi-ai": "1.1.0",

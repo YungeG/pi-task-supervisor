@@ -6,6 +6,16 @@ Local Pi `1.1.0` extension for session-scoped phased work and evidence-driven su
 
 This is a maintained fork of [`@harms-haus/pi-tasks`](https://github.com/harms-haus/pi-tasks). See [`UPSTREAM.md`](./UPSTREAM.md) for provenance. Install an explicit Git revision; isolated SDK/faux-provider validation is not certification of every live-model or business workflow.
 
+## Installation
+
+The first npm beta is `0.1.0-beta.1`, with the `beta` dist-tag rather than `latest`. Requires Pi 1.1.0 and Node.js 22 or newer; host peer ranges describe Pi-supplied modules, not a promise that older Pi releases support the native supervision lifecycle.
+
+```bash
+pi install npm:pi-task-supervisor@0.1.0-beta.1
+```
+
+Do not leave the existing Git source enabled alongside the npm source: they have different package-manager identities and can register the same task tools twice. Keep the working Git pin until the npm release and source replacement are verified. Reload only in an idle session, or open a new Pi process.
+
 ## Human commands
 
 ```text
