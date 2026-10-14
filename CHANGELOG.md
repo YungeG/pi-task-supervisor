@@ -1,5 +1,13 @@
 # Changelog
 
+## Unreleased source revision
+
+- Opt-in read-only preflight, strict proposal-only submission, exact human permission selection and separately guarded startup; legacy supervision remains compatible.
+- Current-session/branch control closure, revision invalidation, protected advisor scope evidence and strong revocation without automatically resuming or changing host tool permissions.
+- Isolated real-SDK/faux-provider preflight smoke; synthetic command approvals certify plumbing, not real business authorization.
+- Preserve owner-confirmed asynchronous waits and legitimate human-decision waiting at native settlement.
+- Exact-revision commit, push and local installation require explicit delivery authorization; npm publication and business deployment are separate.
+
 ## 0.1.0-beta.1
 
 First npm beta of Pi Task Supervisor, based on the maintained fork and Pi 1.1.0 validation.
@@ -9,8 +17,10 @@ First npm beta of Pi Task Supervisor, based on the maintained fork and Pi 1.1.0 
 - Ordinary human pause can resume the board and supervisor once without resetting counters, usage, epoch, or evidence; legacy and stronger holds retain explicit recovery.
 - Soft batch-checkpoint guidance, actionable read-only status, and an eight-line theme-aware unfinished-task widget with a complete task/evidence list.
 - Preserve `continuous-tasks:*` journal identifiers and the `/continuous-tasks` alias.
-- Validation: 558 tests, unchanged 90% branch-coverage gate, and six isolated SDK/faux-provider modes. Live-model adherence and business workflow behavior are not certified.
-- External execution waiting and automatic parallel scheduling remain deferred.
+- Owner-confirmed asynchronous execution waits reuse the existing executor's result delivery without repeated advisor calls, with a fixed 30-minute deadline and preserved human gates, budgets and host evidence.
+- Supervisor evidence packets use a 64,000-byte UTF-8 cap; only marked unbound receipt/transcript excerpts shrink, while goal, board and bound validation receipts remain intact.
+- Validation: 600 tests, 91.14% branch coverage with the unchanged 90% gate, and seven isolated SDK/faux-provider modes. Live-model adherence and real executor/business workflow behavior are not certified.
+- Dispatch, parallel scheduling, write permissions and worktree management remain with Main/the existing executor; Supervisor does not implement them.
 
 The history below belongs to the upstream pi-tasks project and is retained for provenance; it does not describe the current supervisor implementation.
 

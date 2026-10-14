@@ -100,7 +100,7 @@ function boardHeader(
   const { supervisor, journalFault } = currentRuntime();
   if (supervisor) {
     lines.push({
-      text: `Supervisor: ${supervisor.status}${supervisor.reason ? ` — ${text(supervisor.reason)}` : ""}`,
+      text: `Supervisor: ${supervisor.status}${supervisor.externalWait ? " (external wait; last owner report)" : ""}${supervisor.reason ? ` — ${text(supervisor.reason)}` : ""}`,
       color: SUPERVISOR_COLORS[supervisor.status],
     });
   }

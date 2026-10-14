@@ -11,6 +11,7 @@ import {
   createGetReadyTasksTool,
   createAdvanceTasksTool,
   createWorkflowGateTool,
+  createSubmitPreflightTool,
 } from "./tools";
 
 export default function (api: ExtensionAPI): void {
@@ -26,5 +27,6 @@ export default function (api: ExtensionAPI): void {
     pi.registerTool(createGetReadyTasksTool(pi));
     pi.registerTool(createAdvanceTasksTool(pi));
     pi.registerTool(createWorkflowGateTool(pi));
+    pi.registerTool(createSubmitPreflightTool(pi));
   });
 }

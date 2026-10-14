@@ -8,6 +8,16 @@ import {
   SUPERVISOR_LIMITS,
 } from "./flow";
 import { currentRuntime } from "./runtime";
+import {
+  beginPreflight,
+  approvePreflight,
+  markPreflightStarted,
+  preflightStartBinding,
+  preflightContext,
+  preflightStatusLines,
+  revokePreflight,
+  preflightTaskIssue,
+} from "./preflight";
 import { showTaskList } from "./board-ui";
 import {
   holdSupervisor,
@@ -18,7 +28,7 @@ import {
   supervisorState,
   SUPERVISOR_ENTRY,
 } from "./supervisor";
-import { enableSessionScope, isSessionScopeEnabled } from "./scope";
+import { enableSessionScope, isSessionScopeEnabled, updateActiveTools } from "./scope";
 import { getBoardRef, persistEntries, setBoard, updateUI } from "./state";
 import { cloneBoard, hasActionableTasks, isSafeBoundedText } from "./validation";
 
@@ -26,9 +36,14 @@ function notifyError(ctx: ExtensionCommandContext, message: string): void {
   if (ctx.hasUI) ctx.ui.notify(message, "error");
 }
 
-function continueNow(pi: ExtensionAPI): void {
+function continueNow(pi: ExtensionAPI, ctx: ExtensionCommandContext): void {
   const board = getBoardRef();
   const state = supervisorState();
+  const issue = preflightTaskIssue(
+    ctx,
+    state?.status === "stopped" ? undefined : state?.preflightBinding,
+  );
+  if (currentRuntime().journalFault || issue) return;
   if (state && state.status !== "stopped" && state.status !== "active") return;
   if (["paused", "waiting_for_decision"].includes(board.workflowStatus)) return;
   if (state?.status !== "active" && !hasActionableTasks(board)) return;
@@ -111,7 +126,7 @@ function resume(pi: ExtensionAPI, ctx: ExtensionCommandContext): void {
       );
       return;
     }
-    continueNow(pi);
+    continueNow(pi, ctx);
   } catch {
     currentRuntime().supervisor = state;
     setBoard(cloneBoard(board));
@@ -142,6 +157,11 @@ function resolveDecision(
     notifyError(ctx, "Decision answer is empty, too long, or secret-like");
     return;
   }
+  const permissionIssue = flowFacts(ctx).preflightIssue;
+  if (permissionIssue) {
+    notifyError(ctx, permissionIssue);
+    return;
+  }
   const updated = cloneBoard(board);
   updated.workflowStatus = "active";
   updated.decision = undefined;
@@ -150,7 +170,7 @@ function resolveDecision(
   persistEntries(pi, { type: "resolve_decision", id, answer }, updated);
   setBoard(updated);
   updateUI(ctx, updated);
-  continueNow(pi);
+  continueNow(pi, ctx);
 }
 
 function status(ctx: ExtensionCommandContext): void {
@@ -159,9 +179,119 @@ function status(ctx: ExtensionCommandContext): void {
     [
       `${formatSummaryLine(board)}; ${board.workflowStatus}; generation ${board.generation}; stagnant ${board.stagnantSettles}`,
       ...formatFlowStatus(board, supervisorState(), flowFacts(ctx)),
+      ...preflightStatusLines(ctx),
     ].join("\n"),
     "info",
   );
+}
+
+async function beginPlanning(
+  pi: ExtensionAPI,
+  ctx: ExtensionCommandContext,
+  goal: string,
+): Promise<void> {
+  await ctx.waitForIdle();
+  beginPreflight(pi, ctx, goal);
+  try {
+    enableSessionScope(pi);
+    updateActiveTools(pi, true);
+    const content = preflightContext(ctx);
+    if (!content) throw new Error("Preflight planning context changed before dispatch");
+    pi.sendMessage(
+      { customType: "continuous-tasks:preflight-planning", content, display: false },
+      { triggerTurn: true, deliverAs: "followUp" },
+    );
+  } catch {
+    currentRuntime().cancel();
+    currentRuntime().journalFault =
+      "Preflight planning dispatch failed; inspect journal before control";
+    throw new Error(currentRuntime().journalFault);
+  }
+}
+
+async function startGoal(
+  pi: ExtensionAPI,
+  ctx: ExtensionCommandContext,
+  goal: string,
+  planId?: string,
+): Promise<void> {
+  await ctx.waitForIdle();
+  if (planId !== undefined) {
+    const planning = currentRuntime().preflight;
+    if (!planning) throw new Error("No preflight plan exists");
+    preflightStartBinding(ctx, planning.goal, planId);
+    goal = planning.goal;
+  }
+  const boundStart = currentRuntime().preflight?.goal === goal;
+  const previous = supervisorState();
+  try {
+    startSupervisor(pi, ctx, goal);
+    const binding = supervisorState()?.preflightBinding;
+    if (binding) markPreflightStarted(pi, ctx, binding);
+    enableSessionScope(pi);
+    updateActiveTools(pi, true);
+    continueNow(pi, ctx);
+  } catch (error) {
+    if (boundStart && supervisorState() !== previous) {
+      currentRuntime().cancel();
+      currentRuntime().journalFault =
+        "Preflight startup persistence/dispatch failed; inspect existing work before control";
+    }
+    throw error;
+  }
+}
+
+async function settleMain(ctx: ExtensionCommandContext, manual: boolean): Promise<void> {
+  const runtime = currentRuntime();
+  if (manual) runtime.manualPauseDepth++;
+  try {
+    runtime.cancel();
+    if (!ctx.isIdle()) ctx.abort();
+    await ctx.waitForIdle();
+    if (!ctx.isIdle())
+      throw new Error("Host has not settled; inspect command-context bindings before control");
+  } finally {
+    if (manual) runtime.manualPauseDepth--;
+  }
+}
+
+async function revokeGoal(
+  pi: ExtensionAPI,
+  ctx: ExtensionCommandContext,
+  planId: string,
+): Promise<void> {
+  const planning = currentRuntime().preflight;
+  if (
+    !planning ||
+    planning.sessionId !== ctx.sessionManager.getSessionId() ||
+    planning.planId !== planId
+  )
+    throw new Error("Exact current-session preflight plan ID is required for revocation");
+  const state = supervisorState();
+  const bound =
+    state?.sessionId === planning.sessionId &&
+    state.status !== "stopped" &&
+    state.preflightBinding?.preflightId === planning.preflightId;
+  if (bound) await settleMain(ctx, true);
+  else await ctx.waitForIdle();
+  revokePreflight(pi, ctx, planId);
+  if (bound) {
+    try {
+      holdSupervisor(
+        pi,
+        ctx,
+        "paused",
+        "Human revoked preflight authorization; reapprove the exact plan and recover explicitly",
+        "authorization_revoked",
+      );
+    } catch {
+      currentRuntime().journalFault =
+        "Preflight revocation hold persistence failed; inspect journal before control";
+      throw new Error(currentRuntime().journalFault);
+    }
+  }
+  updateActiveTools(pi, isSessionScopeEnabled());
+  status(ctx);
 }
 
 async function supervisorCommand(
@@ -170,28 +300,16 @@ async function supervisorCommand(
   action: string,
   text: string,
 ): Promise<boolean> {
-  if (action === "supervise") {
-    await ctx.waitForIdle();
-    startSupervisor(pi, ctx, text);
-    enableSessionScope(pi);
-    continueNow(pi);
+  if (action === "supervise" || action === "start") {
+    await startGoal(pi, ctx, text, action === "start" ? text : undefined);
+    return true;
+  }
+  if (action === "revoke") {
+    await revokeGoal(pi, ctx, text);
     return true;
   }
   if (action === "pause" && !isSessionScopeEnabled()) return false;
-  if (["pause", "stop", "recover"].includes(action)) {
-    const runtime = currentRuntime();
-    const manual = action === "pause";
-    if (manual) runtime.manualPauseDepth++;
-    try {
-      runtime.cancel();
-      if (!ctx.isIdle()) ctx.abort();
-      await ctx.waitForIdle();
-      if (!ctx.isIdle())
-        throw new Error("Host has not settled; inspect command-context bindings before control");
-    } finally {
-      if (manual) runtime.manualPauseDepth--;
-    }
-  }
+  if (["pause", "stop", "recover"].includes(action)) await settleMain(ctx, action === "pause");
   if (action === "stop") {
     const state = supervisorState();
     if (!state) throw new Error("No supervisor is registered");
@@ -204,16 +322,35 @@ async function supervisorCommand(
     return true;
   }
   if (action === "recover") {
-    recoverSupervisor(pi);
+    if (ctx.hasPendingMessages()) throw new Error("Wait for pending messages before recovery");
+    recoverSupervisor(pi, ctx);
     supervisorNotice(
       pi,
       ctx,
       "Recovered explicitly. Inspect existing work before continuing; approvals are unchanged.",
     );
-    continueNow(pi);
+    continueNow(pi, ctx);
     return true;
   }
   return false;
+}
+
+async function preflightCommand(
+  pi: ExtensionAPI,
+  ctx: ExtensionCommandContext,
+  action: string,
+  text: string,
+): Promise<boolean> {
+  if (action === "preflight") {
+    await beginPlanning(pi, ctx, text);
+    return true;
+  }
+  if (action !== "approve") return false;
+  const [id = "", ...selection] = text.split(/\s+/);
+  await ctx.waitForIdle();
+  approvePreflight(pi, ctx, id, selection.join(" "));
+  status(ctx);
+  return true;
 }
 
 export function registerCommands(pi: ExtensionAPI): void {
@@ -231,6 +368,8 @@ export function registerCommands(pi: ExtensionAPI): void {
           return;
         }
         if (currentRuntime().journalFault) throw new Error(currentRuntime().journalFault);
+        if (await preflightCommand(pi, ctx, action, [id, ...answerParts].filter(Boolean).join(" ")))
+          return;
         if (
           await supervisorCommand(pi, ctx, action, [id, ...answerParts].filter(Boolean).join(" "))
         )
@@ -262,7 +401,7 @@ export function registerCommands(pi: ExtensionAPI): void {
         }
         notifyError(
           ctx,
-          "Usage: /task-supervisor enable|supervise <goal>|status|tasks|pause [reason]|resume|resolve <id> <answer>|recover|stop",
+          "Usage: /task-supervisor enable|preflight <goal>|approve <planId> <all|none|IDs>|start <planId>|revoke <planId>|supervise <goal>|status|tasks|pause [reason]|resume|resolve <id> <answer>|recover|stop",
         );
       } catch (error) {
         notifyError(

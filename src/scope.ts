@@ -12,7 +12,8 @@ export const TASK_TOOL_NAMES: readonly string[] = [
   "workflow_gate",
 ];
 
-const taskTools = new Set(TASK_TOOL_NAMES);
+export const PREFLIGHT_TOOL_NAME = "submit_preflight";
+const taskTools = new Set([...TASK_TOOL_NAMES, PREFLIGHT_TOOL_NAME]);
 
 export function setSessionScopeEnabled(value: boolean): void {
   currentRuntime().enabled = value;
@@ -24,7 +25,14 @@ export function isSessionScopeEnabled(): boolean {
 
 export function updateActiveTools(pi: ExtensionAPI, value: boolean): void {
   const active = pi.getActiveTools().filter((name) => !taskTools.has(name));
-  pi.setActiveTools(value ? [...active, ...TASK_TOOL_NAMES] : active);
+  const preflight = currentRuntime().preflight;
+  const planning = preflight && !preflight.started && preflight.phase !== "revoked";
+  const selected = planning
+    ? preflight.phase === "interrupted"
+      ? []
+      : [PREFLIGHT_TOOL_NAME]
+    : TASK_TOOL_NAMES;
+  pi.setActiveTools(value ? [...active, ...selected] : active);
 }
 
 function hasActivationEntry(ctx: ExtensionContext): boolean {

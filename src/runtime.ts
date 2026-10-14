@@ -3,19 +3,31 @@ import type { ExtensionAPI, ToolDefinition } from "@earendil-works/pi-coding-age
 import type { TSchema } from "typebox";
 import { createEmptyBoard } from "./engine";
 import type { SupervisorState } from "./supervisor";
+import type { PreflightState } from "./preflight";
+import type { TaskBoardSnapshot } from "./types";
 
-export function createRuntime() {
+export interface TaskRuntime {
+  board: TaskBoardSnapshot;
+  enabled: boolean;
+  cancel: () => void;
+  manualPauseDepth: number;
+  supervisor: SupervisorState | undefined;
+  preflight: PreflightState | undefined;
+  journalFault: string | undefined;
+}
+
+export function createRuntime(): TaskRuntime {
   return {
     board: createEmptyBoard(),
     enabled: false,
     cancel: (): void => undefined,
     manualPauseDepth: 0,
     supervisor: undefined as SupervisorState | undefined,
+    preflight: undefined as PreflightState | undefined,
     journalFault: undefined as string | undefined,
   };
 }
 
-export type TaskRuntime = ReturnType<typeof createRuntime>;
 const storage = new AsyncLocalStorage<TaskRuntime>();
 const testRuntime = createRuntime();
 

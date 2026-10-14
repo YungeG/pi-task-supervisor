@@ -5,7 +5,9 @@ import type {
   ExtensionContext,
 } from "@earendil-works/pi-coding-agent";
 import type { ContinuousTasksConfig } from "./config";
+import { claimedExecutionRefs, executionWaitTimer, waitForExecutions } from "./async-execution";
 import { currentRuntime } from "./runtime";
+import { preflightContext, preflightTaskIssue, restorePreflight } from "./preflight";
 import { TASK_WIDGET_KEY } from "./board-ui";
 import { loadConfig, resetConfig } from "./config";
 import { formatContinuePrompt, formatHiddenContext } from "./formatting";
@@ -20,6 +22,7 @@ import { getBoardRef, persistEntries, reconstructState, setBoard, updateUI } fro
 import { cloneBoard, hasActionableTasks, hasBlockedNonTerminalTasks } from "./validation";
 import {
   digest,
+  currentExecutionWait,
   holdSupervisor,
   observeTool,
   redact,
@@ -164,6 +167,7 @@ async function supervisedBoundary(
   current: () => boolean,
   advisor?: Advisor,
 ): Promise<BoundaryResult | undefined> {
+  if (!current()) return undefined;
   const advice = await cancellable(reviewSupervisor(pi, ctx, signal, advisor), signal);
   if (!advice || !current() || ctx.hasPendingMessages()) return undefined;
   return continuation(
@@ -171,13 +175,33 @@ async function supervisedBoundary(
   );
 }
 
+function permissionBlocked(pi: ExtensionAPI, ctx: ExtensionContext): boolean {
+  const state = supervisorState();
+  const reason =
+    currentRuntime().journalFault ??
+    preflightTaskIssue(ctx, state?.status === "stopped" ? undefined : state?.preflightBinding);
+  if (!reason) return false;
+  if (state?.preflightBinding) holdSupervisor(pi, ctx, "paused", reason, "authorization_revoked");
+  return true;
+}
+function holdBoundaryError(pi: ExtensionAPI, ctx: ExtensionContext, error: unknown): void {
+  const reason = redact(error instanceof Error ? error.message : "Continuation failed");
+  const state = supervisorState();
+  if (state && state.status !== "stopped")
+    holdSupervisor(pi, ctx, "fault", reason, "review_failed");
+  else pauseBoard(pi, ctx, reason);
+}
+
 function makeController(pi: ExtensionAPI, configLoader: ConfigLoader, advisor?: Advisor): Control {
   let serial = 0;
   let inFlight: AbortController | undefined;
   let lastProgress: string | undefined;
   let stagnant = 0;
+  let waitTimer: ReturnType<typeof setTimeout> | undefined;
   const cancel = () => {
     serial++;
+    clearTimeout(waitTimer);
+    waitTimer = undefined;
     inFlight?.abort();
     inFlight = undefined;
   };
@@ -221,16 +245,21 @@ function makeController(pi: ExtensionAPI, configLoader: ConfigLoader, advisor?: 
     const signal = reviewSignal(controller, ctx);
     try {
       const state = supervisorState();
-      if (state && state.status !== "stopped")
+      if (permissionBlocked(pi, ctx)) return undefined;
+      if (state && state.status !== "stopped") {
+        if (
+          claimedExecutionRefs(getBoardRef()).length &&
+          (await waitForExecutions(pi, ctx, signal, () => ticket === serial))
+        ) {
+          clearTimeout(waitTimer);
+          waitTimer = executionWaitTimer(pi, ctx);
+          return undefined;
+        }
         return await supervisedBoundary(pi, ctx, signal, () => ticket === serial, advisor);
+      }
       return await baseBoundary(ticket, ctx);
     } catch (error) {
-      if (ticket === serial) {
-        const reason = redact(error instanceof Error ? error.message : "Continuation failed");
-        if (supervisorState() && supervisorState()?.status !== "stopped")
-          holdSupervisor(pi, ctx, "fault", reason, "review_failed");
-        else pauseBoard(pi, ctx, reason);
-      }
+      if (ticket === serial) holdBoundaryError(pi, ctx, error);
       return undefined;
     } finally {
       if (inFlight === controller) inFlight = undefined;
@@ -248,11 +277,15 @@ function registerSessionHandlers(pi: ExtensionAPI, control: Control): void {
     restoreSessionScope(pi, ctx);
     currentRuntime().journalFault = undefined;
     try {
+      restorePreflight(ctx);
       restoreSupervisor(pi, ctx);
-    } catch {
+      updateActiveTools(pi, isSessionScopeEnabled());
+    } catch (error) {
       // Do not reinterpret malformed durable state as an inactive, safe-to-continue supervisor.
       currentRuntime().journalFault =
-        "Invalid supervisor journal; inspect session state before recovery";
+        error instanceof Error && /preflight/i.test(error.message)
+          ? "Invalid preflight journal; inspect session state before recovery"
+          : "Invalid supervisor journal; inspect session state before recovery";
       setSessionScopeEnabled(false);
       updateActiveTools(pi, false);
       updateUI(ctx, board);
@@ -286,7 +319,15 @@ function registerSessionHandlers(pi: ExtensionAPI, control: Control): void {
   });
   pi.on("session_before_compact", (_event, ctx) => {
     control.cancel();
-    if (supervisorState()?.status === "reviewing")
+    if (supervisorState()?.externalWait)
+      holdSupervisor(
+        pi,
+        ctx,
+        "fault",
+        "Context changed during external waiting; inspect the existing run before recovery.",
+        "interrupted",
+      );
+    else if (supervisorState()?.status === "reviewing")
       holdSupervisor(
         pi,
         ctx,
@@ -336,11 +377,37 @@ function supervisedWriteLimitError(
   return supervisorPlanError(added + (input.mode === "replace" ? 0 : getBoardRef().tasks.length));
 }
 
-function taskGate(toolName: string, input: Record<string, unknown>): string | undefined {
-  if (!TASK_TOOL_NAMES.includes(toolName)) return undefined;
+function submissionGate(ctx: ExtensionContext): string | undefined {
+  const state = currentRuntime().preflight;
+  return (
+    currentRuntime().journalFault ??
+    (!isSessionScopeEnabled() ||
+    !state ||
+    state.sessionId !== ctx.sessionManager.getSessionId() ||
+    state.started ||
+    ["revoked", "interrupted"].includes(state.phase)
+      ? "No valid human-created preflight planning context"
+      : undefined)
+  );
+}
+function taskControlIssue(ctx: ExtensionContext): string | undefined {
+  if (currentRuntime().journalFault) return currentRuntime().journalFault;
   if (!isSessionScopeEnabled()) return "Pi Task Supervisor is disabled for this session";
   if (["paused", "waiting_for_decision"].includes(getBoardRef().workflowStatus))
     return "Task-board gate must be resolved by its human command";
+  const state = supervisorState();
+  return preflightTaskIssue(ctx, state?.status === "stopped" ? undefined : state?.preflightBinding);
+}
+
+function taskGate(
+  toolName: string,
+  input: Record<string, unknown>,
+  ctx: ExtensionContext,
+): string | undefined {
+  if (toolName === "submit_preflight") return submissionGate(ctx);
+  if (!TASK_TOOL_NAMES.includes(toolName)) return undefined;
+  const issue = taskControlIssue(ctx);
+  if (issue) return issue;
   const state = supervisorState();
   if (!state || state.status === "stopped") return undefined;
   if (["paused", "fault", "reviewing", "completed"].includes(state.status))
@@ -364,10 +431,26 @@ function taskGate(toolName: string, input: Record<string, unknown>): string | un
   return supervisedWriteLimitError(toolName, input);
 }
 
+function planningMessage(preflight: string | undefined) {
+  if (!isSessionScopeEnabled() || !preflight || currentRuntime().preflight?.started)
+    return undefined;
+  return {
+    message: {
+      customType: "continuous-tasks:preflight-context",
+      content: preflight,
+      display: false,
+    },
+  };
+}
+
 function registerWorkHandlers(pi: ExtensionAPI, control: Control): void {
-  pi.on("before_agent_start", () => {
+  pi.on("before_agent_start", (_event, ctx) => {
     const board = getBoardRef();
     const state = supervisorState();
+    const preflight = preflightContext(ctx);
+    if (currentRuntime().journalFault) return undefined;
+    const planning = planningMessage(preflight);
+    if (planning) return planning;
     if (
       !isSessionScopeEnabled() ||
       (state && !["active", "stopped"].includes(state.status)) ||
@@ -377,7 +460,7 @@ function registerWorkHandlers(pi: ExtensionAPI, control: Control): void {
     return {
       message: {
         customType: "continuous-tasks:context",
-        content: `${formatHiddenContext(board)}\n${state?.status === "active" ? `User-recorded supervisor goal: ${state.goal}\nEvidence refs must use real host receipts tool:<id>, observed during review. Supervisor guidance is never user approval.` : ""}`,
+        content: `${preflight ? `${preflight}\n` : ""}${formatHiddenContext(board)}\n${state?.status === "active" ? `User-recorded supervisor goal: ${state.goal}\nEvidence refs must use real host receipts tool:<id>, observed during review. Supervisor guidance is never user approval.` : ""}${currentExecutionWait(board, state) ? "\nExisting external executions are bound. Inspect the executor's delivered results and exact run IDs; clear resolved references and obtain fresh host validation. A wait or completion notification is neither acceptance nor permission to launch duplicate work." : ""}`,
         display: false,
       },
     };
@@ -395,18 +478,33 @@ function registerWorkHandlers(pi: ExtensionAPI, control: Control): void {
         "The user aborted the last run; inspect before resuming",
         currentRuntime().manualPauseDepth > 0 ? "user_pause" : "run_aborted",
       );
-    } else if (["active", "reviewing"].includes(supervisorState()?.status ?? "")) {
-      holdSupervisor(
-        pi,
-        ctx,
-        "fault",
-        "Pi settled with an unfinished goal; inspect the blocked continuation before explicit recovery",
-        "interrupted",
-      );
+    } else {
+      const board = getBoardRef();
+      const state = supervisorState();
+      const decision = board.decision;
+      const waitingForDecision =
+        board.workflowStatus === "waiting_for_decision" &&
+        decision !== undefined &&
+        board.tasks.some((task) => task.id === decision.taskId) &&
+        state?.status === "active" &&
+        !state.pending &&
+        state.sessionId === ctx.sessionManager.getSessionId();
+      if (
+        ["active", "reviewing"].includes(state?.status ?? "") &&
+        !waitingForDecision &&
+        !currentExecutionWait(board, state)
+      )
+        holdSupervisor(
+          pi,
+          ctx,
+          "fault",
+          "Pi settled with an unfinished goal; inspect the blocked continuation before explicit recovery",
+          "interrupted",
+        );
     }
   });
-  pi.on("tool_call", (event) => {
-    const reason = taskGate(event.toolName, event.input);
+  pi.on("tool_call", (event, ctx) => {
+    const reason = taskGate(event.toolName, event.input, ctx);
     return reason ? { block: true, reason } : undefined;
   });
   pi.on("tool_result", (event, ctx) => {

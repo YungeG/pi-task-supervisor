@@ -1,5 +1,29 @@
 # Local supervisor validation report
 
+## Latest validated source: opt-in preflight and safe continuation
+
+- Accepted local implementation: **696 tests / 34 files PASS**, **91.06% branch coverage**, unchanged 90% thresholds; TypeScript, lint, formatting and eight isolated SDK/faux-provider modes pass.
+- Opt-in proposal, exact current-branch human approval, separately guarded startup, revision invalidation, fail-closed persistence/lifecycle and retained revocation gates are covered. Legacy supervision, owner-confirmed async waiting and legitimate human-decision waiting remain compatible.
+- The single authorized fresh-context read-only implementation review completed in about 221 seconds. Its original `BLOCK` report identified two concrete issues; Main reproduced both red, fixed them and obtained passing targeted/full validation. The report is not rewritten and no second independent review is claimed.
+- Source acceptance evidence is recorded under `/tmp/pi-supervisor-preflight-impl-y6cVye/`, including `check-final-t3-2.log`, `final-acceptance-verification.json`, the original CLI review and `review-resolutions.md`. These are local evidence artifacts, not portable files included in this repository.
+- After local acceptance, the user separately authorized **commit, push and installation**. Delivery targets the current fork branch and an exact-commit local package snapshot; registry publication, business deployment, credential changes and live business-session activation remain unapproved.
+- Prior installation was recovery-hotfix snapshot `273cc792f350a5a833adcfd918de9871a9c8449c`; it lacks preflight. The subsequently selected installation must be verified against its exact commit/configuration, not inferred from this document. Cold snapshot/host checks are separate delivery evidence.
+- The SDK/faux matrix uses the repository's existing Pi 1.1 peers and Node 25.9.0. Real-model use was confined to the authorized independent code review; this does not certify live-model product adherence, real executor/business integration or the user's interactive TUI.
+
+## Previous async integration and bounded evidence packet candidate (historical)
+
+- Source baseline: `9933feaee451046168fb1384b7276fe1ad78c787`; uncommitted candidate on `local/supervisor-async-integration`, not published or installed.
+- `npm run check`: **600 tests / 30 files PASS**, branches **91.14% (1410/1547)**, statements 95.07%, functions 97.81%, lines 97.17%; unchanged 90% coverage gates. TypeScript, ESLint and source formatting pass.
+- All **seven** isolated real-SDK/faux-provider modes pass, including ordinary pause with retained counters and owner-confirmed asynchronous waiting followed by executor-fixture result delivery and fresh Main validation. Real settings remained unchanged.
+- The merged packet fix adds four public-boundary regressions: ASCII/CJK excerpt bounding, oversized bound-evidence refusal, and UTF-8 byte limits. Goal, task board, selected receipt identities/validation metadata and bound receipts remain intact; only explicitly marked unbound/transcript excerpts shrink, never durable history.
+- Evidence: `/tmp/pi-supervisor-merge-review-check.log`; the review's file list/hash is in `/tmp/pi-supervisor-merge-review-baseline.json`. The twelve candidate files and HEAD did not drift during that review. Subsequent documentation-only synchronization does not change the tested source.
+- Active LSP checks of the merged implementation/test reported no errors: one path confirmed clean, one push-only path unconfirmed. Full `tsc --noEmit` passes; this is not an all-LSP-clean claim.
+- No live inference, real child/workflow execution, business-session activation, new packed-install validation, independent implementation review, publication or installation. The executor owner is a fixture; it does not certify real-process liveness or live executor integration.
+
+The frozen scope and failure precedence are in [the async integration contract](./docs/supervisor-async-integration-packet.md). Earlier snapshots below remain historical evidence, not fresh results for this candidate.
+
+## Native-board appearance validation snapshot (historical)
+
 - Validated: 2026-10-11 (UTC)
 - Candidate: `pi-task-supervisor/`, native-board appearance validation snapshot on `local/continuous-tasks`, based on published/installed `e6725ba74d2d01e2cb586ba6a823a62b6471d41f`
 - Public name/command: **Pi Task Supervisor**, `/task-supervisor`; `/continuous-tasks` remains an alias
@@ -11,7 +35,7 @@
 
 This replaces the earlier Pi 0.84.2 board-only canary. Historical results are retained in `UPSTREAM.md` and are not current validation evidence.
 
-## Current native-board appearance checks
+## Native-board appearance checks (historical)
 
 `npm run check` passed after theme-aware appearance changes. Only `src/board-ui.ts` production code changed: task ordering, read-only list/details, activation, gates, execution, persistence, and evidence semantics remain unchanged. The widget uses built-in theme roles, monochrome status glyphs, aligned status/ID columns, bold active titles, and a subtle left rail. Display IDs are capped at 14 columns; the full list retains exact IDs. Empty overflow/fold counts are omitted. Session-derived strings and row data are still captured before deferred rendering.
 
@@ -83,10 +107,12 @@ Active error-level LSP probes covered all five TypeScript paths changed by the s
 | `--compaction`           | One real automatic threshold compaction before settlement; three agent runs; durable goal and actual receipt survive a deliberately lossy fixture summary                                      |
 | `--interrupt-compaction` | Human pause cancels an in-flight advisor even when the faux provider ignores cancellation; real manual compaction follows; stale guidance is discarded; explicit resume/recover completes work |
 | `--native-abort`         | Native manual compaction waits for the boundary; a late advisor draft cannot restart Main; settlement visibly pauses supervision; explicit resume/recover completes work                       |
+| `--ordinary-pause`       | Human pause cancels an in-flight advisor; one resume restores board/Supervisor with retained counters and evidence; fresh Main validation completes the goal                                   |
+| `--async-execution`      | Exact run binding waits without advisor calls; only the executor fixture wakes Main, which clears the reference and validates both tasks.                                                      |
 
-All five modes exercised the primary `/task-supervisor` command and legacy `/continuous-tasks enable` alias without duplicate activation. Interrupted-compaction modes also recovered a primary-created supervisor through the legacy alias. Existing `continuous-tasks:*` journal/message identifiers and `continuous-tasks.json` fixture configuration remained unchanged.
+All seven modes exercised the primary `/task-supervisor` command and legacy `/continuous-tasks enable` alias without duplicate activation. Interrupted-compaction modes also recovered a primary-created supervisor through the legacy alias. Existing `continuous-tasks:*` journal/message identifiers and `continuous-tasks.json` fixture configuration remained unchanged.
 
-All supervised modes verified zero forged user messages, one typed activation entry, restored activation and verified acceptance after reopening, no supervisor inheritance on fork, and default denial in independent sessions. All five modes verified that real settings were unchanged. Smokes use temporary agent directories and no builtin executor tools; validation tools produce deterministic local fixture results, not live external execution.
+All supervised modes verified zero forged user messages, one typed activation entry, restored activation and verified acceptance after reopening, no supervisor inheritance on fork, and default denial in independent sessions. All seven modes verified that real settings were unchanged. Smokes use temporary agent directories and no builtin executor tools; validation tools and the async owner produce deterministic local fixture results, not live external execution.
 
 ## Policy and recovery regressions
 
@@ -108,7 +134,7 @@ Review limits are 30 seconds, 64KB of structured input, 2048 output tokens, 40 c
 
 Pi 1.1 `AgentSession.compact()` aborts and waits for idle **before** emitting `session_before_compact`. During an awaited before-settle advisor check there is no public immediate native-abort signal available to the extension. Native abort/manual compaction may therefore wait for the check to return, bounded by the extension's 30-second review deadline. Pi may persist an aborted guidance draft, but does not execute it; notification reconciliation makes the board/supervisor visibly paused.
 
-For immediate advisor cancellation, use **`/task-supervisor pause` before manual compaction**. After inspection, `resume`/`resolve` restore only board gates; `recover` is a separate explicit human operation. Automatic pre-boundary compaction is covered and preserves the durable journal. No SDK monkeypatching is used.
+For immediate advisor cancellation, use **`/task-supervisor pause` before manual compaction**. A qualified ordinary human pause can resume both board and Supervisor with one `resume`, retaining counters, usage and evidence. Stronger or unknown holds still require inspection and explicit recovery after board gates are resolved; `resolve` answers only the exact decision gate. Compaction during external waiting invalidates that wait and requires explicit recovery. Automatic pre-boundary compaction is covered and preserves the durable journal. No SDK monkeypatching is used.
 
 ## Validation boundaries and next authority
 
@@ -117,4 +143,4 @@ For immediate advisor cancellation, use **`/task-supervisor pause` before manual
 - Node 24 and clean peer-dependency installation were not retested for this candidate. Current execution evidence is Node 25.9.0 with existing local dependencies.
 - Redaction is not general DLP, and task gates are not an OS/tool permission sandbox. Other Main tools retain host controls.
 
-The controlling agent completed the authorized local validation. This report records local validation snapshots; publishing and installing the appearance polish are separately authorized follow-up operations and do not constitute additional validation evidence. No user action is needed for these checks. Live/business validation, credential changes, and business-session activation remain outside this validation scope.
+The controlling agent completed the authorized local validation. This report records local validation snapshots; committing, publishing and installing the current candidate require separate explicit authorization and do not constitute additional validation evidence. npm publication remains paused. No user action is needed for these checks. Live/business validation, credential changes, and business-session activation remain outside this validation scope.

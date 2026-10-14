@@ -1,6 +1,7 @@
 import type { ExtensionContext } from "@earendil-works/pi-coding-agent";
 import { stripTerminalSequences } from "@earendil-works/pi-tui";
 import { currentRuntime } from "./runtime";
+import { preflightTaskIssue } from "./preflight";
 import type { SupervisorState } from "./supervisor";
 import type { TaskBoardSnapshot } from "./types";
 
@@ -14,6 +15,7 @@ export const SUPERVISOR_LIMITS = {
 export interface FlowFacts {
   enabled: boolean;
   journalFault?: string;
+  preflightIssue?: string;
   sessionId: string;
   idle: boolean;
   pending: boolean;
@@ -24,6 +26,10 @@ export function flowFacts(ctx: ExtensionContext): FlowFacts {
   return {
     enabled: runtime.enabled,
     journalFault: runtime.journalFault,
+    preflightIssue: preflightTaskIssue(
+      ctx,
+      runtime.supervisor?.status === "stopped" ? undefined : runtime.supervisor?.preflightBinding,
+    ),
     sessionId: ctx.sessionManager.getSessionId(),
     idle: ctx.isIdle(),
     pending: ctx.hasPendingMessages(),
@@ -36,6 +42,8 @@ export function resumeControlIssue(
   state: Readonly<SupervisorState> | undefined,
   facts: FlowFacts,
 ): string | undefined {
+  if (facts.journalFault) return "Inspect the journal before recovery";
+  if (facts.preflightIssue) return facts.preflightIssue;
   if (!facts.idle || facts.pending || board.decision)
     return "Wait for Main and pending messages; resolve any decision before resuming";
   if (
@@ -48,13 +56,19 @@ export function resumeControlIssue(
   return undefined;
 }
 
+function controlFault(facts: FlowFacts): string | undefined {
+  if (facts.journalFault) return "Inspect the journal before recovery";
+  return facts.preflightIssue;
+}
+
 /** Pure qualification shared by command control and read-only status projection. */
 export function ordinaryResumeIssue(
   board: Readonly<TaskBoardSnapshot>,
   state: Readonly<SupervisorState>,
   facts: FlowFacts,
 ): string | undefined {
-  if (facts.journalFault) return "Inspect the journal before recovery";
+  const fault = controlFault(facts);
+  if (fault) return fault;
   if (!facts.enabled) return "Enable the session explicitly before control";
   if (!facts.idle || facts.pending) return "Wait for Main to be idle with no pending messages";
   if (state.sessionId !== facts.sessionId) return "Supervisor belongs to another session";
@@ -84,6 +98,13 @@ function heldNextStep(
   return "inspect existing work, then /task-supervisor recover (resets review/continuation limits)";
 }
 
+function preflightControlBlocker(facts: FlowFacts): string | undefined {
+  if (!facts.preflightIssue) return undefined;
+  if (!facts.idle || facts.pending)
+    return "wait for the current host run/check and pending messages";
+  return `inspect preflight authorization: ${facts.preflightIssue}`;
+}
+
 function flowBlocker(
   board: Readonly<TaskBoardSnapshot>,
   state: Readonly<SupervisorState> | undefined,
@@ -92,6 +113,8 @@ function flowBlocker(
   if (facts.journalFault) return "inspect journal; control recovery is disabled";
   if (!facts.enabled) return "/task-supervisor enable (tools only), then recheck status";
   if (state && state.sessionId !== facts.sessionId) return "inspect foreign supervisor identity";
+  const preflight = preflightControlBlocker(facts);
+  if (preflight) return preflight;
   if (board.decision || board.workflowStatus === "waiting_for_decision") {
     if (!board.decision || board.workflowStatus !== "waiting_for_decision")
       return "inspect inconsistent decision gate";
@@ -104,6 +127,14 @@ function flowBlocker(
   if (!facts.idle || facts.pending)
     return "wait for the current host run/check and pending messages";
   return undefined;
+}
+
+/** Cached owner observations only: status does not perform RPC or prove process liveness. */
+export function externalWaitText(state: Readonly<SupervisorState> | undefined): string {
+  const wait = state?.status === "active" ? state.externalWait : undefined;
+  if (!wait) return "none confirmed";
+  const phase = wait.phase === "active" ? "execution pending" : "results pending Main review";
+  return `${phase}; last owner report ${new Date(wait.observedAt).toISOString()}; deadline ${new Date(wait.deadlineAt).toISOString()}`;
 }
 
 /** Only recommends actions; an opaque execution reference never establishes liveness. */
@@ -132,9 +163,20 @@ export function nextFlowStep(
       return "goal marked completed; no automatic continuation";
     case "reviewing":
       return "wait for the native Supervisor check";
+    case "active":
+      if (state.externalWait) {
+        if (state.externalWait.deadlineAt <= Date.now())
+          return "inspect expired external wait; do not relaunch the existing run";
+        return "executor wakes Main; inspect delivered results, clear exact references, then obtain fresh host validation";
+      }
+      return "execute/review eligible tasks; finish the batch normally for the native check";
     default:
       return "execute/review eligible tasks; finish the batch normally for the native check";
   }
+}
+
+function preflightBlockerStatus(facts: FlowFacts): string[] {
+  return facts.preflightIssue ? [`Preflight blocker: ${facts.preflightIssue}`] : [];
 }
 
 export function formatFlowStatus(
@@ -156,7 +198,9 @@ export function formatFlowStatus(
       `Hold source: ${state.holdCause ?? "unknown"}`,
       `Budget: reviews ${state.reviews}/${SUPERVISOR_LIMITS.reviews}; auto continuations ${state.continuations}/${SUPERVISOR_LIMITS.continuations}; stagnant ${state.stagnant}/${SUPERVISOR_LIMITS.stagnant}; advisor tokens ${state.tokens}; advisor cost ${state.cost}`,
     );
+  lines.push(`External wait: ${externalWaitText(state)}`);
   if (facts.journalFault) lines.push(`Fault: ${facts.journalFault}`);
+  lines.push(...preflightBlockerStatus(facts));
   if (board.pauseReason) lines.push(`Paused: ${board.pauseReason}`);
   if (board.decision) lines.push(`Decision ${board.decision.id}: ${board.decision.question}`);
   for (const task of claimed) {

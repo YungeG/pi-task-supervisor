@@ -11,6 +11,7 @@ vi.mock("../tools", () => ({
   createGetReadyTasksTool: vi.fn(() => ({ name: "get_ready_tasks" })),
   createAdvanceTasksTool: vi.fn(() => ({ name: "advance_tasks" })),
   createWorkflowGateTool: vi.fn(() => ({ name: "workflow_gate" })),
+  createSubmitPreflightTool: vi.fn(() => ({ name: "submit_preflight" })),
 }));
 
 // Import after mocks are set up
@@ -26,8 +27,8 @@ describe("index (default export)", () => {
 
     indexModule.default(mockObj.api);
 
-    // 7 tools registered
-    expect(mockObj.registerTool).toHaveBeenCalledTimes(7);
+    // Seven legacy task tools plus one opt-in proposal-only tool.
+    expect(mockObj.registerTool).toHaveBeenCalledTimes(8);
     const toolNames = mockObj.registerTool.mock.calls.map(
       (call: unknown) => (call as [{ name: string }])[0].name,
     );
@@ -38,6 +39,7 @@ describe("index (default export)", () => {
     expect(toolNames).toContain("get_ready_tasks");
     expect(toolNames).toContain("advance_tasks");
     expect(toolNames).toContain("workflow_gate");
+    expect(toolNames).toContain("submit_preflight");
 
     expect(mockObj.registerCommand).toHaveBeenCalledTimes(2);
     expect(mockObj.registerCommand).toHaveBeenCalledWith(

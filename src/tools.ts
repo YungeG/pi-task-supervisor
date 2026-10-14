@@ -20,13 +20,25 @@ import {
   TERMINAL_STATUSES,
   ACTIVE_STATUSES,
 } from "./types";
-import type { AdvanceEdit, TaskBoardSnapshot, TaskEdit, TaskWorkflowEvent } from "./types";
+import type {
+  AdvanceEdit,
+  CompletionEvidence,
+  TaskBoardSnapshot,
+  TaskEdit,
+  TaskWorkflowEvent,
+} from "./types";
 import { writeTasks, applyEdits, compileBoard, createEmptyBoard, claimReadyTasks } from "./engine";
 import { cloneBoard, getStatusCounts, isSafeBoundedText } from "./validation";
 import { getBoardRef, setBoard, persistEntries, updateUI } from "./state";
 import { loadConfig, resolvePhasePrompt } from "./config";
 import { assertObservedEvidence, bindCompletion } from "./supervisor";
 import { isSessionScopeEnabled } from "./scope";
+import {
+  SubmitPreflightParams,
+  submitPreflight,
+  validPreflightSubmission,
+  type PreflightState,
+} from "./preflight";
 import {
   formatBoardText,
   formatSummaryLine,
@@ -129,6 +141,44 @@ function renderColoredBoardResult(text: string, _snapshot: TaskBoardSnapshot, th
     })
     .join("\n");
   return new Text(colored, 0, 0);
+}
+
+export function createSubmitPreflightTool(
+  pi: ExtensionAPI,
+): ToolDefinition<typeof SubmitPreflightParams, { state?: PreflightState; error?: string }> {
+  return {
+    name: "submit_preflight",
+    label: "Submit Preflight",
+    description:
+      "Submit the exact read-only plan and additional permission inventory for a human-created preflight. This tool cannot approve or start execution.",
+    parameters: SubmitPreflightParams,
+    promptSnippet:
+      "Submit a complete read-only preflight proposal; only the user can approve and separately start it.",
+    execute(_id, params, signal, _onUpdate, ctx) {
+      try {
+        if (signal?.aborted) throw new Error("Preflight submission cancelled");
+        if (!validPreflightSubmission(params))
+          throw new Error("Invalid preflight submission; approval/status fields are not accepted");
+        const state = submitPreflight(pi, ctx, params.preflightId, params.proposal);
+        return Promise.resolve({
+          content: [
+            {
+              type: "text" as const,
+              text: `Preflight ${state.phase}; plan ${state.planId}; digest ${state.planDigest}\n${JSON.stringify(state.proposal)}\nHuman action: /task-supervisor approve ${state.planId} <all|none|IDs>. Approval does not start execution.`,
+            },
+          ],
+          details: { state },
+        });
+      } catch (error) {
+        const message = error instanceof Error ? error.message : "Preflight submission failed";
+        return Promise.resolve({
+          content: [{ type: "text" as const, text: message }],
+          details: { error: message },
+          isError: true,
+        });
+      }
+    },
+  };
 }
 
 // ── Tool 1: write_tasks ──
@@ -586,7 +636,11 @@ export function createAdvanceTasksTool(
       const edits: AdvanceEdit[] = params.transitions.map((transition) => ({
         id: transition.id,
         type: "advance" as const,
-        data: transition.evidence ? { evidence: transition.evidence } : undefined,
+        // SDK StringEnum uses its host TypeBox's TUnsafe; keep the existing wire contract.
+        // Runtime argument/engine/evidence validation remains unchanged below.
+        data: transition.evidence
+          ? { evidence: transition.evidence as CompletionEvidence }
+          : undefined,
       }));
 
       try {

@@ -7,19 +7,52 @@ import { fauxAssistantMessage, fauxProvider, fauxToolCall } from "@earendil-work
 import { Type } from "typebox";
 import { stripTerminalSequences, visibleWidth } from "@earendil-works/pi-tui";
 
+const preflight = process.argv.includes("--preflight");
+const asyncExecution = process.argv.includes("--async-execution");
 const compaction = process.argv.includes("--compaction");
 const nativeAbort = process.argv.includes("--native-abort");
 const ordinaryPause = process.argv.includes("--ordinary-pause");
 const interruptCompaction =
   process.argv.includes("--interrupt-compaction") || nativeAbort || ordinaryPause;
-const supervised = process.argv.includes("--supervised") || compaction || interruptCompaction;
+const supervised =
+  process.argv.includes("--supervised") ||
+  compaction ||
+  interruptCompaction ||
+  asyncExecution ||
+  preflight;
+let smokeEventBus;
 let interruptedReviewStarted = false;
 let releaseInterruptedReview;
 let completedCompactions = 0;
 let advisoryChecks = 0;
 const goal = "Verify the approved local smoke work";
+const preflightProposal = {
+  summary: "Verify local SDK fixtures without external effects",
+  steps: ["Run the two-task SDK fixture"],
+  acceptance: ["Fresh host receipts and final acceptance"],
+  permissions: ["A1", "A2"].map((id) => ({
+    id,
+    action: id === "A1" ? "Run approved local fixture" : "Optional alternative fixture",
+    target: "Isolated smoke directory",
+    environment: "Local faux SDK only",
+    required: id === "A1",
+    limits: "One isolated fixture; no real business execution",
+    risks: "Temporary local files",
+    fallback: "Use only A1",
+    reconfirm: "Changed scope or external effects",
+  })),
+  prohibitions: ["No settings, credentials, dependencies or business execution"],
+  reconfirm: ["Material proposal changes"],
+};
+function latestPreflight(manager) {
+  return [...manager.getBranch()]
+    .reverse()
+    .find((entry) => entry.type === "custom" && entry.customType === "continuous-tasks:preflight")
+    ?.data;
+}
 import {
   createAgentSession,
+  createEventBus,
   DefaultResourceLoader,
   ModelRuntime,
   SessionManager,
@@ -73,6 +106,12 @@ function advisory(action) {
     if (packet.goal !== goal || !packet.board)
       throw new Error("Durable supervisor goal/board missing");
     advisoryChecks++;
+    if (
+      preflight &&
+      (JSON.stringify(packet.preflight?.proposal) !== JSON.stringify(preflightProposal) ||
+        JSON.stringify(packet.preflight?.approval.permissionIds) !== JSON.stringify(["A1"]))
+    )
+      throw new Error("Advisor lost full exact preflight scope/selected permission set");
     if (
       compaction &&
       advisoryChecks === 2 &&
@@ -137,13 +176,16 @@ function latestSnapshot(sessionManager) {
 }
 
 async function loadExtension(settingsManager) {
+  smokeEventBus = createEventBus();
   const loader = new DefaultResourceLoader({
     cwd: sandbox,
     agentDir: sandbox,
     settingsManager,
+    eventBus: smokeEventBus,
     additionalExtensionPaths: [
       extensionPath,
       ...(compaction || interruptCompaction ? [join(sandbox, "compact-fixture.mjs")] : []),
+      ...(asyncExecution ? [join(sandbox, "async-fixture.mjs")] : []),
     ],
   });
   await loader.reload();
@@ -204,6 +246,40 @@ try {
     }
   `,
     );
+  if (asyncExecution)
+    writeFileSync(
+      join(sandbox, "async-fixture.mjs"),
+      `
+      export default function(pi) {
+        let ctx; let state = "running";
+        pi.on("session_start", (_event, context) => { ctx = context; });
+        pi.events.on("subagents:rpc:v1:request", (request) => {
+          const data = request.method === "ping" ? {
+            version: 1,
+            session: { sessionId: ctx.sessionManager.getSessionId(), sessionFile: ctx.sessionManager.getSessionFile() ?? null },
+            events: { asyncComplete: "subagent:async-complete" },
+            capabilities: { asyncStatusSnapshot: { kind: "pi-subagents.async-status-snapshot", version: 1 } },
+          } : { asyncSnapshot: {
+            kind: "pi-subagents.async-status-snapshot", version: 1, generatedAt: Date.now(),
+            omitted: { runs: 0, children: 0, byteLimitExceeded: false },
+            runs: [{ id: "smoke-run-1", kind: "subagent", state }],
+          } };
+          pi.events.emit("subagents:rpc:v1:reply:" + request.requestId, {
+            version: 1, requestId: request.requestId, method: request.method, success: true, data,
+          });
+        });
+        pi.events.on("smoke:complete", () => {
+          state = "complete";
+          pi.events.emit("subagent:async-complete", {
+            sessionId: ctx.sessionManager.getSessionFile() ?? ctx.sessionManager.getSessionId(),
+            runId: "smoke-run-1", success: true,
+          });
+          pi.sendMessage({ customType: "smoke:executor-result", content: "Faux execution completed. Inspect and validate its result.", display: false },
+            { triggerTurn: true, deliverAs: "followUp" });
+        });
+      }
+    `,
+    );
   const settingsManager = SettingsManager.inMemory(
     compaction || interruptCompaction
       ? {
@@ -259,6 +335,27 @@ try {
     "Implementation verified; final acceptance remains. " + "local faux padding ".repeat(350),
   );
   faux.setResponses([
+    ...(preflight
+      ? [
+          (context) => {
+            const plan = latestPreflight(sessionManager);
+            if (
+              !plan ||
+              plan.phase !== "planning" ||
+              context.tools?.some((item) => item.name === "write_tasks")
+            )
+              throw new Error("Planning exposed execution tools or lost human context");
+            return tool(
+              "submit_preflight",
+              { preflightId: plan.preflightId, proposal: preflightProposal },
+              "proposal-only",
+            );
+          },
+          fauxAssistantMessage(
+            "Read-only proposal submitted; awaiting exact human approval and separate start.",
+          ),
+        ]
+      : []),
     tool("write_tasks", {
       mode: "replace",
       phases: [
@@ -279,6 +376,21 @@ try {
     fauxAssistantMessage("Implementation phase prepared; ending this turn."),
     ...(supervised ? [interruptCompaction ? interruptedAdvisory : advisory("guide")] : []),
     tool("get_ready_tasks", { count: 1 }),
+    ...(asyncExecution
+      ? [
+          tool("workflow_gate", {
+            action: "bind_execution",
+            taskId: "t-1.1",
+            executionRef: { source: "pi-subagents", runId: "smoke-run-1" },
+          }),
+          fauxAssistantMessage("Waiting for the existing background execution."),
+          tool("workflow_gate", {
+            action: "clear_execution",
+            taskId: "t-1.1",
+            executionRef: { source: "pi-subagents", runId: "smoke-run-1" },
+          }),
+        ]
+      : []),
     tool("advance_tasks", { transitions: [{ id: "t-1.1" }] }),
     ...(supervised ? [tool("validate_smoke", {}, "implementation-validation")] : []),
     tool("advance_tasks", {
@@ -390,10 +502,44 @@ try {
     if (event.type === "tool_execution_start") toolSequence.push(event.toolName);
   });
 
-  await enableCommand.handler(
-    supervised ? `supervise ${goal}` : "enable",
-    session.extensionRunner.createCommandContext(),
-  );
+  if (preflight) {
+    await enableCommand.handler(
+      `preflight ${goal}`,
+      session.extensionRunner.createCommandContext(),
+    );
+    await waitUntil(
+      () => latestPreflight(sessionManager)?.phase === "awaiting_authorization",
+      "preflight proposal",
+    );
+    await session.waitForIdle();
+    if (latestSupervisor(sessionManager) || latestSnapshot(sessionManager)?.tasks.length)
+      throw new Error("Read-only preflight started execution");
+    const plan = latestPreflight(sessionManager);
+    const starts = agentStarts;
+    await legacyCommand.handler(
+      `approve ${plan.planId} A1`,
+      session.extensionRunner.createCommandContext(),
+    );
+    const approved = latestPreflight(sessionManager);
+    const control = sessionManager
+      .getBranch()
+      .find((entry) => entry.id === approved.approval.controlEntryId);
+    if (
+      agentStarts !== starts ||
+      latestSupervisor(sessionManager) ||
+      approved.phase !== "approved" ||
+      control?.customType !== "continuous-tasks:preflight-control"
+    )
+      throw new Error("Approval dispatched Main or lacked actual control identity");
+    await enableCommand.handler(
+      `start ${plan.planId}`,
+      session.extensionRunner.createCommandContext(),
+    );
+  } else
+    await enableCommand.handler(
+      supervised ? `supervise ${goal}` : "enable",
+      session.extensionRunner.createCommandContext(),
+    );
   await legacyCommand.handler("enable", session.extensionRunner.createCommandContext());
   if (!supervised) await session.prompt("Start the approved task supervisor board.");
   if (interruptCompaction) {
@@ -448,6 +594,33 @@ try {
     if (nativeAbort)
       await legacyCommand.handler("recover", session.extensionRunner.createCommandContext());
   }
+  if (asyncExecution) {
+    await waitUntil(
+      () => latestSupervisor(sessionManager)?.externalWait?.phase === "active",
+      "owned asynchronous wait",
+    );
+    await session.waitForIdle();
+    const waiting = latestSupervisor(sessionManager);
+    if (
+      waiting.status !== "active" ||
+      waiting.reviews !== 1 ||
+      waiting.continuations !== 1 ||
+      waiting.stagnant !== 0 ||
+      advisoryChecks !== 1 ||
+      agentStarts !== 2
+    )
+      throw new Error("Async waiting repeated advisor calls, spent budget, or faulted settlement");
+    if (latestSnapshot(sessionManager)?.tasks[0]?.executionRef?.runId !== "smoke-run-1")
+      throw new Error("Waiting lost the exact execution reference");
+    const beforeStatus = JSON.stringify(sessionManager.getBranch());
+    await enableCommand.handler("status", session.extensionRunner.createCommandContext());
+    if (
+      !taskDetails.includes("External wait: execution pending") ||
+      beforeStatus !== JSON.stringify(sessionManager.getBranch())
+    )
+      throw new Error("Read-only wait status mutated history or lost owner observation");
+    smokeEventBus.emit("smoke:complete");
+  }
   const snapshot = await waitForCompletion(sessionManager);
   await session.agent.waitForIdle();
 
@@ -487,7 +660,7 @@ try {
 
   if (extensionErrors.length > 0)
     throw new Error(`Extension errors: ${JSON.stringify(extensionErrors)}`);
-  if (agentStarts !== (compaction ? 3 : 2))
+  if (agentStarts !== (preflight ? 3 : compaction || asyncExecution ? 3 : 2))
     throw new Error(`Unexpected agent run count: ${agentStarts}`);
   if (completedCompactions !== ((compaction || interruptCompaction) && !ordinaryPause ? 1 : 0))
     throw new Error("Unexpected automatic compaction count");
@@ -507,10 +680,12 @@ try {
     throw new Error("Completed tasks are missing evidence");
   }
   const expectedTools = [
+    ...(preflight ? ["submit_preflight"] : []),
     "write_tasks",
     "edit_tasks",
     "compile_tasks",
     "get_ready_tasks",
+    ...(asyncExecution ? ["workflow_gate", "workflow_gate"] : []),
     "advance_tasks",
     ...(supervised ? ["validate_smoke"] : []),
     "advance_tasks",
@@ -632,17 +807,23 @@ try {
   console.log(
     JSON.stringify({
       result: "PASS",
-      mode: ordinaryPause
-        ? "supervised-ordinary-pause"
-        : nativeAbort
-          ? "supervised-native-abort"
-          : interruptCompaction
-            ? "supervised-interrupted-compaction"
-            : compaction
-              ? "supervised-compaction"
-              : supervised
-                ? "supervised"
-                : "board-only",
+      preflightApprovedAndSeparatelyStarted: preflight,
+      preflightOptionalPermissionNotGranted: preflight,
+      mode: preflight
+        ? "supervised-preflight"
+        : asyncExecution
+          ? "supervised-async-execution"
+          : ordinaryPause
+            ? "supervised-ordinary-pause"
+            : nativeAbort
+              ? "supervised-native-abort"
+              : interruptCompaction
+                ? "supervised-interrupted-compaction"
+                : compaction
+                  ? "supervised-compaction"
+                  : supervised
+                    ? "supervised"
+                    : "board-only",
       completedCompactions,
       supervisorAccepted: supervised,
       sessionId: sessionManager.getSessionId(),
