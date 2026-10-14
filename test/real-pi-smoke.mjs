@@ -283,7 +283,9 @@ try {
   const settingsManager = SettingsManager.inMemory(
     compaction || interruptCompaction
       ? {
-          compaction: { enabled: compaction, reserveTokens: 4096, keepRecentTokens: 128 },
+          // Arm automatic compaction only after the fixture has bound validation.
+          // Pi 1.2 also checks thresholds between turns, before the next assistant response.
+          compaction: { enabled: false, reserveTokens: 4096, keepRecentTokens: 128 },
         }
       : {},
   );
@@ -486,6 +488,15 @@ try {
   let agentStarts = 0;
   const toolSequence = [];
   session.subscribe((event) => {
+    if (
+      compaction &&
+      completedCompactions === 0 &&
+      event.type === "tool_execution_end" &&
+      event.toolName === "advance_tasks" &&
+      latestSnapshot(sessionManager)?.tasks[0]?.status === "done" &&
+      latestSupervisor(sessionManager)?.bindings.some((binding) => binding.taskId === "t-1.1")
+    )
+      settingsManager.setCompactionEnabled(true);
     if (event.type === "agent_start") agentStarts++;
     if (event.type === "compaction_end") {
       if (!event.result || event.aborted || event.willRetry || event.errorMessage)
