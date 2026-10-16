@@ -7,6 +7,10 @@ import { fauxAssistantMessage, fauxProvider, fauxToolCall } from "@earendil-work
 import { Type } from "typebox";
 import { stripTerminalSequences, visibleWidth } from "@earendil-works/pi-tui";
 
+const longReceipts = process.argv.includes("--long-receipts");
+const receiptReadCount = longReceipts ? Number(process.env.PI_RECEIPT_SMOKE_COUNT ?? 1000) : 0;
+if (!Number.isSafeInteger(receiptReadCount) || receiptReadCount < 0 || receiptReadCount > 1000)
+  throw new Error("Invalid bounded smoke read count");
 const preflight = process.argv.includes("--preflight");
 const asyncExecution = process.argv.includes("--async-execution");
 const compaction = process.argv.includes("--compaction");
@@ -16,6 +20,7 @@ const interruptCompaction =
   process.argv.includes("--interrupt-compaction") || nativeAbort || ordinaryPause;
 const supervised =
   process.argv.includes("--supervised") ||
+  longReceipts ||
   compaction ||
   interruptCompaction ||
   asyncExecution ||
@@ -77,6 +82,9 @@ const extensionPath = join(packageRoot, "src", "index.ts");
 const sandbox = mkdtempSync(join(tmpdir(), "pi-task-supervisor-smoke-"));
 const realSettings = join(homedir(), ".pi", "agent", "settings.json");
 const previousAgentDir = process.env.PI_CODING_AGENT_DIR;
+const previousArgv = process.argv;
+const ttyDescriptors = [process.stdin, process.stdout].map((stream) => Object.getOwnPropertyDescriptor(stream, "isTTY"));
+let preflightApprovalEnabled = false;
 let session;
 
 function digest(path) {
@@ -90,10 +98,25 @@ function tool(name, args, id) {
 }
 
 function latestSupervisor(manager) {
-  return [...manager.getBranch()]
+  const branch = manager.getBranch();
+  const state = [...branch]
     .reverse()
-    .find((entry) => entry.type === "custom" && entry.customType === "continuous-tasks:supervisor")
-    ?.data;
+    .find(
+      (entry) => entry.type === "custom" && entry.customType === "continuous-tasks:supervisor",
+    )?.data;
+  if (state?.version !== 3) return state;
+  // Inspection only. The extension validates actual ledger/checkpoint closure on recovery.
+  const base = state.receiptLedger.legacyBase;
+  const receipts = base ? [...branch.find((entry) => entry.id === base.entryId).data.receipts] : [];
+  const records = branch.filter(
+    (entry) =>
+      entry.type === "custom" &&
+      entry.customType === "continuous-tasks:receipt-ledger" &&
+      entry.data.sessionId === state.sessionId &&
+      entry.data.goalId === state.receiptLedger.goalId,
+  );
+  for (const entry of records) if (entry.data.kind === "receipt") receipts.push(entry.data.receipt);
+  return { ...state, epoch: records.at(-1)?.data.epoch ?? state.epoch, receipts };
 }
 
 function advisory(action) {
@@ -193,7 +216,7 @@ async function loadExtension(settingsManager) {
 }
 
 async function waitForCompletion(sessionManager) {
-  for (let attempt = 0; attempt < 500; attempt++) {
+  for (let attempt = 0; attempt < (longReceipts ? 5000 : 500); attempt++) {
     const snapshot = latestSnapshot(sessionManager);
     if (
       snapshot?.workflowStatus === "completed" &&
@@ -217,6 +240,14 @@ const settingsDigestBefore = digest(realSettings);
 process.env.PI_CODING_AGENT_DIR = sandbox;
 
 try {
+  if (preflight) {
+    // Explicit source-boundary mechanism simulation only, NOT a real CLI/human positive.
+    // The separate real double-TTY SDK-negative and actual CLI/PTY tests stay unchanged.
+    const sdkRoot = dirname(dirname(fileURLToPath(import.meta.resolve("@earendil-works/pi-coding-agent"))));
+    process.argv = [process.execPath, join(sdkRoot, "dist", "cli.js"), ...previousArgv.slice(2)];
+    for (const stream of [process.stdin, process.stdout]) Object.defineProperty(stream, "isTTY", { configurable: true, value: true });
+    console.log("PREFLIGHT SDK SOURCE-BOUNDARY SIMULATION (argv/TTY/UI mocked; not native CLI or human proof)");
+  }
   const sessionManager = SessionManager.create(sandbox, join(sandbox, "sessions"));
   writeFileSync(
     join(sandbox, "continuous-tasks.json"),
@@ -231,10 +262,11 @@ try {
     writeFileSync(
       join(sandbox, "compact-fixture.mjs"),
       `
+    ${latestSupervisor.toString()}
     export default function (pi) {
       pi.on("session_before_compact", (event) => {
         if (event.reason !== ${JSON.stringify(interruptCompaction ? "manual" : "threshold")} || event.willRetry) throw new Error("Unexpected smoke compaction trigger");
-        const state = [...event.branchEntries].reverse().find((entry) => entry.type === "custom" && entry.customType === "continuous-tasks:supervisor")?.data;
+        const state = latestSupervisor({ getBranch: () => event.branchEntries });
         if (state?.goal !== ${JSON.stringify(goal)} || state.receipts.length !== ${interruptCompaction ? 0 : 1} || state.bindings.length !== ${interruptCompaction ? 0 : 1})
           throw new Error("Durable supervised evidence was not ready before compaction");
         return { compaction: {
@@ -328,6 +360,16 @@ try {
       structuredContent: { exit_code: 0 },
     }),
   };
+  const readTool = {
+    name: "read",
+    label: "Inspect receipt fixture",
+    description: "Pure isolated fixture read",
+    parameters: Type.Object({}),
+    execute: async () => ({
+      content: [{ type: "text", text: "Isolated read-only fixture" }],
+      details: {},
+    }),
+  };
   const faux = fauxProvider({
     provider: "pi-task-supervisor-faux",
     models: [{ id: "test", contextWindow: compaction ? 8192 : 128000 }],
@@ -395,6 +437,7 @@ try {
       : []),
     tool("advance_tasks", { transitions: [{ id: "t-1.1" }] }),
     ...(supervised ? [tool("validate_smoke", {}, "implementation-validation")] : []),
+    ...Array.from({ length: receiptReadCount }, (_, i) => tool("read", {}, `history-${i}`)),
     tool("advance_tasks", {
       transitions: [{ id: "t-1.1", evidence: proof("implementation-validation") }],
     }),
@@ -421,7 +464,7 @@ try {
     settingsManager,
     sessionManager,
     noTools: "builtin",
-    customTools: supervised ? [validationTool] : [],
+    customTools: supervised ? [validationTool, ...(longReceipts ? [readTool] : [])] : [],
   });
   if (created.extensionsResult.errors.length > 0) {
     throw new Error(`Extension load failed: ${JSON.stringify(created.extensionsResult.errors)}`);
@@ -440,6 +483,8 @@ try {
     },
     async select(_title, options) {
       listOptions = options;
+      if (preflight && options.includes("Approve") && options.includes("Defer")) return preflightApprovalEnabled ? "Approve" : "Defer";
+      if (preflight && options.includes("Start execution")) return "Start execution";
       return options[0];
     },
     setWidget(key, content, options) {
@@ -527,6 +572,7 @@ try {
       throw new Error("Read-only preflight started execution");
     const plan = latestPreflight(sessionManager);
     const starts = agentStarts;
+    preflightApprovalEnabled = true;
     await legacyCommand.handler(
       `approve ${plan.planId} A1`,
       session.extensionRunner.createCommandContext(),
@@ -699,6 +745,7 @@ try {
     ...(asyncExecution ? ["workflow_gate", "workflow_gate"] : []),
     "advance_tasks",
     ...(supervised ? ["validate_smoke"] : []),
+    ...Array.from({ length: receiptReadCount }, () => "read"),
     "advance_tasks",
     "get_ready_tasks",
     "advance_tasks",
@@ -718,7 +765,7 @@ try {
       state?.status !== "completed" ||
       state.reviews !== (compaction ? 3 : nativeAbort ? 1 : 2) ||
       state.continuations !== (compaction ? 2 : interruptCompaction ? 0 : 1) ||
-      state.receipts.length !== 2 ||
+      state.receipts.length !== 2 + receiptReadCount ||
       state.bindings.length !== 2
     )
       throw new Error(`Incorrect supervisor completion: ${JSON.stringify(state)}`);
@@ -782,8 +829,9 @@ try {
   await session.bindExtensions(uiBindings);
   if (widgetLines.some((line) => line.includes("Supervisor:")))
     throw new Error("Forked widget inherited the source supervisor");
-  if (!session.extensionRunner.getActiveTools().includes("workflow_gate")) {
-    throw new Error("Forking the session did not inherit activated task tools");
+  const forkActivated = session.extensionRunner.getActiveTools().includes("workflow_gate");
+  if (preflight ? forkActivated : !forkActivated) {
+    throw new Error(preflight ? "Fork inherited source-session native approval/activation" : "Forking the session did not inherit activated task tools");
   }
   if (supervised) {
     const gate = await session.extensionRunner.emitToolCall({
@@ -792,7 +840,9 @@ try {
       toolCallId: "fork-probe",
       input: { mode: "append" },
     });
-    if (gate?.block) throw new Error("Fork improperly inherited the source session's supervisor");
+    if (preflight) {
+      if (!gate?.block || !/journal|session|preflight/i.test(gate.reason)) throw new Error("Fork accepted source-session native authorization");
+    } else if (gate?.block) throw new Error("Fork improperly inherited the source session's supervisor");
   }
 
   session.dispose();
@@ -820,21 +870,23 @@ try {
       result: "PASS",
       preflightApprovedAndSeparatelyStarted: preflight,
       preflightOptionalPermissionNotGranted: preflight,
-      mode: preflight
-        ? "supervised-preflight"
-        : asyncExecution
-          ? "supervised-async-execution"
-          : ordinaryPause
-            ? "supervised-ordinary-pause"
-            : nativeAbort
-              ? "supervised-native-abort"
-              : interruptCompaction
-                ? "supervised-interrupted-compaction"
-                : compaction
-                  ? "supervised-compaction"
-                  : supervised
-                    ? "supervised"
-                    : "board-only",
+      mode: longReceipts
+        ? "supervised-long-receipts"
+        : preflight
+          ? "supervised-preflight"
+          : asyncExecution
+            ? "supervised-async-execution"
+            : ordinaryPause
+              ? "supervised-ordinary-pause"
+              : nativeAbort
+                ? "supervised-native-abort"
+                : interruptCompaction
+                  ? "supervised-interrupted-compaction"
+                  : compaction
+                    ? "supervised-compaction"
+                    : supervised
+                      ? "supervised"
+                      : "board-only",
       completedCompactions,
       supervisorAccepted: supervised,
       sessionId: sessionManager.getSessionId(),
@@ -848,10 +900,13 @@ try {
       boundedTaskWidgetLifecycle: true,
       readOnlyFullTaskList: true,
       uiStubNotRealTerminal: true,
+      preflightSourceBoundarySimulated: preflight,
+      productionHumanProof: false,
       resumedActivation: true,
       resumedSupervisorAcceptance: supervised,
       forkSupervisorNotInherited: supervised,
-      forkedActivation: true,
+      forkedActivation: !preflight,
+      nativePreflightForkDenied: preflight,
       independentDefaultDeny: true,
       realSettingsUntouched: true,
     }),
@@ -861,5 +916,7 @@ try {
   session?.dispose();
   if (previousAgentDir === undefined) delete process.env.PI_CODING_AGENT_DIR;
   else process.env.PI_CODING_AGENT_DIR = previousAgentDir;
+  process.argv = previousArgv;
+  if (preflight) [process.stdin, process.stdout].forEach((stream, i) => { const descriptor = ttyDescriptors[i]; if (descriptor) Object.defineProperty(stream, "isTTY", descriptor); else Reflect.deleteProperty(stream, "isTTY"); });
   rmSync(sandbox, { recursive: true, force: true });
 }

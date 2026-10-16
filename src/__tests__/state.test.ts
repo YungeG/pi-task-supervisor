@@ -132,24 +132,15 @@ describe("state", () => {
       expect(board.tasks.length).toBe(snapshot.tasks.length);
     });
 
-    it("skips entries with invalid snapshot data", () => {
-      const validSnapshot = makeSampleBoard();
-      const branch = [
-        snapshotEntry({ version: 2 }), // wrong version
-        snapshotEntry(null), // null data
-        snapshotEntry(undefined), // undefined data
-        snapshotEntry({}), // missing fields
-        snapshotEntry({ version: 1, tasks: "not-array", phases: [] }), // invalid tasks
-        snapshotEntry(validSnapshot),
-      ];
+    it.each([{ version: 2 }, null, undefined, {}, { version: 1, tasks: "not-array", phases: [] }])(
+      "fails closed on recognized invalid snapshot %j even before a valid entry",
+      (invalid) => {
+        const ctx = createMockContext([snapshotEntry(invalid), snapshotEntry(makeSampleBoard())]);
+        expect(() => reconstructState(ctx)).toThrow(/board snapshot/);
+      },
+    );
 
-      const ctx = createMockContext(branch);
-      const board = reconstructState(ctx);
-
-      expect(board.tasks.length).toBe(validSnapshot.tasks.length);
-    });
-
-    it("returns empty board when all snapshots are invalid", () => {
+    it("does not reinterpret invalid history as an empty mutable board", () => {
       const branch = [
         snapshotEntry({ version: 2 }),
         snapshotEntry(null),
@@ -157,9 +148,26 @@ describe("state", () => {
       ];
 
       const ctx = createMockContext(branch);
-      const board = reconstructState(ctx);
+      expect(() => reconstructState(ctx)).toThrow(/board snapshot/);
+    });
 
-      expect(board).toEqual(createEmptyBoard());
+    it("does not reopen an older board when a newer decision has an unknown spec", () => {
+      const older = makeSampleBoard();
+      const unknown = {
+        ...makeSampleBoard({ generation: 2 }),
+        workflowStatus: "waiting_for_decision",
+        decision: {
+          id: "new-question",
+          taskId: "t-2.1",
+          question: "Approve?",
+          whyUserOwned: "Scope changed",
+          createdAt: "now",
+          spec: { version: 99, kind: "authorization", scope: "new scope", prohibitions: [] },
+        },
+      };
+      expect(() =>
+        reconstructState(createMockContext([snapshotEntry(older), snapshotEntry(unknown)])),
+      ).toThrow(/board snapshot/i);
     });
 
     it("returns a deep copy (mutations don't affect cached entry)", () => {

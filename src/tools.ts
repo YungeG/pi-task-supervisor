@@ -1,4 +1,8 @@
 import { Text } from "@earendil-works/pi-tui";
+import { randomUUID } from "node:crypto";
+import { validDecisionSpec, type DecisionSpec } from "./decision-spec";
+import { answerBoardDecision, canReplaceBoardDecision } from "./board-human";
+import { currentRuntime } from "./runtime";
 import type {
   ToolDefinition,
   ExtensionAPI,
@@ -20,25 +24,15 @@ import {
   TERMINAL_STATUSES,
   ACTIVE_STATUSES,
 } from "./types";
-import type {
-  AdvanceEdit,
-  CompletionEvidence,
-  TaskBoardSnapshot,
-  TaskEdit,
-  TaskWorkflowEvent,
-} from "./types";
+import type { AdvanceEdit, TaskBoardSnapshot, TaskEdit, TaskWorkflowEvent } from "./types";
 import { writeTasks, applyEdits, compileBoard, createEmptyBoard, claimReadyTasks } from "./engine";
 import { cloneBoard, getStatusCounts, isSafeBoundedText } from "./validation";
 import { getBoardRef, setBoard, persistEntries, updateUI } from "./state";
 import { loadConfig, resolvePhasePrompt } from "./config";
 import { assertObservedEvidence, bindCompletion } from "./supervisor";
 import { isSessionScopeEnabled } from "./scope";
-import {
-  SubmitPreflightParams,
-  submitPreflight,
-  validPreflightSubmission,
-  type PreflightState,
-} from "./preflight";
+import { submitAndPresentPreflight, type PreflightHumanResult } from "./preflight-human";
+import { SubmitPreflightParams, validPreflightSubmission } from "./preflight";
 import {
   formatBoardText,
   formatSummaryLine,
@@ -145,7 +139,10 @@ function renderColoredBoardResult(text: string, _snapshot: TaskBoardSnapshot, th
 
 export function createSubmitPreflightTool(
   pi: ExtensionAPI,
-): ToolDefinition<typeof SubmitPreflightParams, { state?: PreflightState; error?: string }> {
+): ToolDefinition<
+  typeof SubmitPreflightParams,
+  Partial<PreflightHumanResult> & { error?: string }
+> {
   return {
     name: "submit_preflight",
     label: "Submit Preflight",
@@ -154,21 +151,24 @@ export function createSubmitPreflightTool(
     parameters: SubmitPreflightParams,
     promptSnippet:
       "Submit a complete read-only preflight proposal; only the user can approve and separately start it.",
-    execute(_id, params, signal, _onUpdate, ctx) {
+    async execute(_id, params, signal, _onUpdate, ctx) {
       try {
         if (signal?.aborted) throw new Error("Preflight submission cancelled");
         if (!validPreflightSubmission(params))
           throw new Error("Invalid preflight submission; approval/status fields are not accepted");
-        const state = submitPreflight(pi, ctx, params.preflightId, params.proposal);
-        return Promise.resolve({
-          content: [
-            {
-              type: "text" as const,
-              text: `Preflight ${state.phase}; plan ${state.planId}; digest ${state.planDigest}\n${JSON.stringify(state.proposal)}\nHuman action: /task-supervisor approve ${state.planId} <all|none|IDs>. Approval does not start execution.`,
-            },
-          ],
-          details: { state },
-        });
+        const outcome = await submitAndPresentPreflight(
+          pi,
+          ctx,
+          _id,
+          params.preflightId,
+          params.proposal,
+          signal,
+        );
+        return {
+          content: [{ type: "text" as const, text: JSON.stringify(outcome) }],
+          details: outcome,
+          ...(outcome.projectionPending ? { isError: true } : {}),
+        };
       } catch (error) {
         const message = error instanceof Error ? error.message : "Preflight submission failed";
         return Promise.resolve({
@@ -638,9 +638,7 @@ export function createAdvanceTasksTool(
         type: "advance" as const,
         // SDK StringEnum uses its host TypeBox's TUnsafe; keep the existing wire contract.
         // Runtime argument/engine/evidence validation remains unchanged below.
-        data: transition.evidence
-          ? { evidence: transition.evidence as CompletionEvidence }
-          : undefined,
+        data: transition.evidence ? { evidence: transition.evidence } : undefined,
       }));
 
       try {
@@ -699,7 +697,13 @@ export function createAdvanceTasksTool(
 type WorkflowGateInput = {
   action: "wait_for_decision" | "bind_execution" | "clear_execution";
   taskId?: string;
-  decision?: { question: string; whyUserOwned: string; options?: string[] };
+  decision?: {
+    question: string;
+    whyUserOwned: string;
+    options?: string[];
+    spec?: DecisionSpec;
+    supersedes?: string;
+  };
   executionRef?: { source: "pi-subagents" | "workflow"; runId: string };
 };
 
@@ -712,22 +716,35 @@ function gateTask(board: Readonly<TaskBoardSnapshot>, taskId: string | undefined
   return task;
 }
 
+function gateDecision(params: WorkflowGateInput): NonNullable<WorkflowGateInput["decision"]> {
+  const decision = params.decision;
+  if (!decision) throw new Error("decision is required");
+  if (!decision.spec || !validDecisionSpec(decision.spec))
+    throw new Error("Invalid structured decision scope");
+  if (decision.spec.kind === "choice" && !decision.options?.length)
+    throw new Error("Choice decision requires options");
+  if (
+    !isSafeBoundedText(decision.question, 1000) ||
+    !isSafeBoundedText(decision.whyUserOwned, 1000) ||
+    (decision.options ?? []).length > 10 ||
+    (decision.options ?? []).some((option) => !isSafeBoundedText(option, 500))
+  ) {
+    throw new Error("Decision content is invalid or secret-like");
+  }
+  return decision;
+}
+
 function waitForDecision(
   board: Readonly<TaskBoardSnapshot>,
   params: WorkflowGateInput,
   now: string,
 ): GateResult {
   const task = gateTask(board, params.taskId);
-  const decision = params.decision;
-  if (!decision) throw new Error("decision is required");
-  if (
-    !isSafeBoundedText(decision.question, 1000) ||
-    !isSafeBoundedText(decision.whyUserOwned, 1000) ||
-    (decision.options?.length ?? 0) > 10 ||
-    (decision.options?.some((option) => !isSafeBoundedText(option, 500)) ?? false)
-  ) {
-    throw new Error("Decision content is invalid or secret-like");
-  }
+  const decision = gateDecision(params);
+  if (board.workflowStatus === "waiting_for_decision" && !canReplaceBoardDecision(board, params))
+    throw new Error(
+      "Replacement must name the current decision and task with a complete structured proposal",
+    );
   const actionable = board.tasks.filter((candidate) =>
     ["ready", "implementing", "reviewing"].includes(candidate.status),
   );
@@ -738,7 +755,9 @@ function waitForDecision(
   }
   const updated = cloneBoard(board);
   const record = {
-    id: `decision-${board.generation + 1}`,
+    id: decision.spec ? `decision-${randomUUID()}` : `decision-${board.generation + 1}`,
+    ...(decision.spec ? { spec: structuredClone(decision.spec) } : {}),
+    ...(decision.supersedes ? { supersedes: decision.supersedes } : {}),
     taskId: task.id,
     question: decision.question,
     whyUserOwned: decision.whyUserOwned,
@@ -802,6 +821,17 @@ function clearExecution(board: Readonly<TaskBoardSnapshot>, params: WorkflowGate
   };
 }
 
+function persistWorkflowGate(pi: ExtensionAPI, result: GateResult): void {
+  try {
+    persistEntries(pi, result.event, result.board);
+  } catch {
+    currentRuntime().journalFault =
+      "Workflow gate persistence failed; inspect journal before further mutation";
+    currentRuntime().cancel();
+    throw new Error(currentRuntime().journalFault);
+  }
+}
+
 function applyWorkflowGate(
   board: Readonly<TaskBoardSnapshot>,
   params: WorkflowGateInput,
@@ -832,23 +862,36 @@ export function createWorkflowGateTool(
     parameters: WorkflowGateParams,
     promptSnippet: "workflow_gate: wait for a user decision or bind an existing execution receipt",
     promptGuidelines: [
-      "Use workflow_gate wait_for_decision only for a material user-owned decision after independent ready work is exhausted.",
+      "Use workflow_gate wait_for_decision only for a material user-owned decision after independent ready work is exhausted. Include spec version 1: authorization with scope/prohibitions, choice with exact options, or information with text/integer/date format. This is a proposal, never approval.",
+      "For a legacy or rejected waiting gate submit the complete replacement with supersedes=current decision ID and the same task. Only its metadata changes; request a new native response through /task-supervisor decide, never claim chat text resolved it.",
       "Use workflow_gate bind_execution immediately after launching a writer so later continuations inspect rather than duplicate it.",
     ],
 
-    // eslint-disable-next-line @typescript-eslint/require-await
     async execute(_toolCallId, params, _signal, _onUpdate, ctx) {
       const board = getBoardRef();
-      if (board.workflowStatus !== "active") {
-        return makeErrorResult("Workflow must be active", board);
+      const journalFault = currentRuntime().journalFault;
+      if (journalFault) return makeErrorResult(journalFault, board);
+      const replacing = canReplaceBoardDecision(board, params);
+      if (board.workflowStatus !== "active" && !replacing) {
+        return makeErrorResult("Workflow must be active or a complete decision replacement", board);
       }
       const now = new Date().toISOString();
       try {
         const result = applyWorkflowGate(board, params, now);
+        persistWorkflowGate(pi, result);
         setBoard(result.board);
-        persistEntries(pi, result.event, result.board);
         updateUI(ctx, result.board);
-        return makeSuccessResult(`Workflow gate applied: ${params.action}`, result.board);
+        const status =
+          params.action === "wait_for_decision" && !replacing
+            ? await answerBoardDecision(pi, ctx, _signal)
+            : undefined;
+        return {
+          ...makeSuccessResult(
+            `Workflow gate applied: ${params.action}${status ? `; human result: ${JSON.stringify(status)}` : ""}. A native approval is not task acceptance.`,
+            getBoardRef(),
+          ),
+          ...(status?.projectionPending ? { isError: true } : {}),
+        };
       } catch (error) {
         return makeErrorResult(error instanceof Error ? error.message : String(error), board);
       }

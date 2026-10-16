@@ -2,6 +2,7 @@ import { beforeEach, describe, expect, it } from "vitest";
 import { formatContinuePrompt } from "../formatting";
 import { createWorkflowGateTool } from "../tools";
 import { getBoard, resetState, setBoard } from "../state";
+import { currentRuntime } from "../runtime";
 import type { TaskBoardSnapshot } from "../types";
 import { isValidSnapshotV2 } from "../validation";
 import { createMockAPI, createMockContext } from "./helpers/mocks";
@@ -50,6 +51,7 @@ describe("workflow_gate", () => {
         decision: {
           question: "Which compatibility policy should be used?",
           whyUserOwned: "This changes the supported product contract",
+          spec: { version: 1, kind: "choice" },
           options: ["strict", "compatible"],
         },
       },
@@ -62,12 +64,54 @@ describe("workflow_gate", () => {
     expect(result.details.snapshot).toMatchObject({
       workflowStatus: "waiting_for_decision",
       decision: {
-        id: "decision-6",
+        id: expect.stringMatching(/^decision-[a-f0-9-]{36}$/),
         taskId: "t-1.1",
         question: "Which compatibility policy should be used?",
       },
     });
     expect(getBoard().workflowStatus).toBe("waiting_for_decision");
+  });
+
+  it("holds all later mutations when a waiting proposal snapshot write fails", async () => {
+    const mockAPI = createMockAPI();
+    const tool = createWorkflowGateTool(mockAPI.api);
+    setBoard(board("implementing"));
+    mockAPI.appendEntry
+      .mockImplementationOnce(() => undefined)
+      .mockImplementationOnce(() => {
+        throw new Error("disk full after memory leaf update");
+      });
+    const result = await tool.execute(
+      "proposal",
+      {
+        action: "wait_for_decision",
+        taskId: "t-1.1",
+        decision: {
+          question: "Approve?",
+          whyUserOwned: "new scope",
+          spec: { version: 1, kind: "authorization", scope: "Local changes", prohibitions: [] },
+        },
+      },
+      undefined,
+      undefined,
+      createMockContext(),
+    );
+    expect(result.isError).toBe(true);
+    expect(currentRuntime().journalFault).toMatch(/persistence/i);
+    const later = await tool.execute(
+      "later",
+      {
+        action: "bind_execution",
+        taskId: "t-1.1",
+        executionRef: { source: "workflow", runId: "must-not-bind" },
+      },
+      undefined,
+      undefined,
+      createMockContext(),
+    );
+    expect(later.isError).toBe(true);
+    expect(getBoard().tasks[0]!.executionRef).toBeUndefined();
+    expect(mockAPI.appendEntry).toHaveBeenCalledTimes(2);
   });
 
   it("rejects waiting while another independent task remains actionable", async () => {
@@ -93,6 +137,7 @@ describe("workflow_gate", () => {
         decision: {
           question: "Choose",
           whyUserOwned: "Product decision",
+          spec: { version: 1, kind: "information", format: "text" },
         },
       },
       undefined,

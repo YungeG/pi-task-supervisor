@@ -73,7 +73,7 @@ describe("preflight lifecycle authorization boundary", () => {
       0,
     );
   });
-  it("shows the authorization prerequisite before a decision command it would reject", async () => {
+  it("shows the authorization prerequisite before native decision guidance without bypassing either gate", async () => {
     const h = await started();
     setBoard(activeBoard());
     await createGetReadyTasksTool(h.mock.api).execute(
@@ -83,7 +83,7 @@ describe("preflight lifecycle authorization boundary", () => {
       undefined,
       h.ctx,
     );
-    await createWorkflowGateTool(h.mock.api).execute(
+    const result = await createWorkflowGateTool(h.mock.api).execute(
       "decision",
       {
         action: "wait_for_decision",
@@ -92,12 +92,15 @@ describe("preflight lifecycle authorization boundary", () => {
           question: "Choose a local path",
           whyUserOwned: "Only the user chooses the scope",
           options: ["A", "B"],
+          spec: { version: 1, kind: "choice" },
         },
       },
       undefined,
       undefined,
       h.ctx,
     );
+    expect(result.isError).not.toBe(true);
+    expect(getBoard().decision?.spec).toEqual({ version: 1, kind: "choice" });
     const decision = getBoard().decision!;
     const id = currentRuntime().preflight!.planId;
     await h.command(`revoke ${id}`);
@@ -116,7 +119,9 @@ describe("preflight lifecycle authorization boundary", () => {
     await h.command(`approve ${id} A1`);
     await h.command("status");
     expect(h.ctx.ui.notify).toHaveBeenLastCalledWith(
-      expect.stringContaining(`Next: /task-supervisor resolve ${decision.id}`),
+      expect.stringContaining(
+        "Next: /task-supervisor decide (native response; no ID or chat approval)",
+      ),
       "info",
     );
   });
@@ -304,6 +309,7 @@ describe("preflight lifecycle authorization boundary", () => {
     await h.fire("session_tree");
     expect(currentRuntime().preflight).toBeUndefined();
     vi.mocked(h.ctx.sessionManager.getSessionId).mockReturnValue("test-session");
+    await h.fire("session_tree");
     await h.command("preflight Replacement goal");
     h.mock.sendMessage.mockClear();
     await h.fire("session_tree");

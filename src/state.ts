@@ -34,9 +34,17 @@ export function getBoardRef(): Readonly<TaskBoardSnapshot> {
 export function resetState(): void {
   currentRuntime().board = createEmptyBoard();
   currentRuntime().supervisor = undefined;
+  currentRuntime().receiptStore = undefined;
+  currentRuntime().receiptIdentity = undefined;
   currentRuntime().preflight = undefined;
   currentRuntime().journalFault = undefined;
+  currentRuntime().preflightRepair = undefined;
+  currentRuntime().boardRepair = undefined;
   currentRuntime().manualPauseDepth = 0;
+  currentRuntime().boardHumanContext = undefined;
+  currentRuntime().humanEpoch++;
+  currentRuntime().humanAbort?.abort();
+  currentRuntime().humanAbort = undefined;
 }
 
 // ── State Reconstruction ──
@@ -58,7 +66,7 @@ function migrateLegacySnapshot(snapshot: LegacyTaskBoardSnapshot): TaskBoardSnap
 /**
  * Reconstructs board state from session history.
  * Reads local version-2 snapshots and one-way migrates pinned upstream version-1 snapshots.
- * Falls back to empty board if no valid snapshot is found.
+ * Empty history is inactive; recognized but invalid snapshots fail closed.
  */
 export function reconstructState(ctx: ExtensionContext): TaskBoardSnapshot {
   const branch = ctx.sessionManager.getBranch();
@@ -69,13 +77,16 @@ export function reconstructState(ctx: ExtensionContext): TaskBoardSnapshot {
     if (entry.type !== "custom") continue;
     const customType = (entry as { customType?: string }).customType;
     const data = (entry as { data?: unknown }).data;
-    if (customType === LEGACY_CUSTOM_SNAPSHOT_TYPE && isValidLegacySnapshot(data)) {
-      if (latestV2) return createEmptyBoard();
+    if (customType === LEGACY_CUSTOM_SNAPSHOT_TYPE) {
+      if (latestV2 || !isValidLegacySnapshot(data))
+        throw new Error("Invalid or downgraded board snapshot");
       latestLegacy = structuredClone(data);
       continue;
     }
-    if (customType !== CUSTOM_SNAPSHOT_TYPE || !isValidSnapshotV2(data)) continue;
-    if (latestV2 && data.generation <= latestV2.generation) return createEmptyBoard();
+    if (customType !== CUSTOM_SNAPSHOT_TYPE) continue;
+    if (!isValidSnapshotV2(data)) throw new Error("Invalid or unknown-version board snapshot");
+    if (latestV2 && data.generation <= latestV2.generation)
+      throw new Error("Non-monotonic board snapshot");
     latestV2 = cloneBoard(data);
   }
 

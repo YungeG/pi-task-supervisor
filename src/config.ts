@@ -1,6 +1,7 @@
 import { readFile } from "node:fs/promises";
 import { homedir } from "node:os";
 import { join, resolve } from "node:path";
+import { DEFAULT_RECEIPT_CACHE, type ReceiptCacheConfig } from "./receipt-store";
 
 export interface ContinuousTasksConfig {
   /** Legacy setting, parsed for compatibility; native boundaries do not use a countdown. */
@@ -8,12 +9,14 @@ export interface ContinuousTasksConfig {
   maxStagnantSettles: number;
   requireCompletionEvidence: boolean;
   phaseCompletionPromptTemplate?: string;
+  receiptCache?: ReceiptCacheConfig;
 }
 
 export const DEFAULT_CONFIG: ContinuousTasksConfig = {
   countdownMs: 3000,
   maxStagnantSettles: 5,
   requireCompletionEvidence: true,
+  receiptCache: { ...DEFAULT_RECEIPT_CACHE },
 };
 
 let cachedConfig: ContinuousTasksConfig | null = null;
@@ -48,9 +51,26 @@ function decodeConfig(value: unknown): ContinuousTasksConfig | null {
   const requireCompletionEvidence =
     input.requireCompletionEvidence ?? DEFAULT_CONFIG.requireCompletionEvidence;
   const phaseCompletionPromptTemplate = input.phaseCompletionPromptTemplate;
+  const cache = input.receiptCache === undefined ? DEFAULT_RECEIPT_CACHE : input.receiptCache;
+  if (typeof cache !== "object" || cache === null) return null;
+  const cacheInput = cache as Record<string, unknown>;
+  const maxEntries = boundedInteger(
+    cacheInput.maxEntries,
+    DEFAULT_RECEIPT_CACHE.maxEntries,
+    1,
+    4096,
+  );
+  const maxBytes = boundedInteger(
+    cacheInput.maxBytes,
+    DEFAULT_RECEIPT_CACHE.maxBytes,
+    16_384,
+    67_108_864,
+  );
   if (
     countdownMs === null ||
     maxStagnantSettles === null ||
+    maxEntries === null ||
+    maxBytes === null ||
     typeof requireCompletionEvidence !== "boolean" ||
     (phaseCompletionPromptTemplate !== undefined &&
       (typeof phaseCompletionPromptTemplate !== "string" ||
@@ -64,6 +84,7 @@ function decodeConfig(value: unknown): ContinuousTasksConfig | null {
     maxStagnantSettles,
     requireCompletionEvidence,
     phaseCompletionPromptTemplate,
+    receiptCache: { maxEntries, maxBytes },
   };
 }
 

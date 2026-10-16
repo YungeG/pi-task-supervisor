@@ -29,6 +29,7 @@ async function decisionGate(h: ReturnType<typeof lifecycle>) {
       decision: {
         question: "Which local delivery scope is approved?",
         whyUserOwned: "The user must select the delivery scope",
+        spec: { version: 1, kind: "choice" },
         options: ["A: documentation", "B: local implementation"],
       },
     },
@@ -73,20 +74,17 @@ describe("supervised human decision settlement", () => {
     });
   });
 
-  it("resumes once after the exact user decision without an unnecessary recover", async () => {
+  it("does not resume an untyped legacy gate from an exact ID and bare answer", async () => {
     const h = await supervisedWait();
-    const decision = getBoard().decision!;
+    const decision = { ...getBoard().decision!, spec: undefined };
+    setBoard({ ...getBoard(), decision });
     const state = structuredClone(supervisorState());
     await h.fire("agent_before_settle", BOUNDARY);
     await h.fire("agent_settled", { aborted: false });
     await h.command(`resolve ${decision.id} B`);
-    expect(getBoard()).toMatchObject({ workflowStatus: "active", decision: undefined });
+    expect(getBoard()).toMatchObject({ workflowStatus: "waiting_for_decision", decision });
     expect(supervisorState()).toEqual(state);
-    expect(h.mock.sendMessage).toHaveBeenCalledOnce();
-    expect(h.mock.sendMessage).toHaveBeenCalledWith(
-      expect.objectContaining({ customType: "continuous-tasks:continue", display: false }),
-      { triggerTurn: true, deliverAs: "followUp" },
-    );
+    expect(h.mock.sendMessage).not.toHaveBeenCalled();
   });
 
   it("does not let recover approve a still-pending user decision", async () => {

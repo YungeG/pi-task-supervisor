@@ -1,5 +1,4 @@
 import { beforeEach, describe, expect, it, vi } from "vitest";
-import { registerCommands } from "../commands";
 import { currentRuntime } from "../runtime";
 import { setSessionScopeEnabled } from "../scope";
 import { getBoard, resetState, setBoard } from "../state";
@@ -14,10 +13,8 @@ import { activeBoard, lifecycle } from "./helpers/lifecycle";
 import { createMockAPI, createMockContext } from "./helpers/mocks";
 
 function setup() {
-  const mock = createMockAPI();
-  const ctx = createMockContext();
-  Object.assign(ctx, { model: { provider: "faux", id: "test" } });
-  registerCommands(mock.api);
+  const h = lifecycle();
+  const { mock, ctx } = h;
   setBoard(activeBoard());
   startSupervisor(mock.api, ctx, "Finish the authorized task board");
   const command = mock.registerCommand.mock.calls.find(
@@ -25,7 +22,7 @@ function setup() {
   )?.[1] as {
     handler: (args: string, context: typeof ctx) => Promise<void>;
   };
-  return { mock, ctx, run: (args: string) => command.handler(args, ctx) };
+  return { mock, ctx, fire: h.fire, run: (args: string) => command.handler(args, ctx) };
 }
 
 describe("ordinary supervised pause recovery", () => {
@@ -35,7 +32,16 @@ describe("ordinary supervised pause recovery", () => {
   });
 
   it("resumes a confirmed human pause once without resetting supervisor counters or usage", async () => {
-    const { mock, run } = setup();
+    const { mock, run, fire } = setup();
+    for (let i = 0; i < 73; i++)
+      fire("tool_result", {
+        type: "tool_result",
+        toolName: "write",
+        toolCallId: `epoch-${i}`,
+        input: {},
+        content: [{ type: "text", text: "changed" }],
+        isError: false,
+      });
     Object.assign(supervisorState()!, {
       reviews: 7,
       continuations: 4,
@@ -67,6 +73,25 @@ describe("ordinary supervised pause recovery", () => {
       expect.objectContaining({ customType: "continuous-tasks:continue" }),
       { triggerTurn: true, deliverAs: "followUp" },
     );
+  });
+
+  it("does not jointly resume a human pause with an unresolved host capture", async () => {
+    const { run, fire } = setup();
+    fire("tool_call", {
+      type: "tool_call",
+      toolName: "write",
+      toolCallId: "unresolved",
+      input: {},
+    });
+    await run("pause inspect pending write");
+    await run("resume");
+    expect(getBoard().workflowStatus).toBe("active");
+    expect(supervisorState()!.status).toBe("paused");
+    expect(currentRuntime().receiptStore!.pendingCount).toBe(1);
+    await run("recover");
+    expect(supervisorState()!.status).toBe("active");
+    expect(currentRuntime().receiptStore!.pendingCount).toBe(0);
+    expect(supervisorState()!.epoch).toBe(2);
   });
 
   it.each([
@@ -170,11 +195,13 @@ describe("ordinary supervised pause recovery", () => {
     mock.sendMessage.mockClear();
     await run("status");
     expect(ctx.ui.notify).toHaveBeenLastCalledWith(
-      expect.stringContaining("resolve choose <answer>"),
+      expect.stringContaining("structured replacement from Main, then /task-supervisor decide"),
       "info",
     );
     const text = vi.mocked(ctx.ui.notify).mock.calls.at(-1)?.[0] as string;
-    expect(text.indexOf("resolve choose <answer>")).toBeLessThan(text.lastIndexOf("recover"));
+    expect(
+      text.indexOf("structured replacement from Main, then /task-supervisor decide"),
+    ).toBeLessThan(text.lastIndexOf("recover"));
     expect(text).toContain("Validation unavailable");
     expect(mock.appendEntry).not.toHaveBeenCalled();
     expect(mock.sendMessage).not.toHaveBeenCalled();

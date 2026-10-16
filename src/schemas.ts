@@ -1,5 +1,6 @@
 import { StringEnum } from "@earendil-works/pi-ai";
 import { Type } from "typebox";
+import { DecisionSpecSchema } from "./decision-spec";
 
 // ── Schemas ──
 
@@ -98,6 +99,8 @@ export const WorkflowGateParams = Type.Object({
   taskId: Type.Optional(Type.String({ minLength: 1, maxLength: 100 })),
   decision: Type.Optional(
     Type.Object({
+      spec: Type.Optional(DecisionSpecSchema),
+      supersedes: Type.Optional(Type.String({ minLength: 1, maxLength: 100 })),
       question: Type.String({ minLength: 1, maxLength: 1000 }),
       whyUserOwned: Type.String({ minLength: 1, maxLength: 1000 }),
       options: Type.Optional(

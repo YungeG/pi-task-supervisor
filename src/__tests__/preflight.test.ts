@@ -1,3 +1,4 @@
+import { approvePreflight } from "../preflight-human";
 import { beforeEach, describe, expect, it, vi } from "vitest";
 import {
   canonicalPreflightProposal,
@@ -5,7 +6,6 @@ import {
   preflightAuthorizationIssue,
   preflightStartBinding,
   preflightEvidence,
-  approvePreflight,
   restorePreflight,
   PREFLIGHT_CONTROL_ENTRY,
   PREFLIGHT_ENTRY,
@@ -128,7 +128,11 @@ describe("preflight strict proposal/identity", () => {
     async (selection) => {
       const h = await proposed();
       const n = h.entries.length;
-      await h.command(`approve ${currentRuntime().preflight!.planId} ${selection}`);
+      if (selection === "")
+        await expect(
+          approvePreflight(h.mock.api, h.ctx, currentRuntime().preflight!.planId, selection),
+        ).rejects.toThrow("Unknown or duplicate");
+      else await h.command(`approve ${currentRuntime().preflight!.planId} ${selection}`);
       expect(h.entries).toHaveLength(n);
       expect(currentRuntime().preflight?.approval).toBeUndefined();
     },
@@ -223,6 +227,7 @@ describe("current-branch human control and persistence", () => {
     const h = await started();
     const last = [...h.entries].reverse().find((e) => e.customType === PREFLIGHT_ENTRY)!;
     (last.data as any).started = undefined;
+    h.syncJournal();
     await h.fire("session_tree");
     expect(currentRuntime().journalFault).toContain("preflight");
   });
@@ -327,7 +332,7 @@ describe("current-branch human control and persistence", () => {
       const state = currentRuntime().preflight!;
       const snapshot = [...h.entries].reverse().find((e) => e.customType === PREFLIGHT_ENTRY)!
         .data as any;
-      if (scenario === "version") snapshot.version = 2;
+      if (scenario === "version") snapshot.version = 99;
       if (scenario === "approved snapshot") snapshot.phase = "approved";
       if (scenario === "digest") snapshot.planDigest = "f".repeat(64);
       if (scenario === "half control")
@@ -340,6 +345,7 @@ describe("current-branch human control and persistence", () => {
           permissionIds: ["A1"],
           createdAt: new Date().toISOString(),
         });
+      h.syncJournal();
       await h.fire("session_tree");
       expect(currentRuntime().journalFault).toContain("preflight");
       expect(h.fire("tool_call", { toolName: "write_tasks", input: {} })).toMatchObject({
@@ -367,9 +373,10 @@ describe("current-branch human control and persistence", () => {
   it("does not fabricate a leaf/control ID from a no-op host", async () => {
     const h = await proposed();
     h.mock.appendEntry.mockImplementation(() => {});
-    expect(() =>
-      approvePreflight(h.mock.api, h.ctx, currentRuntime().preflight!.planId!, "A1"),
-    ).toThrow("persistence");
+    vi.mocked(h.ctx.ui.select).mockResolvedValue("Approve");
+    await expect(
+      approvePreflight(h.mock.api, h.ctx, currentRuntime().preflight!.planId, "A1"),
+    ).rejects.toThrow();
     expect(currentRuntime().journalFault).toBeDefined();
   });
   it.each(["supervisor append", "started append", "dispatch"])(

@@ -288,6 +288,7 @@ export function executionWaitTimer(
           "External execution wait expired; inspect the existing run before recovery",
           "interrupted",
         );
+        if (currentRuntime().journalFault) throw new Error("Expiry checkpoint was not persisted");
       } catch {
         currentRuntime().journalFault =
           "External wait expiry persistence failed; inspect the journal before recovery";

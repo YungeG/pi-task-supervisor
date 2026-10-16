@@ -75,6 +75,28 @@ describe("config", () => {
       await expect(loadConfig()).resolves.toEqual(DEFAULT_CONFIG);
     });
 
+    it("loads independent bounded cache budgets without a lifetime receipt cap", async () => {
+      mockReadFile.mockResolvedValue(
+        JSON.stringify({ receiptCache: { maxEntries: 1, maxBytes: 16_384 } }),
+      );
+      await expect(loadConfig()).resolves.toMatchObject({
+        receiptCache: { maxEntries: 1, maxBytes: 16_384 },
+      });
+    });
+
+    it.each([
+      null,
+      "unlimited",
+      { maxEntries: 0 },
+      { maxEntries: 4097 },
+      { maxBytes: 1 },
+      { maxBytes: 67_108_865 },
+      { maxBytes: "1000000" },
+    ])("rejects invalid cache configuration %j", async (receiptCache) => {
+      mockReadFile.mockResolvedValue(JSON.stringify({ receiptCache }));
+      await expect(loadConfig()).resolves.toEqual(DEFAULT_CONFIG);
+    });
+
     it("fails closed on unreadable configuration", async () => {
       const error = new Error("permission denied") as NodeJS.ErrnoException;
       error.code = "EACCES";

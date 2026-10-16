@@ -1,3 +1,5 @@
+import type { DecisionSpec } from "./decision-spec";
+
 // ── Status ──
 
 export type TaskStatus =
@@ -62,6 +64,9 @@ export type WorkflowStatus =
   | "completed";
 
 export interface DecisionRecord {
+  spec?: DecisionSpec;
+  response?: "rejected";
+  supersedes?: string;
   id: string;
   taskId: string;
   question: string;
@@ -131,7 +136,12 @@ export type TaskWorkflowEvent =
     }
   | { type: "abandon_task"; id: string }
   | { type: "wait_for_decision"; decision: DecisionRecord }
-  | { type: "resolve_decision"; id: string; answer: string }
+  | {
+      type: "resolve_decision";
+      id: string;
+      answer: string;
+      outcome?: "approve" | "reject" | "answer";
+    }
   | { type: "bind_execution"; id: string; executionRef: ExecutionRef }
   | { type: "clear_execution"; id: string; executionRef: ExecutionRef }
   | { type: "clear_tasks" };

@@ -4,6 +4,7 @@ import { setSessionScopeEnabled } from "../scope";
 import { resetState, setBoard } from "../state";
 import { supervisorState } from "../supervisor";
 import { activeBoard, BOUNDARY, lifecycle } from "./helpers/lifecycle";
+import { appendMockEntries } from "./helpers/mocks";
 
 const guide = {
   action: "guide",
@@ -100,14 +101,14 @@ describe("session-runtime advisor adapter", () => {
       content: [{ type: "text", text: '{"token":"output-private"} Bearer output-bearer' }],
       isError: false,
     });
-    vi.mocked(h.ctx.sessionManager.getBranch).mockReturnValue([
+    appendMockEntries(h.ctx, [
       { type: "message", message: { role: "user", content: 'authorization="transcript-private"' } },
       {
         type: "message",
         message: { role: "assistant", content: [{ type: "text", text: "api_key=recent-private" }] },
       },
       { type: "custom", customType: "unrelated", data: { value: "not a message" } },
-    ] as any);
+    ]);
     expect((await h.fire("agent_before_settle", BOUNDARY))?.continue).toBe(true);
     const packet = JSON.parse(packets[0]!);
     expect(packet.goal).toBe("Validate approved work");

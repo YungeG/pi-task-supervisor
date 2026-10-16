@@ -7,7 +7,12 @@ import { currentRuntime } from "../runtime";
 import { resetState, updateUI } from "../state";
 import { holdSupervisor, startSupervisor } from "../supervisor";
 import type { TaskBoardSnapshot, TaskRecord, TaskStatus } from "../types";
-import { createMockAPI, createMockContext, createMockTheme } from "./helpers/mocks";
+import {
+  attachMockJournal,
+  createMockAPI,
+  createMockContext,
+  createMockTheme,
+} from "./helpers/mocks";
 
 function task(id: string, status: TaskStatus, overrides: Partial<TaskRecord> = {}): TaskRecord {
   return {
@@ -51,6 +56,7 @@ function widget(ctx: ReturnType<typeof createMockContext>, theme?: Theme) {
 function supervisedContext() {
   const ctx = createMockContext();
   const api = createMockAPI();
+  attachMockJournal(api, ctx);
   Object.assign(ctx, { model: { provider: "faux", id: "test" } });
   startSupervisor(api.api, ctx, "Review approved work");
   return { ctx, api };

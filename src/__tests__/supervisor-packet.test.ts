@@ -4,6 +4,7 @@ import { setSessionScopeEnabled } from "../scope";
 import { getBoardRef, resetState, setBoard } from "../state";
 import { supervisorState } from "../supervisor";
 import { activeBoard, BOUNDARY, lifecycle } from "./helpers/lifecycle";
+import { appendMockEntries } from "./helpers/mocks";
 
 const guide = {
   action: "guide",
@@ -49,11 +50,12 @@ describe("bounded supervisor evidence packet", () => {
       const receipts = structuredClone(state.receipts);
       const bindings = structuredClone(state.bindings);
       const board = structuredClone(getBoardRef());
-      vi.mocked(h.ctx.sessionManager.getBranch).mockReturnValue(
+      appendMockEntries(
+        h.ctx,
         Array.from({ length: 16 }, () => ({
           type: "message",
           message: { role: "assistant", content: text.repeat(2000) },
-        })) as any,
+        })),
       );
 
       expect((await h.fire("agent_before_settle", BOUNDARY))?.continue).toBe(true);
@@ -81,7 +83,8 @@ describe("bounded supervisor evidence packet", () => {
       expect(
         packet.receipts.find((receipt: { id: string }) => receipt.id === "tool:large-0"),
       ).toEqual(receipts[0]);
-      expect(packet.recent).toHaveLength(16);
+      // The real review checkpoint occupies one of the last 16 native branch entries.
+      expect(packet.recent).toHaveLength(15);
       expect(packet.excerpts).toMatchObject({ shortened: true });
       expect(supervisorState()!.receipts).toEqual(receipts);
       expect(supervisorState()!.bindings).toEqual(bindings);

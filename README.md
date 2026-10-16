@@ -22,37 +22,50 @@ Do not leave the existing Git source enabled alongside the npm source: they have
 /task-supervisor enable
 /task-supervisor supervise <goal>
 /task-supervisor preflight <goal>
-/task-supervisor approve <planId> <all|none|IDs>
-/task-supervisor start <planId>
+/task-supervisor approve [planId [all|none|IDs]]
+/task-supervisor start [planId]
 /task-supervisor revoke <planId>
 /task-supervisor status
 /task-supervisor tasks
 /task-supervisor pause [reason]
 /task-supervisor resume
-/task-supervisor resolve <decision-id> <answer>
+/task-supervisor decide
+/task-supervisor resolve [decision-id]     # compatibility entry; opens native response
+/task-supervisor repair-decision          # confirmed board cache only
+/task-supervisor repair-preflight         # confirmed preflight cache only
 /task-supervisor recover
 /task-supervisor stop
 ```
 
-`/continuous-tasks` remains a legacy alias for every subcommand. Both names control the same board and supervisor; activation is idempotent across aliases. Existing `continuous-tasks:*` journal entries, messages, and renderers retain their identifiers, so saved sessions need no migration.
+`/continuous-tasks` remains a legacy alias for every subcommand. Both names control the same board and supervisor; activation is idempotent across aliases. Existing `continuous-tasks:*` journal entries, messages, and renderers retain their identifiers. Historical records remain readable, but untyped legacy decisions require a complete replacement proposal and a new native response; unknown or inconsistent authorization history is held, not silently migrated.
 
 - `enable` activates task tools for this session without starting a supervisor.
 - `supervise` records a bounded, non-secret goal, pins the current session model, activates tools, and starts Main using a hidden custom message. An existing goal must be stopped before replacement. A paused/decision-gated board must be human-resolved first; already completed tasks cannot be reused as proof for a new goal.
 - `pause` cancels an advisor immediately and pauses Main/the board. `stop` also stops supervision and prevents silent fallback to board continuation.
-- `resume` jointly resumes a confirmed ordinary human pause of the board and supervisor without resetting counters, usage, epoch, or evidence. Legacy/unknown pauses and stronger holds resume only the board and explicitly require inspection plus `recover`; no automatic Main turn is started. Decisions, pending host work, wrong sessions, and inconsistent state do not gain joint recovery. `resolve` changes only the exact decision gate. `recover` retains its explicit counter-reset semantics and never grants other approvals or restarts external writers. Faulted completed boards require stopping and re-planning.
+- `resume` jointly resumes a confirmed ordinary human pause of the board and supervisor without resetting counters, usage, epoch, or evidence. Legacy/unknown pauses and stronger holds resume only the board and explicitly require inspection plus `recover`; no automatic Main turn is started. Decisions, pending host work, wrong sessions, and inconsistent state do not gain joint recovery. `decide`/`resolve` collect a native response for the exact current decision; command answer text is not authorization. `recover` retains its explicit counter-reset semantics and never grants other approvals or restarts external writers. Faulted completed boards require stopping and re-planning.
 - `status` is read-only even while disabled or journal-faulted. It reports the goal, host activity, claimed batch, soft check point, all available gate information, advisor-only usage/limits, unknown external run status, and the next valid human action.
 - `tasks` opens a scrollable full list, including completed/abandoned tasks; select a task to inspect its details and retained evidence. This read-only view works even when task tools are disabled or the supervisor journal is faulted, and never activates supervision or schedules work.
 
-Activation is a durable session entry. Resuming restores it; independent sessions remain disabled. Forks inherit the board/activation but **not the source session's supervisor**. Any unfinished supervisor restored after restart/tree navigation becomes an interrupted fault requiring inspection and explicit recovery, never an active-but-idle badge.
+Activation is a durable session entry. Resuming restores it; independent sessions remain disabled. Ordinary forks inherit the board/activation but **not the source session's supervisor**. A fork carrying native approvals cannot inherit their source-session authority and remains held for inspection. Any unfinished supervisor restored after restart/tree navigation becomes an interrupted fault requiring inspection and explicit recovery, never an active-but-idle badge.
+
+## Native human responses (local source candidate)
+
+New approvals support the trusted local Node Pi CLI/TUI with real stdin/stdout TTYs and a recoverable session JSONL file. The first structured request opens Pi's native select/input: respond there once; no decision ID or second resolve command is needed. Bare chat, RPC/print, ordinary SDK custom UI, model flags and copied result objects do not submit new approval. This is a trusted-host boundary, not authentication against malicious same-process/OS programs.
+
+`workflow_gate` proposals declare `decision.spec.version: 1` and one kind: `authorization` with exact `scope`/`prohibitions`; `choice` with exact options; or `information` with `text`/`integer`/`date` format. Only authorization approval grants that displayed scope. Choice/information resolve their information gate without new business rights. Main supplies a complete same-task `supersedes` replacement for legacy/rejected gates; this changes metadata only, never task execution/evidence.
+
+Approve resolves only that gate. Reject retains waiting and does not nag; defer/cancel saves no final response. Independent preflight permissions, Supervisor faults, budgets, execution references and final evidence stay in force. An existing confirmed response is never obtained again just because a derived cache failed.
+
+Saved results require actual file readback of the owner control and its derived witness, not an in-memory leaf. `repair-decision`/`repair-preflight` recheck original proof and repair only a missing derived cache: no new approval, witness, startup, scope enable, budget reset or Main dispatch. Broken physical ancestry, conflicting history and an unconfirmed start stay visibly held; do not retry uncertain external execution. In-memory/setup-only sessions cannot save recoverable approvals.
 
 ## Opt-in authorization preflight (local source candidate)
 
-The four preflight commands above exist in this source revision; recovery-hotfix snapshot `273cc79` does not include them. Implementation and isolated validation are separate from delivery authorization. A later explicit user instruction authorized commit, push and exact-revision installation; npm publication and business deployment remain outside that instruction. Verify the selected package revision before using the new commands.
+These native-interaction commands are a **local source candidate**. This integration has not been committed or installed; earlier delivery authority for another revision does not authorize this feature. Verify the selected package revision before using it.
 
 - `preflight <goal>` requires an idle host, no pending work, an empty board and no unstopped supervisor. It records planning and sends a hidden **read-only planning instruction**, without starting supervision or creating tasks.
 - `submit_preflight` is the model's proposal-only tool. It inventories required/optional permissions, limits, risks, alternatives, prohibitions and reconfirmation conditions. It cannot approve or start work. Complete proposals have a 16,000-byte UTF-8 limit and exact session/goal/revision/digest identity.
-- Human `approve` confirms the exact proposal and **replaces** the selected permission IDs. `all` selects all listed IDs; `none` selects no extra permissions. Missing required IDs prevent startup. Approval never dispatches Main.
-- Human `start` separately rechecks the current-branch control receipt and all existing gates, then binds the approved plan and dispatches Main once. With no preflight record, legacy `supervise` remains immediate; it cannot bypass a selected preflight for the corresponding goal.
+- Human `approve` opens the same native confirmation and **replaces** the selected permission IDs. With no arguments it selects only declared required IDs, never optional rights. Compatible explicit `all`/`none`/exact subsets still require the final native response. Missing required IDs prevent startup; complete approval is **approved, not started**, and never dispatches Main.
+- Human `start` needs no plan ID: it separately presents native first-start confirmation, rechecks the current-branch approval and all existing gates, then binds the same approved plan and dispatches Main once. An explicit plan ID is only a stale-ID check. With no preflight record, legacy `supervise` remains immediate; it cannot bypass a selected preflight for the corresponding goal.
 - `revoke` cancels this plugin's review, requests Main abort when needed, waits for actual idle and records revocation. It preserves the board/evidence and stronger holds; it cannot stop or roll back external processes. Reapproving an unchanged started plan does not resume it: existing `resume`/`recover` gates still apply. `stop` does not detach a retained started board from its authorization; a revoked grant still blocks board-only resume and task mutation.
 
 Task mutation is blocked during planning/approval and when a bound grant is missing or revoked. Restarts and tree navigation validate the current session/branch closure without replay; forks do not inherit the grant. Complete preflight material is protected inside the unchanged 64,000-byte advisor packet cap. This is an execution agreement, **not an OS sandbox or general tool-permission engine**: other tools keep existing host controls, and Main must check natural-language limits and reconfirmation conditions before acting.
@@ -87,6 +100,18 @@ Under supervision, each review-to-done transition requires a passing **command**
 
 A host tool without structured exit status cannot prove command success; use a host validation tool that exposes it. These receipts establish host observation, not the truth or quality of arbitrary external tool output. The advisor judges goal coverage; the task/evidence gates are deterministic.
 
+## Receipt storage and recovery
+
+There is **no cumulative 500-receipt stop**. Each proof is appended once to Pi's branch-local receipt ledger; Supervisor checkpoints contain metadata and exact bindings rather than repeating all historical receipt bodies. An instance-local cache defaults to 128 entries / 1 MiB of serialized UTF-8 data. Reaching the cache budget evicts cache copies, not audit history or proof validity. Evicted bound and current-review evidence is resolved from its original branch. Compact receipt locators still grow linearly with history; this does not make the entire Pi session constant-memory or impose a new unlimited execution permission.
+
+Potentially mutating tools first record an intent. A lost result stays unknown, late/unmatched results invalidate earlier freshness, and recovery never replays the tool automatically. Validation overlapping unfinished modifications, or started before its task review, cannot prove completion. Failed capture reports the actual evidence error while preserving the original tool result/structured status; it does not repeatedly resend an older acceptance warning.
+
+V1 inline journals and the configured v2 batch format remain readable. V2 uses a bounded read-only archive view: its hash chain, cursor, session/goal scope and complete checkpoint must validate, and necessary pause/fault/stop metadata stays v2 without adding new v2 bodies. An unfinished v1/v2 goal migrates only through explicit `recover` after the existing board/authorization gates, preserving bindings, usage and exact old records while requiring fresh validation. Recovery confirms its checkpoint before publishing active state.
+
+A v1 snapshot at the old 500 limit may have missed later modifications: loading it records one freshness barrier, clears its old acceptance and keeps explicit pauses, budgets and the completed task board. A valid completed v1 goal below saturation and a stopped goal are not indiscriminately reopened or migrated. Format recovery establishes its own subsequent freshness boundary. New goals and recovered work write v3. Old extensions refuse v3 (and older v3-only candidates do not understand its v2 legacy base), so rolling back the package does **not** make every v3 session writable by the old version.
+
+Supervision remains session/explicit-goal scoped, not an inferred working-directory sandbox: changing Git worktrees is not itself a new Supervisor goal. Stop an old goal explicitly before unrelated work; preserve completed history and use a valid fresh board/session for a new goal. Post-acceptance potential mutation still revokes acceptance.
+
 ## Existing async execution
 
 When all claimed tasks have exact `workflow_gate` execution references, the native boundary checks the installed execution owner's versioned `pi-subagents` RPC `ping/status` contract. A complete, current-session snapshot reporting queued/running work establishes a finite wait instead of another advisor call or stagnant continuation. A completed workflow parent with active children still waits.
@@ -100,7 +125,7 @@ The executor still owns result delivery, deduplication and waking Main; Supervis
 - Task tools are removed/blocked until a human command activates the session. Supervisor state is isolated per extension instance.
 - Supervisor holds/faults, board pauses, and real decision gates block task mutation. Completed supervised tasks are frozen; required tasks cannot be discarded or abandoned.
 - The advisor uses the pinned **session runtime** model with no executor tools or separate credential discovery. Common credential patterns are redacted in captured receipt text and advisor packets; this is not a general secret scanner. Do not put credentials in goals, tasks, or tool labels.
-- Reviews have a 30-second bound, a 64KB packet cap, and a 2048-token output cap. Limits: 40 reviews, 20 resumes, three non-progress continuations, 500 receipts, and at most 100 supervised tasks/bindings. Oversized plans are rejected on start, write, and recovery. Explicit recovery resets review/resume/stagnation counters, not approvals or recorded usage.
+- Reviews have a 30-second bound, a 64KB packet cap, and a 2048-token output cap. Limits: 40 reviews, 20 resumes, three non-progress continuations, and at most 100 supervised tasks/bindings. Receipt caches have bounded count/bytes, not a cumulative goal receipt limit. Oversized plans are rejected on start, write, and recovery. Explicit recovery resets review/resume/stagnation counters, not approvals or recorded usage.
 - Packet size is measured in UTF-8 bytes. The complete goal, task board, selected receipt identities/digests, and bound validation receipts are never shortened. When space is tight, only unbound receipt and recent-transcript excerpts are shortened and explicitly marked; durable history is unchanged. Oversized protected material still fails closed before any advisor call.
 - Malformed journals, model failures, timeouts, stale branches, and exhausted budgets stop visibly. There is no unsupervised fallback after a supervised failure.
 - Automatic pre-boundary compaction preserves durable goals/receipts. Compaction hooks cancel in-flight reviews and reject late results.
@@ -131,9 +156,15 @@ Optional `~/.pi/agent/continuous-tasks.json` (or `$PI_CODING_AGENT_DIR/continuou
 ```json
 {
   "maxStagnantSettles": 5,
-  "requireCompletionEvidence": true
+  "requireCompletionEvidence": true,
+  "receiptCache": {
+    "maxEntries": 128,
+    "maxBytes": 1048576
+  }
 }
 ```
+
+`receiptCache.maxEntries` accepts 1–4096; `maxBytes` accepts 16 KiB–64 MiB. These only size the raw cache, not the advisor packet, cumulative receipt count or execution authority. A single oversized cache item remains in the ledger and is read without caching. Status shows cumulative count, cache budget, pending captures and ledger health without writing state or querying an executor.
 
 Missing/invalid settings use safe defaults. `countdownMs` remains parse-compatible but is deprecated and ignored: native continuation has no countdown. Supervisor host-evidence requirements cannot be waived by `requireCompletionEvidence: false`. `phaseCompletionPromptTemplate` may include `{phase}`.
 
@@ -144,7 +175,7 @@ npm ci --ignore-scripts
 npm run check
 ```
 
-`check` runs type checking, lint, format checks, coverage (unchanged 90% branch gate), and eight isolated real-Pi **faux-provider** smokes: board-only, supervised, automatic compaction, paused in-flight review plus compaction, native boundary abort/recovery, ordinary pause/single-command resume with retained counters, owner-confirmed async waiting followed by executor-owned result delivery and fresh Main acceptance, and opt-in preflight with a required/optional inventory, explicit human-command approval and separate start. SDK hosts must bind real command-context actions, including `waitForIdle`; a still-busy host after that callback is rejected rather than treated as settled. Smokes use temporary agent directories, no builtin executor tools or live inference, and verify real settings remain unchanged.
+`check` runs type checking, lint, format checks, coverage (unchanged 90% branch gate), and twelve isolated real-Pi **faux-provider** smokes. The original eight cover board-only, supervised, automatic compaction, paused in-flight review plus compaction, native boundary abort/recovery, ordinary pause/single-command resume with retained counters, owner-confirmed async waiting followed by executor-owned result delivery and fresh Main acceptance, and opt-in preflight with a required/optional inventory, source-boundary simulated native approval and separate start. Four additional modes cover 1000 reads with an evicted validation proof, 500-receipt v1 gap/migration through a real recovery command, interrupted intent recovery without replay, and cross-batch v2 migration preserving its original records. The preflight SDK arm explicitly mocks argv/TTY/UI to test owner plumbing, not ordinary-SDK approval support or human identity. This integration requires separate offline real CLI/PTY product-entry and real double-TTY ordinary-SDK rejection checks; older candidate results do not stand in for these. SDK hosts must bind real command-context actions, including `waitForIdle`; a still-busy host after that callback is rejected rather than treated as settled. Smokes use temporary agent directories, no builtin executor tools or live inference, and verify real settings remain unchanged.
 
 Compatibility evidence and limitations: [`CANARY.md`](./CANARY.md). Original workspace design: [`../docs/continuous-tasks-extension-design.md`](../docs/continuous-tasks-extension-design.md) (outside this standalone repository; not included in a Git checkout or package).
 

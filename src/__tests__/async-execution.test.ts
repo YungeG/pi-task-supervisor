@@ -6,11 +6,12 @@ import { setSessionScopeEnabled } from "../scope";
 import { getBoard, resetState, setBoard } from "../state";
 import { supervisorState, type Advisor } from "../supervisor";
 import { activeBoard, ACTIVATION, BOUNDARY, deferred, getHandler } from "./helpers/lifecycle";
-import { createMockAPI, createMockContext } from "./helpers/mocks";
+import { attachMockJournal, createMockAPI, createMockContext } from "./helpers/mocks";
 
 function fixture() {
   const mock = createMockAPI();
   const ctx = createMockContext();
+  attachMockJournal(mock, ctx);
   Object.assign(ctx, { model: { provider: "faux", id: "test" } });
   Object.assign(ctx.sessionManager, { getSessionFile: vi.fn(() => undefined) });
   const handlers = new Map<string, Set<(value: unknown) => void>>();
@@ -365,7 +366,23 @@ describe("owned asynchronous execution wait", () => {
       await lane.statusRequested;
       if (change === "branch")
         vi.mocked(lane.ctx.sessionManager.getLeafId).mockReturnValue("changed-leaf");
-      if (change === "epoch") supervisorState()!.epoch++;
+      if (change === "epoch") {
+        getHandler(lane.mock, "tool_call")(
+          { type: "tool_call", toolName: "write", toolCallId: "epoch-change", input: {} },
+          lane.ctx,
+        );
+        getHandler(lane.mock, "tool_result")(
+          {
+            type: "tool_result",
+            toolName: "write",
+            toolCallId: "epoch-change",
+            input: {},
+            content: [{ type: "text", text: "changed" }],
+            isError: false,
+          },
+          lane.ctx,
+        );
+      }
       if (change === "board") {
         const board = getBoard();
         board.generation++;
@@ -417,7 +434,7 @@ describe("owned asynchronous execution wait", () => {
     expect(lane.advisor).not.toHaveBeenCalled();
     await lane.command("status");
     expect(lane.ctx.ui.notify).toHaveBeenLastCalledWith(
-      expect.stringContaining("resolve approval-1"),
+      expect.stringContaining("structured replacement from Main, then /task-supervisor decide"),
       "info",
     );
   });

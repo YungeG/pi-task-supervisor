@@ -101,7 +101,7 @@ describe("opt-in human preflight commands", () => {
     expect(h.mock.sendMessage).not.toHaveBeenCalled();
   });
 
-  it("rejects missing and prefix-only start IDs even for an approved plan", async () => {
+  it("accepts no-ID native start but rejects prefix-only start IDs", async () => {
     const h = preflightLifecycle();
     await h.command("preflight Implement the local fixture");
     await createSubmitPreflightTool(h.mock.api).execute(
@@ -114,12 +114,10 @@ describe("opt-in human preflight commands", () => {
     const plan = latest(h);
     await h.command(`approve ${plan.planId} A1`);
     h.mock.sendMessage.mockClear();
-    await h.command("start");
-    expect(supervisorState()).toBeUndefined();
     await h.command(`start ${plan.preflightId}`);
     expect(supervisorState()).toBeUndefined();
     expect(h.mock.sendMessage).not.toHaveBeenCalled();
-    await h.command(`start ${plan.planId}`);
+    await h.command("start");
     expect(supervisorState()?.status).toBe("active");
   });
 

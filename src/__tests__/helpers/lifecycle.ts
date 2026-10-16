@@ -4,7 +4,7 @@ import { registerEventHandlers } from "../../events";
 import { registerCommands } from "../../commands";
 import type { Advisor } from "../../supervisor";
 import type { TaskBoardSnapshot } from "../../types";
-import { createMockAPI, createMockContext } from "./mocks";
+import { attachMockJournal, createMockAPI, createMockContext } from "./mocks";
 
 export const NOW = "2026-08-23T00:00:00.000Z";
 export const ACTIVATION = {
@@ -64,16 +64,25 @@ export function getHandler(mock: ReturnType<typeof createMockAPI>, name: string)
 export function lifecycle(advisor?: Advisor) {
   const mock = createMockAPI();
   const ctx = createMockContext();
+  attachMockJournal(mock, ctx);
   Object.assign(ctx, { model: { provider: "faux", id: "test" } });
   registerEventHandlers(mock.api, async () => DEFAULT_CONFIG, advisor);
   registerCommands(mock.api);
   const command = mock.registerCommand.mock.calls[0]?.[1] as {
     handler: (args: string, context: ReturnType<typeof createMockContext>) => Promise<void>;
   };
+  const started = new Set<string>();
   return {
     mock,
     ctx,
-    fire: (name: string, event: unknown = {}) => getHandler(mock, name)(event, ctx),
+    fire: (name: string, event: any = {}) => {
+      if (name === "tool_call") started.add(event.toolCallId);
+      if (name === "tool_result" && !started.has(event.toolCallId)) {
+        started.add(event.toolCallId);
+        getHandler(mock, "tool_call")({ ...event, type: "tool_call" }, ctx);
+      }
+      return getHandler(mock, name)(event, ctx);
+    },
     command: (args: string) => command.handler(args, ctx),
   };
 }

@@ -1,6 +1,40 @@
 # Local supervisor validation report
 
-## Latest validated source: opt-in preflight and safe continuation
+## Human interaction + receipt v2/v3 integration — local checks PASS, not merged/installed
+
+Current candidate is isolated on `integrate/human-interaction-r2-receipt-v3-20261016`, based on fixed commit `d1199c24fa70941ad3a9244594fcf4ecd24cb7c9`. Final `npm run check`: **1044 tests / 48 files PASS**, statements **93.66%**, branches **90.02% (3267/3629)**, functions **98.49%**, lines **95.68%**, full typecheck/lint/format and all **12** SDK/faux smokes. Thresholds and lint limits are unchanged. Original V2's 15 regression cases were retained and ported to the V3 writer / retained-V2 reader interfaces, not deleted or disabled.
+
+- An immutable no-package-dependency snapshot passed **12/12 cold modes on each SDK 1.1/1.2** and **6/6 old-reader refusal checks**. Frozen identity: `bd25e6cf67a1879f2d99db2e6c47f03d8f04d8629dbe55a99b44c0a52d64df1e`; the later 15-case port changes unit tests only, not any cold-tested production/harness/config bytes.
+- Actual offline production-factory/tool/command CLI/PTY pilots passed board native response and separate preflight approval/start on **both Pi 1.1 and 1.2**, without argv/TTY/UI/source mocks. Ordinary SDK auto-approve UI in a real double TTY was rejected before UI with no approval/receipt. Test keystrokes/faux providers do not certify human identity or live business execution; the SDK preflight arm explicitly remains a mocked source-boundary simulation.
+- Real behavioral red/green evidence covers persisted v3 first-start S, getter-only SDK contexts, rehashed V2 archive tampering, saved human answers under unresolved host intents, and a deferred saturation barrier followed by explicit migration. Owner validation is reused; readonly repair never becomes a second receipt/start writer.
+- Original code, the old human candidate and the receipt input remain protected. No original-directory write-back, staging, commit, publication, installation or business operation is authorized. Current checks were controlling-agent execution/self-review, not a new independent formal code review.
+
+Local artifacts: `/home/ygguo/.pi/agent/worktrees-artifacts/pi-task-supervisor-human-interaction-r2-receipt-v3-20261016/` (`check-delivery-final.log`, `cold-accepted-results.json`, `native-cli-pilot/accepted-*.log`, `final-handoff.md`). Historical reports below are input evidence only, not proof of this combined candidate.
+
+## Historical input: human interaction r2 candidate (2026-10-15; pinned-source checks complete)
+
+- Isolated worktree `fix/human-interaction-r2-20261014`, pinned HEAD `9933feaee451046168fb1384b7276fe1ad78c787` plus the recorded read-only 81-file prerequisite snapshot. Not committed, merged, published or installed; no business session operated.
+- After the independent P1 ancestry finding, an actual SDK SessionManager regression injects C's physical append failure after native leaf advancement, persists the normal tool-result descendant, reopens, and requires a visible journal hold. It was behavioral red, then green. Setup-only and explicit in-memory cases remain distinct; missing/corrupt durable files are held.
+- Final parent `npm run check`: **933 tests / 45 files PASS**, statements **93.76%**, branches **90.18% (2766/3067)**, functions **98.42%**, lines **95.82%**; typecheck, full ESLint, source formatting and all eight SDK/faux smokes passed. No threshold was lowered. Diff/index checks remained clean; no staging or commits.
+- All eight SDK/faux-provider smoke arms pass. The preflight arm is explicitly a mocked source-boundary simulation (argv/TTY/UI), not a positive SDK source claim. It retains full scope, required-only rights, separate startup, final host evidence and acceptance, resume, fork denial and unchanged real settings checks.
+- Separate actual offline CLI/PTY production-factory/tool/command pilots passed board native response and preflight approval plus separate start on local Pi **1.1 and 1.2**. No argv/TTY/UI/source mocks were used in those pilots. Synthetic test keystrokes and faux models are not proof of human identity, live business behavior or general SDK approval support. The actual ordinary SDK bound to automatic-approve TUI in a real double TTY remains rejected before UI with zero receipt/approval.
+- The first full-factory pilot reached its saved outcome but its harness cleanup timed out; cleanup was corrected to terminate only its owned synthetic CLI. A 1.1 follow-up exposed reliance on a host event for current start context; the single explicit continuation now includes the exact permission agreement, with a red/green assertion and successful repeated native pilot. Failed/partial pilot artifacts are not counted as passing runs.
+- Independent final code review found one P1; the targeted re-review confirmed it resolved with no new blocker in the correction's blast radius. This is a narrow code verdict, not merge/install authority. Concurrent original-root receipt-journal version 2 and related command/smoke edits have NOT been imported or accepted as compatible with this fixed pin. Reconcile a stable final source contract before merge/install; do not overwrite the concurrent session.
+
+
+## Historical input: receipt integration candidate — LOCAL PASS (not merged or installed)
+
+The V2/V3 semantic integration has fresh local validation at code/test/config fingerprint `09641ecbc4b44d590ae8b8d5fc083d117c19e56ab9c349a8f29ba71b88a96d40`: **768 tests / 36 files PASS; 90.20% branches with unchanged 90% gates**, lint complexity maximum 15, and twelve development SDK smoke modes. Its frozen source passed twelve dependency-free package cold modes on each of SDK 1.1/1.2 and six refusal checks using old v1/v2/V3-only readers. Cross-batch v2 migration, exact sibling-branch rejection and unacknowledged committed recovery are covered. Resource samples 100→1000→5000 passed; the raw cache stayed at 128 entries at 5000, while index/session memory still grows with history.
+
+Fresh integration evidence is recorded in [receipt-integration-acceptance.md](./docs/receipt-integration-acceptance.md). Historical results below are baseline evidence only, not integration acceptance. Original main/V2/V3/human-interaction trees and selected settings were preserved; no commit, original-tree merge, publication, installation, credential/model change or second external formal review is claimed. Faux-provider/UI-stub tests do not certify business execution or interactive TUI quality.
+
+## Baseline V3-only receipt-storage candidate (historical)
+
+The implementation is isolated on `docs/supervisor-receipt-retention-plan`, based on `f6d3c7f6cab37bae2f0cb4b63024cb5eae8053ce`. Local source acceptance is **737 tests / 35 files PASS, 90.14% branches with unchanged 90% gates**, plus eleven development SDK smoke modes. The same code fingerprint (`e2578137d0aca2bf91ab7adc2071ef8cc31c7dd647bde5b596e5f33b4fc3e48c`) passed eleven no-package-local-dependency cold modes on each of SDK 1.1 and 1.2, and both old-reader refusal checks. Resource samples at 100/1000/5000 receipts passed. It is not committed, published or installed. Current validation status, raw evidence and remaining gaps are maintained in [the receipt acceptance record](./docs/supervisor-receipt-storage-acceptance.md), not inferred from the historical results below.
+
+The candidate replaces lifetime receipt counts with append-only evidence and bounded raw caching; new persisted checkpoints are v3, with explicit v1 recovery/migration. It does not implement working-directory permissions, automatic new-goal approval, old-version write compatibility or real-business/TUI certification. At that V3-only acceptance, the other worktree's v2 candidate had not been integrated; the current integration separately verifies the actually configured v2 wire format. No new independent formal review is claimed.
+
+## Previously validated source: opt-in preflight and safe continuation (historical)
 
 - Accepted local implementation: **696 tests / 34 files PASS**, **91.06% branch coverage**, unchanged 90% thresholds; TypeScript, lint, formatting and eight isolated SDK/faux-provider modes pass.
 - Opt-in proposal, exact current-branch human approval, separately guarded startup, revision invalidation, fail-closed persistence/lifecycle and retained revocation gates are covered. Legacy supervision, owner-confirmed async waiting and legitimate human-decision waiting remain compatible.
@@ -129,7 +163,7 @@ The public command, task-tool/event, and native boundary seams cover:
 - Common credential-pattern redaction before JSON encoding, nested sensitive input keys, preserved structured tool results, receipt deduplication, and invalid usage accounting rejection.
 - At most **100 supervised tasks**, matching the durable binding limit: start, write/append, and recovery reject oversized plans; exact-boundary plans remain allowed.
 
-Review limits are 30 seconds, 64KB of structured input, 2048 output tokens, 40 checks, 20 resumes, three non-progress continuations, and 500 receipts. Mocked-time tests cover a provider ignoring cancellation; the real SDK interruption scenarios use controlled faux replies rather than waiting for a live provider.
+Review limits are 30 seconds, 64KB of structured input, 2048 output tokens, 40 checks, 20 resumes, three non-progress continuations, and 500 receipts in that historical candidate (the current repair removes this cumulative limit). Mocked-time tests cover a provider ignoring cancellation; the real SDK interruption scenarios use controlled faux replies rather than waiting for a live provider.
 
 ## Native abort/compaction limitation
 

@@ -5,6 +5,9 @@ import type {
   ExtensionContext,
 } from "@earendil-works/pi-coding-agent";
 import type { ContinuousTasksConfig } from "./config";
+import { createEmptyBoard } from "./engine";
+import { inspectRestorableSession } from "./human-control";
+import { restoreBoardHuman, boardHumanContext, canReplaceBoardDecision } from "./board-human";
 import { claimedExecutionRefs, executionWaitTimer, waitForExecutions } from "./async-execution";
 import { currentRuntime } from "./runtime";
 import { preflightContext, preflightTaskIssue, restorePreflight } from "./preflight";
@@ -25,6 +28,7 @@ import {
   currentExecutionWait,
   holdSupervisor,
   observeTool,
+  prepareToolCapture,
   redact,
   restoreSupervisor,
   reviewSupervisor,
@@ -199,6 +203,9 @@ function makeController(pi: ExtensionAPI, configLoader: ConfigLoader, advisor?: 
   let stagnant = 0;
   let waitTimer: ReturnType<typeof setTimeout> | undefined;
   const cancel = () => {
+    currentRuntime().humanEpoch++;
+    currentRuntime().humanAbort?.abort();
+    currentRuntime().humanAbort = undefined;
     serial++;
     clearTimeout(waitTimer);
     waitTimer = undefined;
@@ -268,15 +275,30 @@ function makeController(pi: ExtensionAPI, configLoader: ConfigLoader, advisor?: 
   return { cancel, boundary };
 }
 
+function restoreFaultedSupervisor(pi: ExtensionAPI, ctx: ExtensionContext): void {
+  try {
+    restoreSupervisor(pi, ctx);
+  } catch {
+    currentRuntime().supervisor = undefined;
+  }
+}
+
 function registerSessionHandlers(pi: ExtensionAPI, control: Control): void {
   const restore = (ctx: ExtensionContext) => {
     control.cancel();
-    const board = reconstructState(ctx);
+    let board = createEmptyBoard();
     setBoard(board);
-    updateUI(ctx, board);
-    restoreSessionScope(pi, ctx);
     currentRuntime().journalFault = undefined;
+    currentRuntime().preflightRepair = undefined;
+    currentRuntime().preflight = undefined;
+    currentRuntime().boardRepair = undefined;
+    currentRuntime().boardHumanContext = undefined;
     try {
+      inspectRestorableSession(ctx);
+      board = restoreBoardHuman(ctx, reconstructState(ctx));
+      restoreSessionScope(pi, ctx);
+      setBoard(board);
+      updateUI(ctx, board);
       restorePreflight(ctx);
       restoreSupervisor(pi, ctx);
       updateActiveTools(pi, isSessionScopeEnabled());
@@ -286,6 +308,8 @@ function registerSessionHandlers(pi: ExtensionAPI, control: Control): void {
         error instanceof Error && /preflight/i.test(error.message)
           ? "Invalid preflight journal; inspect session state before recovery"
           : "Invalid supervisor journal; inspect session state before recovery";
+      // Restore only a held view after another owner's failure; no writes or replay.
+      restoreFaultedSupervisor(pi, ctx);
       setSessionScopeEnabled(false);
       updateActiveTools(pi, false);
       updateUI(ctx, board);
@@ -302,12 +326,19 @@ function registerSessionHandlers(pi: ExtensionAPI, control: Control): void {
       );
     }
   };
-  pi.on("session_start", (_event, ctx) => {
+  const restoreCache = async (ctx: ExtensionContext) => {
+    restore(ctx);
+    const store = currentRuntime().receiptStore;
+    const config = await loadConfig();
+    if (store && currentRuntime().receiptStore === store && config.receiptCache)
+      store.configure(config.receiptCache);
+  };
+  pi.on("session_start", async (_event, ctx) => {
     resetConfig();
-    restore(ctx);
+    await restoreCache(ctx);
   });
-  pi.on("session_tree", (_event, ctx) => {
-    restore(ctx);
+  pi.on("session_tree", async (_event, ctx) => {
+    await restoreCache(ctx);
   });
   pi.on("session_shutdown", (_event, ctx) => {
     control.cancel();
@@ -399,6 +430,26 @@ function taskControlIssue(ctx: ExtensionContext): string | undefined {
   return preflightTaskIssue(ctx, state?.status === "stopped" ? undefined : state?.preflightBinding);
 }
 
+function decisionReplacementAllowed(toolName: string, input: Record<string, unknown>): boolean {
+  return (
+    toolName === "workflow_gate" &&
+    canReplaceBoardDecision(getBoardRef(), input) &&
+    isSessionScopeEnabled() &&
+    !currentRuntime().journalFault
+  );
+}
+
+function abandonsRequiredTasks(toolName: string, input: Record<string, unknown>): boolean {
+  return (
+    toolName === "edit_tasks" &&
+    Array.isArray(input.tasks) &&
+    input.tasks.some(
+      (item: unknown) =>
+        typeof item === "object" && item !== null && "type" in item && item.type === "abandon",
+    )
+  );
+}
+
 function taskGate(
   toolName: string,
   input: Record<string, unknown>,
@@ -406,6 +457,7 @@ function taskGate(
 ): string | undefined {
   if (toolName === "submit_preflight") return submissionGate(ctx);
   if (!TASK_TOOL_NAMES.includes(toolName)) return undefined;
+  if (decisionReplacementAllowed(toolName, input)) return undefined;
   const issue = taskControlIssue(ctx);
   if (issue) return issue;
   const state = supervisorState();
@@ -419,14 +471,7 @@ function taskGate(
     (toolName === "write_tasks" && input.mode === "replace" && getBoardRef().tasks.length > 0)
   )
     return "A supervised goal cannot discard its task board";
-  if (
-    toolName === "edit_tasks" &&
-    Array.isArray(input.tasks) &&
-    input.tasks.some(
-      (item: unknown) =>
-        typeof item === "object" && item !== null && "type" in item && item.type === "abandon",
-    )
-  )
+  if (abandonsRequiredTasks(toolName, input))
     return "A supervised goal cannot abandon required tasks";
   return supervisedWriteLimitError(toolName, input);
 }
@@ -460,7 +505,7 @@ function registerWorkHandlers(pi: ExtensionAPI, control: Control): void {
     return {
       message: {
         customType: "continuous-tasks:context",
-        content: `${preflight ? `${preflight}\n` : ""}${formatHiddenContext(board)}\n${state?.status === "active" ? `User-recorded supervisor goal: ${state.goal}\nEvidence refs must use real host receipts tool:<id>, observed during review. Supervisor guidance is never user approval.` : ""}${currentExecutionWait(board, state) ? "\nExisting external executions are bound. Inspect the executor's delivered results and exact run IDs; clear resolved references and obtain fresh host validation. A wait or completion notification is neither acceptance nor permission to launch duplicate work." : ""}`,
+        content: `${boardHumanContext(ctx) ?? ""}\n${preflight ? `${preflight}\n` : ""}${formatHiddenContext(board)}\n${state?.status === "active" ? `User-recorded supervisor goal: ${state.goal}\nEvidence refs must use real host receipts tool:<id>, observed during review. Supervisor guidance is never user approval.` : ""}${currentExecutionWait(board, state) ? "\nExisting external executions are bound. Inspect the executor's delivered results and exact run IDs; clear resolved references and obtain fresh host validation. A wait or completion notification is neither acceptance nor permission to launch duplicate work." : ""}`,
         display: false,
       },
     };
@@ -503,16 +548,35 @@ function registerWorkHandlers(pi: ExtensionAPI, control: Control): void {
         );
     }
   });
+}
+
+function registerReceiptHandlers(pi: ExtensionAPI): void {
+  const blockedCaptures = new Set<string>();
   pi.on("tool_call", (event, ctx) => {
     const reason = taskGate(event.toolName, event.input, ctx);
-    return reason ? { block: true, reason } : undefined;
+    if (reason) return { block: true, reason };
+    try {
+      prepareToolCapture(pi, event);
+    } catch (error) {
+      blockedCaptures.add(event.toolCallId);
+      const reason = error instanceof Error ? error.message : "Receipt capture unavailable";
+      const store = currentRuntime().receiptStore;
+      if (store && !store.healthy) currentRuntime().journalFault = reason;
+      const state = supervisorState();
+      if (state) {
+        state.status = "fault";
+        state.pending = false;
+        state.reason = reason;
+      }
+      return { block: true, reason: `Tool not started: ${reason}` };
+    }
+    return undefined;
   });
   pi.on("tool_result", (event, ctx) => {
+    if (blockedCaptures.delete(event.toolCallId) && event.isError) return undefined;
+    const previousFault = currentRuntime().journalFault;
     try {
-      observeTool(pi, event);
-      const receipt = supervisorState()?.receipts.find(
-        (item) => item.id === `tool:${event.toolCallId}`,
-      );
+      const receipt = observeTool(pi, event);
       if (receipt)
         return {
           content: [
@@ -527,16 +591,47 @@ function registerWorkHandlers(pi: ExtensionAPI, control: Control): void {
             : { structuredContent: event.structuredContent }),
         };
     } catch (error) {
-      holdSupervisor(
-        pi,
-        ctx,
-        "fault",
-        error instanceof Error ? error.message : "Evidence capture failed",
-        "review_failed",
-      );
+      const reason = receiptFailure(pi, ctx, error, previousFault);
+      return {
+        content: [
+          ...event.content,
+          {
+            type: "text" as const,
+            text: `Evidence not recorded: ${reason}. Do not treat this result as a new proof or automatically retry the tool.`,
+          },
+        ],
+        ...(event.structuredContent === undefined
+          ? {}
+          : { structuredContent: event.structuredContent }),
+      };
     }
     return undefined;
   });
+}
+
+function receiptFailure(
+  pi: ExtensionAPI,
+  ctx: ExtensionContext,
+  error: unknown,
+  previousFault: string | undefined,
+): string {
+  const reason = error instanceof Error ? error.message : "Evidence capture failed";
+  const state = supervisorState();
+  const store = currentRuntime().receiptStore;
+  if (store && !store.healthy) {
+    currentRuntime().journalFault = reason;
+    if (state) {
+      state.status = "fault";
+      state.pending = false;
+      state.reason = reason;
+      state.acceptedDigest = undefined;
+    }
+  } else if (state?.status !== "fault") {
+    holdSupervisor(pi, ctx, "fault", reason, "review_failed");
+  }
+  if (currentRuntime().journalFault && previousFault !== reason)
+    ctx.ui.notify(`Evidence not committed; tool may have executed. ${reason}`, "error");
+  return reason;
 }
 
 export function registerEventHandlers(
@@ -548,4 +643,5 @@ export function registerEventHandlers(
   currentRuntime().cancel = control.cancel;
   registerSessionHandlers(pi, control);
   registerWorkHandlers(pi, control);
+  registerReceiptHandlers(pi);
 }

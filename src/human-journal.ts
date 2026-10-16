@@ -1,0 +1,338 @@
+import { Type, type Static } from "typebox";
+import { Check } from "typebox/value";
+import { createHash } from "node:crypto";
+import { closeSync, constants, fstatSync, openSync, readSync } from "node:fs";
+import { TextDecoder } from "node:util";
+
+export interface SessionJournalView {
+  path: string | undefined;
+  sessionId: string;
+  leafId: string | null;
+}
+export interface JournalNode {
+  id: string;
+  parentId: string | null;
+  type: string;
+  customType?: string;
+  data?: unknown;
+  digest: string;
+}
+export interface SessionJournal {
+  sessionId: string;
+  nodes: ReadonlyMap<string, JournalNode>;
+  branch: readonly JournalNode[];
+}
+const frameId = Type.String({ minLength: 1, maxLength: 200 });
+const frameHash = Type.String({ pattern: "^[a-f0-9]{64}$" });
+export const ReadbackFrameSchema = Type.Object(
+  {
+    version: Type.Literal(1),
+    owner: Type.Union([Type.Literal("board"), Type.Literal("preflight")]),
+    sessionId: frameId,
+    requestId: frameId,
+    presentationId: frameId,
+    scopeDigest: frameHash,
+    baseSnapshotEntryId: frameId,
+    baseSnapshotDigest: frameHash,
+  },
+  { additionalProperties: false },
+);
+export type ReadbackFrame = Static<typeof ReadbackFrameSchema>;
+export interface ReadbackWitness {
+  version: 1;
+  controlEntryId: string;
+  controlDigest: string;
+  frame: ReadbackFrame;
+}
+export type ReadbackProof =
+  | { status: "missing" }
+  | { status: "unconfirmed"; control: JournalNode; frame: ReadbackFrame }
+  | {
+      status: "confirmed";
+      control: JournalNode;
+      witness: JournalNode;
+      base: JournalNode;
+      frame: ReadbackFrame;
+    };
+export type JournalErrorCode =
+  | "JOURNAL_UNAVAILABLE"
+  | "JOURNAL_LIMIT"
+  | "JOURNAL_INVALID"
+  | "JOURNAL_BRANCH_INVALID"
+  | "READBACK_INVALID"
+  | "READBACK_CONFLICT";
+export class JournalReadError extends Error {
+  constructor(readonly code: JournalErrorCode) {
+    super(code);
+    this.name = "JournalReadError";
+  }
+}
+export function journalDigest(value: unknown): string {
+  return createHash("sha256").update(JSON.stringify(value)).digest("hex");
+}
+function record(value: unknown): value is Record<string, unknown> {
+  return value !== null && typeof value === "object" && !Array.isArray(value);
+}
+function identifier(value: unknown): value is string {
+  return typeof value === "string" && value.length > 0 && value.length <= 200;
+}
+function fail(code: JournalErrorCode): never {
+  throw new JournalReadError(code);
+}
+const RETAINED = new Set([
+  "continuous-tasks:event",
+  "continuous-tasks:preflight-control",
+  "continuous-tasks:human-readback",
+  "continuous-tasks:snapshot",
+  "continuous-tasks:preflight",
+]);
+export interface JournalLimits {
+  maxBytes: number;
+  maxLineBytes: number;
+  maxEntries: number;
+}
+const LIMITS: JournalLimits = {
+  maxBytes: 256 * 1024 * 1024,
+  maxLineBytes: 8 * 1024 * 1024,
+  maxEntries: 200_000,
+};
+
+function validateLimits(limits: JournalLimits): void {
+  if (Object.values(limits).some((value) => !Number.isSafeInteger(value) || value < 1))
+    fail("JOURNAL_LIMIT");
+}
+
+function parseEntry(
+  value: Record<string, unknown>,
+  nodes: Map<string, JournalNode>,
+  entries: number,
+  maxEntries: number,
+): JournalNode | null {
+  if (entries > maxEntries) fail("JOURNAL_LIMIT");
+  if (
+    !identifier(value.id) ||
+    (value.parentId !== null && !identifier(value.parentId)) ||
+    typeof value.type !== "string" ||
+    nodes.has(value.id)
+  )
+    fail("JOURNAL_INVALID");
+  const node: JournalNode = {
+    id: value.id,
+    parentId: value.parentId,
+    type: value.type,
+    ...(typeof value.customType === "string" ? { customType: value.customType } : {}),
+    ...(typeof value.customType === "string" && RETAINED.has(value.customType)
+      ? { data: value.data }
+      : {}),
+    digest: journalDigest(value),
+  };
+  nodes.set(value.id, node);
+  return node;
+}
+
+function checkComplete(line: string, fd: number, originalSize: number, headerSeen: boolean): void {
+  if (!headerSeen || line !== "" || fstatSync(fd).size !== originalSize) fail("JOURNAL_INVALID");
+}
+
+function readAllLines(
+  fd: number,
+  limits: JournalLimits,
+  consume: (text: string) => void,
+  getHeaderSeen: () => boolean,
+): void {
+  const stat = fstatSync(fd);
+  if (!stat.isFile()) fail("JOURNAL_UNAVAILABLE");
+  if (stat.size > limits.maxBytes) fail("JOURNAL_LIMIT");
+  const decoder = new TextDecoder("utf-8", { fatal: true, ignoreBOM: true });
+  let line = "";
+  let bytes = 0;
+  const buffer = Buffer.alloc(64 * 1024);
+  let count: number;
+  while ((count = readSync(fd, buffer, 0, buffer.length, null)) > 0) {
+    bytes += count;
+    if (bytes > limits.maxBytes) fail("JOURNAL_LIMIT");
+    line += decoder.decode(buffer.subarray(0, count), { stream: true });
+    let end: number;
+    while ((end = line.indexOf("\n")) !== -1) {
+      const physicalLine = line.slice(0, end);
+      if (Buffer.byteLength(physicalLine) > limits.maxLineBytes) fail("JOURNAL_LIMIT");
+      consume(physicalLine.endsWith("\r") ? physicalLine.slice(0, -1) : physicalLine);
+      line = line.slice(end + 1);
+    }
+    if (Buffer.byteLength(line) > limits.maxLineBytes) fail("JOURNAL_LIMIT");
+  }
+  line += decoder.decode();
+  checkComplete(line, fd, stat.size, getHeaderSeen());
+}
+
+function buildBranch(nodes: Map<string, JournalNode>, leafId: string | null): JournalNode[] {
+  const branch: JournalNode[] = [];
+  const seen = new Set<string>();
+  let id = leafId;
+  while (id !== null) {
+    const node = nodes.get(id);
+    if (!node || seen.has(id)) fail("JOURNAL_BRANCH_INVALID");
+    seen.add(id);
+    branch.push(node);
+    id = node.parentId;
+  }
+  branch.reverse();
+  return branch;
+}
+
+/** Reads only; never calls the native loader that can silently repair an incomplete tail. */
+export function inspectSessionJournal(
+  view: SessionJournalView,
+  limits: JournalLimits = LIMITS,
+): SessionJournal {
+  if (!view.path) fail("JOURNAL_UNAVAILABLE");
+  validateLimits(limits);
+  let fd: number;
+  try {
+    fd = openSync(view.path, constants.O_RDONLY | constants.O_NOFOLLOW);
+  } catch {
+    return fail("JOURNAL_UNAVAILABLE");
+  }
+  const nodes = new Map<string, JournalNode>();
+  let headerSeen = false;
+  let entries = 0;
+  function consume(text: string): void {
+    if (!text) fail("JOURNAL_INVALID");
+    let value: unknown;
+    try {
+      value = JSON.parse(text) as unknown;
+    } catch {
+      return fail("JOURNAL_INVALID");
+    }
+    if (!record(value)) fail("JOURNAL_INVALID");
+    if (!headerSeen) {
+      if (value.type !== "session" || value.version !== 3 || value.id !== view.sessionId)
+        fail("JOURNAL_INVALID");
+      headerSeen = true;
+      return;
+    }
+    entries++;
+    parseEntry(value, nodes, entries, limits.maxEntries);
+  }
+  try {
+    readAllLines(fd, limits, consume, () => headerSeen);
+  } catch (error) {
+    if (error instanceof JournalReadError) throw error;
+    return fail("JOURNAL_INVALID");
+  } finally {
+    closeSync(fd);
+  }
+  const branch = buildBranch(nodes, view.leafId);
+  return { sessionId: view.sessionId, nodes, branch };
+}
+
+function frame(value: unknown): value is ReadbackFrame {
+  return Check(ReadbackFrameSchema, value);
+}
+
+function matchesOwner(
+  binding: ReadbackFrame,
+  node: { customType?: string; data?: unknown },
+): boolean {
+  if (binding.owner === "board") {
+    return (
+      node.customType === "continuous-tasks:event" &&
+      record(node.data) &&
+      node.data.type === "resolve_decision"
+    );
+  }
+  return (
+    node.customType === "continuous-tasks:preflight-control" &&
+    record(node.data) &&
+    ["approve", "revoke", "reject", "start"].includes(String(node.data.kind))
+  );
+}
+
+function findControl(
+  branch: readonly JournalNode[],
+  sessionId: string,
+  owner: ReadbackFrame["owner"],
+  requestId: string,
+): { control: JournalNode; frame: ReadbackFrame } | undefined {
+  const candidates: Array<{ control: JournalNode; frame: ReadbackFrame }> = [];
+  for (const node of branch) {
+    if (node.type !== "custom" || !record(node.data)) continue;
+    if (!Object.hasOwn(node.data, "humanInteraction")) continue;
+    if (!frame(node.data.humanInteraction)) fail("READBACK_INVALID");
+    const binding = node.data.humanInteraction;
+    if (binding.sessionId !== sessionId) fail("READBACK_INVALID");
+    if (!matchesOwner(binding, node)) fail("READBACK_INVALID");
+    if (binding.owner === owner && binding.requestId === requestId)
+      candidates.push({ control: node, frame: binding });
+  }
+  if (candidates.length > 1) fail("READBACK_CONFLICT");
+  return candidates[0];
+}
+
+function validateWitnessData(data: Record<string, unknown>): void {
+  if (
+    Object.keys(data).length !== 4 ||
+    data.version !== 1 ||
+    !identifier(data.controlEntryId) ||
+    typeof data.controlDigest !== "string" ||
+    !/^[a-f0-9]{64}$/.test(data.controlDigest) ||
+    !frame(data.frame)
+  )
+    fail("READBACK_INVALID");
+}
+
+function collectWitnesses(branch: readonly JournalNode[], controlId: string): JournalNode[] {
+  const witnesses: JournalNode[] = [];
+  for (const node of branch) {
+    if (node.type !== "custom" || node.customType !== "continuous-tasks:human-readback") continue;
+    const { data } = node;
+    if (!record(data)) fail("READBACK_INVALID");
+    validateWitnessData(data);
+    if (data.controlEntryId === controlId) witnesses.push(node);
+  }
+  if (witnesses.length > 1) fail("READBACK_CONFLICT");
+  return witnesses;
+}
+
+function validateWitness(
+  witness: JournalNode,
+  found: { control: JournalNode; frame: ReadbackFrame },
+  branch: readonly JournalNode[],
+  nodes: ReadonlyMap<string, JournalNode>,
+  owner: ReadbackFrame["owner"],
+): JournalNode {
+  const data = witness.data as ReadbackWitness;
+  const base = nodes.get(found.frame.baseSnapshotEntryId);
+  const controlIndex = branch.indexOf(found.control);
+  const witnessIndex = branch.indexOf(witness);
+  const baseIndex = base ? branch.indexOf(base) : -1;
+  if (!base) fail("READBACK_INVALID");
+  const baseType = owner === "board" ? "continuous-tasks:snapshot" : "continuous-tasks:preflight";
+  if (
+    data.controlDigest !== found.control.digest ||
+    journalDigest(data.frame) !== journalDigest(found.frame) ||
+    witnessIndex <= controlIndex ||
+    baseIndex < 0 ||
+    baseIndex >= controlIndex ||
+    base.type !== "custom" ||
+    base.customType !== baseType ||
+    journalDigest(base.data) !== found.frame.baseSnapshotDigest
+  )
+    fail("READBACK_INVALID");
+  return base;
+}
+
+/** Structural disk evidence only; the owner must separately verify source, scope and action. */
+export function findReadbackProof(
+  journal: SessionJournal,
+  owner: ReadbackFrame["owner"],
+  requestId: string,
+): ReadbackProof {
+  const found = findControl(journal.branch, journal.sessionId, owner, requestId);
+  if (!found) return { status: "missing" };
+  const witnesses = collectWitnesses(journal.branch, found.control.id);
+  const witness = witnesses[0];
+  if (!witness) return { status: "unconfirmed", ...found };
+  const base = validateWitness(witness, found, journal.branch, journal.nodes, owner);
+  return { status: "confirmed", ...found, witness, base };
+}

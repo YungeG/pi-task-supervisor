@@ -7,7 +7,7 @@ import { beforeEach, describe, expect, it, vi } from "vitest";
 import extension from "../index";
 import { resetState } from "../state";
 import { activeBoard, ACTIVATION, BOUNDARY, deferred, getHandler } from "./helpers/lifecycle";
-import { createMockAPI, createMockContext } from "./helpers/mocks";
+import { attachMockJournal, createMockAPI, createMockContext } from "./helpers/mocks";
 
 function instance(id: string) {
   const mock = createMockAPI();
@@ -15,6 +15,7 @@ function instance(id: string) {
     ACTIVATION,
     { type: "custom", customType: "continuous-tasks:snapshot", data: activeBoard() },
   ]);
+  attachMockJournal(mock, ctx);
   vi.mocked(ctx.sessionManager.getSessionId).mockReturnValue(id);
   Object.assign(ctx, { model: { provider: "faux", id: "test" } });
   extension(mock.api);

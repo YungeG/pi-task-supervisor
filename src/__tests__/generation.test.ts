@@ -72,6 +72,8 @@ describe("generation monotonicity", () => {
       },
     ];
 
-    expect(reconstructState(createMockContext(branch))).toEqual(createEmptyBoard());
+    expect(() => reconstructState(createMockContext(branch))).toThrow(
+      /Non-monotonic board snapshot/,
+    );
   });
 });

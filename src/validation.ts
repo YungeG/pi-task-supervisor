@@ -7,6 +7,7 @@ import type {
   TaskStatus,
 } from "./types";
 import { TERMINAL_STATUSES, ACTIVE_STATUSES } from "./types";
+import { validDecisionSpec } from "./decision-spec";
 
 // ── String Validation ──
 
@@ -290,6 +291,17 @@ function hasValidV2Metadata(obj: Record<string, unknown>): boolean {
   return true;
 }
 
+function validDecisionMetadata(decision: Record<string, unknown>): boolean {
+  const spec = decision.spec;
+  if (spec !== undefined && !validDecisionSpec(spec)) return false;
+  if (
+    decision.response !== undefined &&
+    (decision.response !== "rejected" || spec?.kind !== "authorization")
+  )
+    return false;
+  return decision.supersedes === undefined || isSafeBoundedText(decision.supersedes, 100);
+}
+
 function isValidDecision(value: unknown, tasks: Array<Record<string, unknown>>): boolean {
   if (typeof value !== "object" || value === null) return false;
   const decision = value as Record<string, unknown>;
@@ -303,6 +315,7 @@ function isValidDecision(value: unknown, tasks: Array<Record<string, unknown>>):
     return false;
   }
   if (!tasks.some((task) => task.id === decision.taskId)) return false;
+  if (!validDecisionMetadata(decision)) return false;
   if (decision.options === undefined) return true;
   return (
     Array.isArray(decision.options) &&

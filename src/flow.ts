@@ -16,6 +16,7 @@ export interface FlowFacts {
   enabled: boolean;
   journalFault?: string;
   preflightIssue?: string;
+  receiptIssue?: string;
   sessionId: string;
   idle: boolean;
   pending: boolean;
@@ -26,6 +27,13 @@ export function flowFacts(ctx: ExtensionContext): FlowFacts {
   return {
     enabled: runtime.enabled,
     journalFault: runtime.journalFault,
+    receiptIssue: runtime.receiptStore?.pendingCount
+      ? "Unknown host capture requires explicit recover and fresh validation"
+      : runtime.supervisor &&
+          (!runtime.receiptStore || runtime.receiptStore.format === 2) &&
+          runtime.supervisor.status !== "stopped"
+        ? "Legacy receipt format requires explicit recover/migration for unfinished goals"
+        : undefined,
     preflightIssue: preflightTaskIssue(
       ctx,
       runtime.supervisor?.status === "stopped" ? undefined : runtime.supervisor?.preflightBinding,
@@ -58,7 +66,7 @@ export function resumeControlIssue(
 
 function controlFault(facts: FlowFacts): string | undefined {
   if (facts.journalFault) return "Inspect the journal before recovery";
-  return facts.preflightIssue;
+  return facts.preflightIssue ?? facts.receiptIssue;
 }
 
 /** Pure qualification shared by command control and read-only status projection. */
@@ -105,6 +113,14 @@ function preflightControlBlocker(facts: FlowFacts): string | undefined {
   return `inspect preflight authorization: ${facts.preflightIssue}`;
 }
 
+function decisionNextStep(board: Readonly<TaskBoardSnapshot>, after: string): string {
+  if (!board.decision?.spec)
+    return `legacy decision needs a complete structured replacement from Main, then /task-supervisor decide (native; no ID)${after}`;
+  if (board.decision.response === "rejected")
+    return `scope rejected; request a new structured replacement before another native response${after}`;
+  return `/task-supervisor decide (native response; no ID or chat approval)${after}`;
+}
+
 function flowBlocker(
   board: Readonly<TaskBoardSnapshot>,
   state: Readonly<SupervisorState> | undefined,
@@ -122,7 +138,7 @@ function flowBlocker(
       state && ["paused", "fault"].includes(state.status)
         ? `; then ${heldNextStep(board, state)}`
         : "; remaining gates still apply";
-    return `/task-supervisor resolve ${board.decision.id} <answer>${after}`;
+    return decisionNextStep(board, after);
   }
   if (!facts.idle || facts.pending)
     return "wait for the current host run/check and pending messages";
@@ -175,10 +191,21 @@ export function nextFlowStep(
   }
 }
 
-function preflightBlockerStatus(facts: FlowFacts): string[] {
-  return facts.preflightIssue ? [`Preflight blocker: ${facts.preflightIssue}`] : [];
+function evidenceBlockerStatus(facts: FlowFacts): string[] {
+  return [
+    ...(facts.preflightIssue ? [`Preflight blocker: ${facts.preflightIssue}`] : []),
+    ...(facts.receiptIssue ? [`Evidence: ${facts.receiptIssue}`] : []),
+  ];
 }
 
+function receiptStatusLines(): string[] {
+  const s = currentRuntime().receiptStore?.stats;
+  return s
+    ? [
+        `Receipts: ${s.count} total; cache ${s.cacheEntries}/${s.maxEntries} entries, ${s.cacheBytes}/${s.maxBytes} UTF-8 bytes; ${s.pending} unknown/in-flight; ledger v${s.format} ${s.healthy ? "healthy" : "fault"}; ${s.indexed} locator entries (linear metadata)`,
+      ]
+    : [];
+}
 export function formatFlowStatus(
   board: Readonly<TaskBoardSnapshot>,
   state: Readonly<SupervisorState> | undefined,
@@ -198,9 +225,10 @@ export function formatFlowStatus(
       `Hold source: ${state.holdCause ?? "unknown"}`,
       `Budget: reviews ${state.reviews}/${SUPERVISOR_LIMITS.reviews}; auto continuations ${state.continuations}/${SUPERVISOR_LIMITS.continuations}; stagnant ${state.stagnant}/${SUPERVISOR_LIMITS.stagnant}; advisor tokens ${state.tokens}; advisor cost ${state.cost}`,
     );
+  lines.push(...receiptStatusLines());
   lines.push(`External wait: ${externalWaitText(state)}`);
   if (facts.journalFault) lines.push(`Fault: ${facts.journalFault}`);
-  lines.push(...preflightBlockerStatus(facts));
+  lines.push(...evidenceBlockerStatus(facts));
   if (board.pauseReason) lines.push(`Paused: ${board.pauseReason}`);
   if (board.decision) lines.push(`Decision ${board.decision.id}: ${board.decision.question}`);
   for (const task of claimed) {

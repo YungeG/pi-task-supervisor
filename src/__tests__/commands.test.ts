@@ -6,7 +6,7 @@ import { currentRuntime } from "../runtime";
 import { supervisorState } from "../supervisor";
 import { getBoard, resetState, setBoard } from "../state";
 import type { TaskBoardSnapshot } from "../types";
-import { createMockAPI, createMockContext } from "./helpers/mocks";
+import { attachMockJournal, createMockAPI, createMockContext } from "./helpers/mocks";
 
 const NOW = "2026-08-23T00:00:00.000Z";
 
@@ -37,8 +37,12 @@ function activeBoard(): TaskBoardSnapshot {
 function commandHandler(mockAPI: ReturnType<typeof createMockAPI>, command = "continuous-tasks") {
   const call = mockAPI.registerCommand.mock.calls.find(([name]) => name === command);
   if (!call) throw new Error(`${command} command not registered`);
-  return (call[1] as { handler: (args: string, ctx: ExtensionCommandContext) => Promise<void> })
-    .handler;
+  return (args: string, ctx: ExtensionCommandContext) => {
+    attachMockJournal(mockAPI, ctx as ReturnType<typeof createMockContext>);
+    return (
+      call[1] as { handler: (args: string, ctx: ExtensionCommandContext) => Promise<void> }
+    ).handler(args, ctx);
+  };
 }
 
 describe("continuous-tasks command", () => {
@@ -65,7 +69,7 @@ describe("continuous-tasks command", () => {
     );
   });
 
-  it("resolves the exact waiting decision and resumes", async () => {
+  it("keeps legacy decisions waiting instead of authorizing from bare command text", async () => {
     const mockAPI = createMockAPI();
     registerCommands(mockAPI.api);
     const ctx = createMockContext() as ExtensionCommandContext;
@@ -84,19 +88,12 @@ describe("continuous-tasks command", () => {
 
     await handler("resolve decision-6 compatible", ctx);
 
-    expect(getBoard()).toMatchObject({ workflowStatus: "active", decision: undefined });
-    expect(mockAPI.appendEntry).toHaveBeenCalledWith(
-      "continuous-tasks:event",
-      expect.objectContaining({
-        type: "resolve_decision",
-        id: "decision-6",
-        answer: "compatible",
-      }),
-    );
-    expect(mockAPI.sendMessage).toHaveBeenCalledWith(
-      expect.objectContaining({ customType: "continuous-tasks:continue" }),
-      { triggerTurn: true, deliverAs: "followUp" },
-    );
+    expect(getBoard()).toMatchObject({
+      workflowStatus: "waiting_for_decision",
+      decision: { id: "decision-6" },
+    });
+    expect(mockAPI.appendEntry).not.toHaveBeenCalled();
+    expect(mockAPI.sendMessage).not.toHaveBeenCalled();
   });
 
   it("enables only the current session and does not duplicate the marker", async () => {
@@ -181,7 +178,7 @@ describe("continuous-tasks command", () => {
     expect(ctx.ui.notify).toHaveBeenCalledWith(expect.stringContaining(expected), "error");
   });
 
-  it("rejects a stale decision id and secret-like answer", async () => {
+  it("rejects stale IDs and never stores legacy answer arguments, including secrets", async () => {
     const mockAPI = createMockAPI();
     registerCommands(mockAPI.api);
     const ctx = createMockContext() as ExtensionCommandContext;
@@ -198,14 +195,14 @@ describe("continuous-tasks command", () => {
     };
     setBoard(waiting);
     await commandHandler(mockAPI)("resolve decision-5 answer", ctx);
-    expect(ctx.ui.notify).toHaveBeenCalledWith("Decision id does not match decision-6", "error");
+    expect(ctx.ui.notify).toHaveBeenCalledWith("Decision id is stale", "error");
 
     setBoard(waiting);
     await commandHandler(mockAPI)("resolve decision-6 token=secret-value-123456", ctx);
-    expect(ctx.ui.notify).toHaveBeenCalledWith(
-      "Decision answer is empty, too long, or secret-like",
-      "error",
-    );
+    expect(getBoard()).toEqual(waiting);
+    expect(mockAPI.appendEntry).not.toHaveBeenCalled();
+    expect(mockAPI.sendMessage).not.toHaveBeenCalled();
+    expect(JSON.stringify(vi.mocked(ctx.ui.notify).mock.calls)).not.toContain("secret-value");
   });
 
   it("starts an explicit supervisor goal without a model call or forged user message", async () => {

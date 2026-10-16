@@ -1,6 +1,29 @@
 # Changelog
 
-## Unreleased source revision
+## Unreleased native-human / receipt integration candidate
+
+- Native typed board authorization/choice/information and required-only preflight approval, with separate no-ID first start. Bare chat and ordinary SDK/RPC command text do not approve new scope.
+- Reuse the Supervisor owner's strict v1/v2/v3 history/ledger validation for physical first-start readback. Keep readonly recovery views, cache-only human repairs, explicit migrations and one continuation carrying the exact execution agreement.
+- Preserve pending host-intent holds after saving a human answer; bind lazy V2 archive reads to the already-validated batch head; retain a deferred legacy saturation barrier before explicit recovery/migration. Each correction has a behavioral red/green regression.
+- Full local gate: 1044 tests, unchanged 90% coverage threshold, twelve SDK smokes, dual-SDK cold/refusal checks and separate real CLI/PTY pilots. The original V2's 15 regression cases remain meaningful and enabled. Not committed, written back, installed or deployed.
+
+## Unreleased receipt integration candidate
+
+- Integrate the configured v2 format as a strictly validated, bounded archive view; explicit recovery anchors its exact checkpoint before continuing in v3, without copying/replacing historical bodies.
+- Retain the v2 safeguard for v1 snapshots saturated at 500: a one-time observation-gap barrier revokes old acceptance while preserving pauses, budgets, usage and completed boards. Below-saturation and stopped historical targets are not indiscriminately reopened.
+- Publish recovery active state only after checkpoint confirmation; failed or unacknowledged recovery holds the current runtime without continuing. Reopen reads the checkpoint actually committed, and treats an active checkpoint as interrupted rather than automatically running it.
+- Extend native SDK smoke with cross-batch v2 migration. Integration validation is tracked separately in `docs/receipt-integration-acceptance.md`; old V3-only results are not merge acceptance.
+- No source-tree cleanup, commit/merge, publication, installation, model or credential changes are part of this local candidate.
+
+## V3-only receipt-storage repair candidate (historical)
+
+- Remove the cumulative 500-receipt failure, using append-only branch-local proof records, small v3 checkpoints and a bounded raw cache instead of repeated full-history snapshots.
+- That V3-only candidate preserved evicted current-review/bound proof lookup, exact goal identity, immutable v1 migration anchors, usage and human gates; it did not include the configured v2 compatibility now added by the integration candidate.
+- Persist mutation intents and unmatched/late-result freshness barriers; never replay unknown work automatically or accept overlapping validation as fresh evidence.
+- Add bounded cache configuration and read-only status. Report current capture errors without repeatedly emitting a stale acceptance warning or dropping host structured results.
+- Add native SDK long-history, legacy migration and interrupted-intent smoke modes. Validation evidence and limitations are tracked in `docs/supervisor-receipt-storage-acceptance.md`; this is not a published/installed revision.
+
+## Preflight source revision (historical)
 
 - Opt-in read-only preflight, strict proposal-only submission, exact human permission selection and separately guarded startup; legacy supervision remains compatible.
 - Current-session/branch control closure, revision invalidation, protected advisor scope evidence and strong revocation without automatically resuming or changing host tool permissions.
