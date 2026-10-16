@@ -19,11 +19,25 @@ export function createMockTheme(): Theme {
 export function createMockContext(
   branch: Array<{
     type: string;
+    id?: string;
+    parentId?: string | null;
     customType?: string;
     data?: unknown;
   }> = [],
 ): ExtensionToolContext & ExtensionCommandContext {
-  return {
+  const entries = branch.map((entry, index) => ({
+    ...entry,
+    id: entry.id ?? `initial-${index + 1}`,
+    parentId:
+      entry.parentId !== undefined
+        ? entry.parentId
+        : index
+          ? (branch[index - 1]?.id ?? `initial-${index}`)
+          : null,
+  }));
+  const getBranch = vi.fn(() => entries);
+  const getLeafId = vi.fn((): string | null => getBranch().at(-1)?.id ?? null);
+  const ctx = {
     hasUI: true,
     mode: "tui",
     waitForIdle: vi.fn(async () => undefined),
@@ -35,13 +49,50 @@ export function createMockContext(
       notify: vi.fn(),
     },
     sessionManager: {
-      getBranch: vi.fn(() => branch),
+      getBranch,
       getSessionId: vi.fn(() => "test-session"),
-      getLeafId: vi.fn(() => "test-leaf"),
+      getLeafId,
+      getLeafEntry: vi.fn(() => getBranch().find((entry) => entry.id === getLeafId())),
+      getEntry: vi.fn((id: string) => getBranch().find((entry) => entry.id === id)),
     },
     isIdle: vi.fn(() => true),
     hasPendingMessages: vi.fn(() => false),
-  } as unknown as ExtensionToolContext & ExtensionCommandContext;
+  };
+  return ctx as unknown as ExtensionToolContext & ExtensionCommandContext;
+}
+
+let journalSequence = 0;
+/** Filesystem/SDK persistence seam: real identities and parent links, never a fixed fake leaf. */
+export function attachMockJournal(
+  mock: ReturnType<typeof createMockAPI>,
+  ctx: ReturnType<typeof createMockContext>,
+): void {
+  mock.appendEntry.mockImplementation((customType: string, data: unknown) => {
+    const entry = {
+      id: `journal-${++journalSequence}`,
+      parentId: ctx.sessionManager.getLeafId(),
+      type: "custom",
+      customType,
+      data: structuredClone(data),
+      timestamp: new Date().toISOString(),
+    };
+    (ctx.sessionManager.getBranch() as unknown[]).push(entry);
+  });
+}
+
+/** Append native transcript entries without replacing the evidence branch. */
+export function appendMockEntries(
+  ctx: ReturnType<typeof createMockContext>,
+  entries: Array<Record<string, unknown>>,
+): void {
+  for (const entry of entries) {
+    (ctx.sessionManager.getBranch() as unknown[]).push({
+      ...entry,
+      id: `native-${++journalSequence}`,
+      parentId: ctx.sessionManager.getLeafId(),
+      timestamp: new Date().toISOString(),
+    });
+  }
 }
 
 /** Creates a mock ExtensionAPI */

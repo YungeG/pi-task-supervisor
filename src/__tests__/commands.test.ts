@@ -6,7 +6,7 @@ import { currentRuntime } from "../runtime";
 import { supervisorState } from "../supervisor";
 import { getBoard, resetState, setBoard } from "../state";
 import type { TaskBoardSnapshot } from "../types";
-import { createMockAPI, createMockContext } from "./helpers/mocks";
+import { attachMockJournal, createMockAPI, createMockContext } from "./helpers/mocks";
 
 const NOW = "2026-08-23T00:00:00.000Z";
 
@@ -37,8 +37,12 @@ function activeBoard(): TaskBoardSnapshot {
 function commandHandler(mockAPI: ReturnType<typeof createMockAPI>, command = "continuous-tasks") {
   const call = mockAPI.registerCommand.mock.calls.find(([name]) => name === command);
   if (!call) throw new Error(`${command} command not registered`);
-  return (call[1] as { handler: (args: string, ctx: ExtensionCommandContext) => Promise<void> })
-    .handler;
+  return (args: string, ctx: ExtensionCommandContext) => {
+    attachMockJournal(mockAPI, ctx as ReturnType<typeof createMockContext>);
+    return (
+      call[1] as { handler: (args: string, ctx: ExtensionCommandContext) => Promise<void> }
+    ).handler(args, ctx);
+  };
 }
 
 describe("continuous-tasks command", () => {

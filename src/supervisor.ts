@@ -1,9 +1,10 @@
-import { createHash } from "node:crypto";
 import { StringEnum, type AssistantMessage, type Usage } from "@earendil-works/pi-ai";
 import type {
   ExtensionAPI,
   ExtensionContext,
   ToolResultEvent,
+  ToolCallEvent,
+  SessionEntry,
 } from "@earendil-works/pi-coding-agent";
 import { Type, type Static } from "typebox";
 import { Check } from "typebox/value";
@@ -19,6 +20,18 @@ import { TASK_TOOL_NAMES } from "./scope";
 import type { CompletionEvidence, TaskBoardSnapshot } from "./types";
 import { completionEvidenceError, isSafeBoundedText } from "./validation";
 import { SUPERVISOR_LIMITS } from "./flow";
+import {
+  ReceiptSchema,
+  ReceiptLedgerSchema,
+  ReceiptStore,
+  RECEIPT_LEDGER_ENTRY,
+  isReceiptLedgerRecord,
+  digest,
+  redact,
+  redactedJSON,
+} from "./receipt-store";
+export { digest, redact } from "./receipt-store";
+import { V2CursorSchema, V2ReceiptHistory, V2_RECEIPTS_ENTRY, type V2Cursor } from "./receipt-v2";
 
 export const SUPERVISOR_ENTRY = "continuous-tasks:supervisor";
 const MAX_SUPERVISED_TASKS = SUPERVISOR_LIMITS.tasks;
@@ -30,18 +43,6 @@ export function supervisorPlanError(taskCount: number): string | undefined {
 }
 const text = (maxLength: number) => Type.String({ minLength: 1, maxLength });
 const natural = Type.Integer({ minimum: 0 });
-const ReceiptSchema = Type.Object({
-  id: text(300),
-  tool: text(200),
-  taskIds: Type.Array(text(100), { maxItems: 100 }),
-  reviews: Type.Array(Type.Object({ taskId: text(100), digest: text(64) }), { maxItems: 100 }),
-  epoch: natural,
-  ok: Type.Boolean(),
-  exitCode: Type.Optional(Type.Integer()),
-  digest: text(64),
-  input: text(2000),
-  output: text(2000),
-});
 const BindingSchema = Type.Object({
   taskId: text(100),
   digest: text(64),
@@ -95,9 +96,22 @@ const SupervisorSchema = Type.Object({
   preflightBinding: Type.Optional(PreflightBindingSchema),
   acceptedDigest: Type.Optional(text(64)),
   receipts: Type.Array(ReceiptSchema, { maxItems: 500 }),
+  receiptGapEpoch: Type.Optional(Type.Integer({ minimum: 0, maximum: Number.MAX_SAFE_INTEGER })),
   bindings: Type.Array(BindingSchema, { maxItems: MAX_SUPERVISED_TASKS }),
   tokens: natural,
   cost: Type.Number({ minimum: 0 }),
+});
+const SupervisorV2Schema = Type.Object({
+  ...SupervisorSchema.properties,
+  version: Type.Literal(2),
+  receipts: Type.Array(ReceiptSchema, { maxItems: 0 }),
+  receiptJournal: V2CursorSchema,
+});
+const SupervisorCheckpointSchema = Type.Object({
+  ...SupervisorSchema.properties,
+  version: Type.Literal(3),
+  receipts: Type.Array(ReceiptSchema, { maxItems: 0 }),
+  receiptLedger: ReceiptLedgerSchema,
 });
 export type SupervisorState = Static<typeof SupervisorSchema>;
 export type SupervisorHoldCause = NonNullable<SupervisorState["holdCause"]>;
@@ -118,40 +132,43 @@ export type Advisor = (
   signal: AbortSignal,
 ) => Promise<{ advice: Advice; usage?: Usage }>;
 
-export function digest(value: unknown): string {
-  return createHash("sha256").update(JSON.stringify(value)).digest("hex");
-}
-
-export function redact(value: string, limit = 2000): string {
-  return (
-    value
-      .replace(
-        /\bBearer\s+\S+|\b(?:api[_-]?key|(?:access[_-]?|refresh[_-]?)?token|password|authorization|client[_-]?secret)["']?\s*[:=]\s*(?:"(?:\\.|[^"\\])*"|'(?:\\.|[^'\\])*'|[^\s,;}]+)|\b(?:sk|ghp|pt|dt)_[A-Za-z0-9_-]{8,}/gi,
-        "[redacted]",
-      )
-      .slice(0, limit) || "(empty)"
-  );
-}
-
-function redactedJSON(value: unknown): string {
-  return JSON.stringify(value, (key, item: unknown) => {
-    if (
-      /^(?:api[_-]?key|(?:access[_-]?|refresh[_-]?)?token|password|authorization|client[_-]?secret)$/i.test(
-        key,
-      )
-    )
-      return "[redacted]";
-    return typeof item === "string" ? redact(item, item.length) : item;
-  });
-}
-
 export function supervisorState(): SupervisorState | undefined {
   return currentRuntime().supervisor;
 }
 
-export function saveSupervisor(pi: ExtensionAPI): void {
-  const state = supervisorState();
-  if (state) pi.appendEntry(SUPERVISOR_ENTRY, structuredClone(state));
+function goalIdentity(state: SupervisorState): string {
+  const binding = state.preflightBinding;
+  return digest([
+    state.sessionId,
+    state.goal,
+    state.model.provider,
+    state.model.id,
+    binding?.preflightId,
+    binding?.planId,
+    binding?.planDigest,
+  ]);
+}
+export function saveSupervisor(pi: ExtensionAPI, state = supervisorState()): void {
+  if (!state) return;
+  const store = currentRuntime().receiptStore;
+  if (!store) {
+    pi.appendEntry(SUPERVISOR_ENTRY, structuredClone(state));
+    return;
+  }
+  const owner = supervisorState();
+  if (
+    !owner ||
+    state.sessionId !== owner.sessionId ||
+    state.goal !== owner.goal ||
+    goalIdentity(state) !== currentRuntime().receiptIdentity ||
+    state.epoch !== store.epoch
+  )
+    throw new Error("Supervisor checkpoint changed receipt identity/version");
+  const value =
+    store.format === 2
+      ? { ...structuredClone(state), version: 2, receipts: [], receiptJournal: store.v2Cursor }
+      : { ...structuredClone(state), version: 3, receipts: [], receiptLedger: store.checkpoint() };
+  store.appendCheckpoint(SUPERVISOR_ENTRY, value);
 }
 
 function updateSupervisorUI(ctx: ExtensionContext): void {
@@ -196,8 +213,16 @@ export function holdSupervisor(
   state.reason ??= redact(reason);
   state.externalWait = undefined;
   state.pending = false;
-  saveSupervisor(pi);
-  supervisorNotice(pi, ctx, state.reason);
+  try {
+    saveSupervisor(pi);
+  } catch (error) {
+    currentRuntime().journalFault ??=
+      error instanceof Error ? error.message : "Supervisor checkpoint persistence failed";
+    state.status = "fault";
+    state.reason = currentRuntime().journalFault;
+    state.acceptedDigest = undefined;
+  }
+  supervisorNotice(pi, ctx, state.reason ?? "Supervisor checkpoint failed");
 }
 
 export function startSupervisor(pi: ExtensionAPI, ctx: ExtensionContext, goal: string): void {
@@ -234,6 +259,8 @@ export function startSupervisor(pi: ExtensionAPI, ctx: ExtensionContext, goal: s
     tokens: 0,
     cost: 0,
   };
+  currentRuntime().receiptStore = new ReceiptStore(pi, ctx, ctx.sessionManager.getSessionId());
+  currentRuntime().receiptIdentity = goalIdentity(currentRuntime().supervisor as SupervisorState);
   saveSupervisor(pi);
   supervisorNotice(
     pi,
@@ -254,15 +281,178 @@ function restoreBoundPreflight(
   holdSupervisor(pi, ctx, "paused", issue, "authorization_revoked");
 }
 
+function decodeSupervisorEntry(data: unknown): {
+  state: SupervisorState;
+  ledger?: Static<typeof ReceiptLedgerSchema>;
+  v2?: V2Cursor;
+} {
+  if (Check(SupervisorCheckpointSchema, data)) {
+    const { receiptLedger, ...metadata } = data;
+    return { state: { ...metadata, version: 1 }, ledger: receiptLedger };
+  }
+  if (Check(SupervisorV2Schema, data)) {
+    const { receiptJournal, ...metadata } = data;
+    return { state: { ...metadata, version: 1 }, v2: receiptJournal };
+  }
+  if (!Check(SupervisorSchema, data))
+    throw new Error("Invalid persisted supervisor state/unsupported receipt format");
+  return { state: data };
+}
+function registerReceiptGoal(
+  goals: Map<string, string>,
+  state: SupervisorState,
+  goalId: string,
+): void {
+  const identity = goalIdentity(state);
+  const previous = goals.get(goalId);
+  if (previous !== undefined && previous !== identity)
+    throw new Error("Receipt goal scope changed across checkpoints");
+  goals.set(goalId, identity);
+}
+function consumeReceiptHistory(
+  ctx: ExtensionContext,
+  entry: SessionEntry,
+  goals: Map<string, string>,
+  v2: V2ReceiptHistory,
+): boolean {
+  if (entry.type !== "custom") return false;
+  if (entry.customType === V2_RECEIPTS_ENTRY) {
+    v2.observeBatch(entry);
+    return true;
+  }
+  if (entry.customType !== RECEIPT_LEDGER_ENTRY) return false;
+  if (!isReceiptLedgerRecord(entry.data)) throw new Error("Invalid receipt ledger record");
+  if (entry.data.sessionId === ctx.sessionManager.getSessionId() && !goals.has(entry.data.goalId))
+    throw new Error("Receipt ledger has no current-branch goal checkpoint");
+  return true;
+}
+function validateLegacyScope(
+  state: SupervisorState,
+  ledger: Static<typeof ReceiptLedgerSchema>,
+  scopes: Map<string, string>,
+  latest: string | undefined,
+): void {
+  const base = ledger.legacyBase;
+  if (base && (scopes.get(base.entryId) !== goalIdentity(state) || base.entryId !== latest))
+    throw new Error("Legacy receipt goal scope does not match its earlier checkpoint");
+}
+function readSupervisorHistory(ctx: ExtensionContext) {
+  let state: SupervisorState | undefined;
+  let ledger: Static<typeof ReceiptLedgerSchema> | undefined;
+  const goals = new Map<string, string>();
+  const legacyScopes = new Map<string, string>();
+  const v2 = new V2ReceiptHistory(ctx);
+  let legacyV2Entry: string | undefined;
+  let lastLegacyEntry: string | undefined;
+  for (const entry of ctx.sessionManager.getBranch()) {
+    if (consumeReceiptHistory(ctx, entry, goals, v2)) continue;
+    if (entry.type !== "custom" || entry.customType !== SUPERVISOR_ENTRY) continue;
+    const next = decodeSupervisorEntry(entry.data);
+    if (next.state.sessionId !== ctx.sessionManager.getSessionId()) continue;
+    if (next.ledger) {
+      ledger = next.ledger;
+      validateLegacyScope(next.state, ledger, legacyScopes, lastLegacyEntry);
+      registerReceiptGoal(goals, next.state, ledger.goalId);
+    } else {
+      if (ledger || (legacyV2Entry && !next.v2))
+        throw new Error("Receipt checkpoint cannot downgrade to an older format");
+      if (next.v2) {
+        v2.acknowledge(entry.id, next.v2, next.state.epoch, goalIdentity(next.state));
+        legacyV2Entry = entry.id;
+      }
+      legacyScopes.set(entry.id, goalIdentity(next.state));
+      lastLegacyEntry = entry.id;
+    }
+    state = next.state;
+  }
+  v2.finish();
+  return {
+    state: state ? structuredClone(state) : undefined,
+    ledger,
+    legacyV2: !ledger && legacyV2Entry ? v2.archive(legacyV2Entry) : undefined,
+    resolveV2: (entryId: string, expected: string) => v2.archive(entryId, expected),
+  };
+}
+function rejectLegacyGap(state: SupervisorState, reason: string): never {
+  state.status = "fault";
+  state.pending = false;
+  state.acceptedDigest = undefined;
+  throw new Error(reason);
+}
+function validateGapBarrier(state: SupervisorState, marker: number): void {
+  if (
+    marker < 1 ||
+    marker > state.epoch ||
+    state.status === "completed" ||
+    state.acceptedDigest !== undefined
+  )
+    rejectLegacyGap(state, "Invalid legacy receipt gap barrier");
+}
+function retainLegacyGap(pi: ExtensionAPI, ctx: ExtensionContext, state: SupervisorState): void {
+  if (state.receipts.length !== 500 || state.status === "stopped") return;
+  if (state.receiptGapEpoch !== undefined) {
+    validateGapBarrier(state, state.receiptGapEpoch);
+    return;
+  }
+  if (!Number.isSafeInteger(state.epoch + 1))
+    rejectLegacyGap(state, "Legacy receipt epoch overflow");
+  state.epoch++;
+  state.receiptGapEpoch = state.epoch;
+  state.acceptedDigest = undefined;
+  state.pending = false;
+  state.externalWait = undefined;
+  const reason =
+    "Legacy receipt capacity reached; later tools may be unobserved. Inspect the gap and obtain fresh validation; no automatic replay";
+  if (!["paused", "fault"].includes(state.status)) {
+    state.status = "fault";
+    state.reason = reason;
+    state.holdCause = "interrupted";
+  }
+  const parent = ctx.sessionManager.getLeafId();
+  pi.appendEntry(SUPERVISOR_ENTRY, structuredClone(state));
+  const entry = ctx.sessionManager.getLeafEntry();
+  if (
+    !entry ||
+    entry.id === parent ||
+    entry.parentId !== parent ||
+    entry.type !== "custom" ||
+    entry.customType !== SUPERVISOR_ENTRY ||
+    digest(entry.data) !== digest(state)
+  )
+    throw new Error("Legacy receipt gap barrier was not confirmed on the actual branch");
+  supervisorNotice(pi, ctx, reason);
+}
+function restoreReceiptViews(
+  pi: ExtensionAPI,
+  ctx: ExtensionContext,
+  history: ReturnType<typeof readSupervisorHistory>,
+): void {
+  const { state, ledger, legacyV2, resolveV2 } = history;
+  if (!state) return;
+  if (ledger)
+    currentRuntime().receiptStore = ReceiptStore.restore(
+      pi,
+      ctx,
+      ledger,
+      SUPERVISOR_ENTRY,
+      resolveV2,
+    );
+  else if (legacyV2) currentRuntime().receiptStore = ReceiptStore.fromV2(pi, ctx, legacyV2);
+  else {
+    retainLegacyGap(pi, ctx, state);
+    return;
+  }
+  currentRuntime().receiptIdentity = goalIdentity(state);
+  syncReceiptState(state);
+}
 export function restoreSupervisor(pi: ExtensionAPI, ctx: ExtensionContext): void {
   currentRuntime().supervisor = undefined;
-  for (const entry of ctx.sessionManager.getBranch()) {
-    if (entry.type !== "custom" || entry.customType !== SUPERVISOR_ENTRY) continue;
-    if (!Check(SupervisorSchema, entry.data)) throw new Error("Invalid persisted supervisor state");
-    if (entry.data.sessionId === ctx.sessionManager.getSessionId())
-      currentRuntime().supervisor = structuredClone(entry.data);
-  }
-  const state = supervisorState();
+  currentRuntime().receiptStore = undefined;
+  currentRuntime().receiptIdentity = undefined;
+  const history = readSupervisorHistory(ctx);
+  const state = history.state;
+  currentRuntime().supervisor = state;
+  restoreReceiptViews(pi, ctx, history);
   if (state) restoreBoundPreflight(pi, ctx, state);
   if (
     state?.status === "completed" &&
@@ -287,6 +477,28 @@ export function restoreSupervisor(pi: ExtensionAPI, ctx: ExtensionContext): void
   updateSupervisorUI(ctx);
 }
 
+function receiptRecoveryStore(
+  pi: ExtensionAPI,
+  ctx: ExtensionContext | undefined,
+  state: SupervisorState,
+): ReceiptStore {
+  const existing = currentRuntime().receiptStore;
+  if (existing) return existing;
+  if (!ctx) throw new Error("Receipt migration requires current session context");
+  const anchor = [...ctx.sessionManager.getBranch()]
+    .reverse()
+    .find(
+      (entry) =>
+        entry.type === "custom" &&
+        entry.customType === SUPERVISOR_ENTRY &&
+        digest(entry.data) === digest(state),
+    );
+  if (!anchor) throw new Error("Legacy receipt migration needs its exact branch checkpoint");
+  const store = ReceiptStore.migrate(pi, ctx, state, anchor.id);
+  currentRuntime().receiptStore = store;
+  currentRuntime().receiptIdentity = goalIdentity(state);
+  return store;
+}
 export function recoverSupervisor(pi: ExtensionAPI, ctx?: ExtensionContext): void {
   const state = supervisorState();
   if (!state || !["paused", "fault"].includes(state.status))
@@ -303,70 +515,117 @@ export function recoverSupervisor(pi: ExtensionAPI, ctx?: ExtensionContext): voi
     const issue = preflightAuthorizationIssue(ctx, state.preflightBinding);
     if (issue) throw new Error(issue);
   }
-  state.status = "active";
-  state.reason = undefined;
-  state.holdCause = undefined;
-  state.reviews = 0;
-  state.continuations = 0;
-  state.stagnant = 0;
-  state.pending = false;
-  saveSupervisor(pi);
-}
-
-function observedExitCode(structured: ToolResultEvent["structuredContent"]): number | undefined {
-  return typeof structured === "object" &&
-    structured !== null &&
-    "exit_code" in structured &&
-    typeof structured.exit_code === "number" &&
-    Number.isInteger(structured.exit_code)
-    ? structured.exit_code
-    : undefined;
-}
-
-/** Only host tool-result events create receipts; labels/exit codes supplied by Main are not proof. */
-export function observeTool(pi: ExtensionAPI, event: ToolResultEvent): void {
-  const state = supervisorState();
-  if (
-    !state ||
-    state.status === "stopped" ||
-    TASK_TOOL_NAMES.includes(event.toolName) ||
-    event.toolName === "submit_preflight"
-  )
-    return;
-  if (state.receipts.some((receipt) => receipt.id === `tool:${event.toolCallId}`)) return;
-  if (state.receipts.length >= 500) throw new Error("Evidence receipt limit reached");
-  const readOnly =
-    ["read", "ls", "find", "grep"].includes(event.toolName) ||
-    pi.getAllTools().find((tool) => tool.name === event.toolName)?.annotations?.readOnlyHint ===
-      true;
-  if (!readOnly) state.epoch++;
-  const structured = event.structuredContent;
-  const exitCode = observedExitCode(structured);
-  state.receipts.push({
-    id: `tool:${event.toolCallId}`,
-    tool: event.toolName,
-    taskIds: getBoardRef()
-      .tasks.filter((task) => task.status === "reviewing")
-      .map((task) => task.id),
-    reviews: getBoardRef()
-      .tasks.filter((task) => task.status === "reviewing")
-      .map((task) => ({ taskId: task.id, digest: digest(task) })),
-    epoch: state.epoch,
-    ok: !event.isError,
-    exitCode,
-    digest: digest({ input: event.input, content: event.content, structured }),
-    input: redactedJSON(event.input).slice(0, 2000),
-    output: redact(
-      event.content.flatMap((item) => (item.type === "text" ? [item.text] : [])).join("\n"),
-    ),
-  });
-  if (state.status === "completed" && !readOnly) {
+  try {
+    const store = receiptRecoveryStore(pi, ctx, state);
+    store.promoteV2();
+    store.closeUnknown();
+    syncReceiptState(state);
+    const next: SupervisorState = {
+      ...state,
+      status: "active",
+      reason: undefined,
+      holdCause: undefined,
+      reviews: 0,
+      continuations: 0,
+      stagnant: 0,
+      pending: false,
+    };
+    saveSupervisor(pi, next);
+    currentRuntime().supervisor = next;
+  } catch (error) {
+    syncReceiptState(state);
+    state.status = "fault";
+    state.pending = false;
     state.acceptedDigest = undefined;
+    currentRuntime().journalFault =
+      error instanceof Error ? error.message : "Receipt recovery checkpoint failed";
+    throw error;
+  }
+}
+
+function capturedTool(toolName: string): boolean {
+  return !TASK_TOOL_NAMES.includes(toolName) && toolName !== "submit_preflight";
+}
+function readOnlyTool(pi: ExtensionAPI, name: string): boolean {
+  return (
+    ["read", "ls", "find", "grep"].includes(name) ||
+    pi.getAllTools().find((tool) => tool.name === name)?.annotations?.readOnlyHint === true
+  );
+}
+function syncReceiptState(state: SupervisorState): void {
+  const store = currentRuntime().receiptStore;
+  if (!store) return;
+  if (state.epoch !== store.epoch) state.acceptedDigest = undefined;
+  state.epoch = store.epoch;
+  state.receipts = store.cachedReceipts;
+}
+export function prepareToolCapture(pi: ExtensionAPI, event: ToolCallEvent): void {
+  const state = supervisorState();
+  if (!state || state.status === "stopped" || !capturedTool(event.toolName)) return;
+  const store = currentRuntime().receiptStore;
+  if (!store || store.format === 2) {
+    if (!readOnlyTool(pi, event.toolName))
+      throw new Error("Legacy goal needs explicit recover/migration before more execution");
+    return;
+  }
+  try {
+    store.prepareToolCapture(
+      event,
+      getBoardRef()
+        .tasks.filter((task) => task.status === "reviewing")
+        .map((task) => ({ taskId: task.id, digest: digest(task) })),
+      readOnlyTool(pi, event.toolName),
+    );
+  } finally {
+    syncReceiptState(state);
+  }
+}
+/** Only committed host results create proof; cache projections never replace the ledger. */
+export function observeTool(
+  pi: ExtensionAPI,
+  event: ToolResultEvent,
+): Static<typeof ReceiptSchema> | undefined {
+  const state = supervisorState();
+  if (!state || state.status === "stopped" || !capturedTool(event.toolName)) return;
+  const store = currentRuntime().receiptStore;
+  if (!store || store.format === 2) return;
+  let receipt: Static<typeof ReceiptSchema>;
+  try {
+    receipt = store.commitToolReceipt(event);
+  } finally {
+    syncReceiptState(state);
+  }
+  if (state.status === "completed" && !readOnlyTool(pi, event.toolName))
     throw new Error(
       "Work changed after supervisor acceptance; revalidation and a new goal are required",
     );
+  return receipt;
+}
+function observedReceipts(
+  state: SupervisorState,
+  ids: readonly string[],
+  recent = 0,
+): Static<typeof ReceiptSchema>[] {
+  const store = state === supervisorState() ? currentRuntime().receiptStore : undefined;
+  if (store) {
+    try {
+      return store.readReceipts(ids, recent);
+    } catch (error) {
+      if (!store.healthy) {
+        currentRuntime().journalFault =
+          error instanceof Error ? error.message : "Archived receipt lookup failed";
+        state.status = "fault";
+        state.pending = false;
+        state.acceptedDigest = undefined;
+      }
+      throw error;
+    }
   }
-  saveSupervisor(pi);
+  const selected = new Set(ids);
+  return state.receipts.filter(
+    (receipt, index) =>
+      selected.has(receipt.id) || (recent > 0 && index >= state.receipts.length - recent),
+  );
 }
 
 function receiptMatchesReview(
@@ -377,6 +636,8 @@ function receiptMatchesReview(
   const task = getBoardRef().tasks.find((candidate) => candidate.id === taskId);
   return (
     !!receipt?.ok &&
+    receipt.eligible !== false &&
+    !currentRuntime().receiptStore?.pendingCount &&
     !!task &&
     receipt.epoch === epoch &&
     receipt.reviews.some((review) => review.taskId === taskId && review.digest === digest(task))
@@ -393,7 +654,7 @@ export function assertObservedEvidence(
   if (error || !evidence) throw new Error(error ?? "Missing evidence");
   const passed = evidence.refs.filter((ref) => ref.status === "passed");
   for (const ref of passed) {
-    const receipt = state.receipts.find((candidate) => candidate.id === ref.ref);
+    const receipt = ref.ref ? observedReceipts(state, [ref.ref])[0] : undefined;
     if (!receipt || !receiptMatchesReview(receipt, taskId, state.epoch))
       throw new Error(
         `Task ${taskId}: evidence must reference a successful fresh host receipt from its review (tool:<id>)`,
@@ -432,8 +693,12 @@ function freshFinalValidation(board: Readonly<TaskBoardSnapshot>, state: Supervi
     (candidate) => candidate.taskId === board.finalAcceptanceTaskId,
   );
   return !!binding?.refs.some((ref) =>
-    state.receipts.some(
-      (receipt) => receipt.id === ref && receipt.epoch === state.epoch && receipt.exitCode === 0,
+    observedReceipts(state, [ref]).some(
+      (receipt) =>
+        receipt.id === ref &&
+        receipt.epoch === state.epoch &&
+        receipt.exitCode === 0 &&
+        receipt.eligible !== false,
     ),
   );
 }
@@ -446,15 +711,25 @@ function boardComplete(board: Readonly<TaskBoardSnapshot>): boolean {
   );
 }
 
+function supervisorAcceptanceIssue(
+  state: SupervisorState,
+  ctx?: ExtensionContext,
+): string | undefined {
+  const issue = state.preflightBinding
+    ? preflightAuthorizationIssue(ctx, state.preflightBinding)
+    : undefined;
+  if (issue) return issue;
+  return currentRuntime().receiptStore?.pendingCount
+    ? "A potentially mutating host tool still has an unknown/in-flight result"
+    : undefined;
+}
 export function acceptanceError(
   board: Readonly<TaskBoardSnapshot>,
   state: SupervisorState,
   ctx?: ExtensionContext,
 ): string | undefined {
-  if (state.preflightBinding) {
-    const issue = preflightAuthorizationIssue(ctx, state.preflightBinding);
-    if (issue) return issue;
-  }
+  const scopeIssue = supervisorAcceptanceIssue(state, ctx);
+  if (scopeIssue) return scopeIssue;
   if (!boardComplete(board)) return "Task board and final acceptance are not complete";
   if (board.tasks.some((task) => task.status !== "done" || task.executionRef))
     return "Every task must be done with no unresolved execution receipt (abandonment is not acceptance)";
@@ -478,7 +753,7 @@ export function acceptanceError(
     if (
       !binding ||
       !binding.refs.every((ref) =>
-        state.receipts.some((receipt) => receipt.id === ref && receipt.ok),
+        observedReceipts(state, [ref]).some((receipt) => receipt.id === ref && receipt.ok),
       )
     )
       return `Task ${task.id} lacks host-verified completion evidence`;
@@ -505,9 +780,7 @@ export function evidencePacket(
   state: SupervisorState,
 ): string {
   const referenced = new Set(state.bindings.flatMap((binding) => binding.refs));
-  const receipts = state.receipts.filter(
-    (receipt, index) => referenced.has(receipt.id) || index >= state.receipts.length - 30,
-  );
+  const receipts = observedReceipts(state, [...referenced], 30);
   const recent = ctx.sessionManager
     .getBranch()
     .slice(-16)
@@ -687,7 +960,9 @@ function applyAdvice(
     throw new Error("Malformed or unsafe supervisor advice");
   if (
     result.advice.taskIds.some((id) => !board.tasks.some((task) => task.id === id)) ||
-    result.advice.evidenceRefs.some((id) => !state.receipts.some((receipt) => receipt.id === id))
+    result.advice.evidenceRefs.some(
+      (id) => !observedReceipts(state, [id]).some((receipt) => receipt.id === id),
+    )
   )
     throw new Error("Supervisor cited nonexistent tasks/evidence");
   recordUsage(state, result.usage);
@@ -705,7 +980,7 @@ function applyAdvice(
       result.advice.evidenceRefs.some(
         (ref) =>
           !state.bindings.some((binding) => binding.refs.includes(ref)) ||
-          !state.receipts.some((receipt) => receipt.id === ref && receipt.ok),
+          !observedReceipts(state, [ref]).some((receipt) => receipt.id === ref && receipt.ok),
       )
     )
       throw new Error("Acceptance advice must cite bound successful host evidence");
@@ -731,6 +1006,16 @@ export async function reviewSupervisor(
   const state = supervisorState();
   if (!state || state.status !== "active") return undefined;
   const board = getBoardRef();
+  if (currentRuntime().receiptStore?.pendingCount) {
+    holdSupervisor(
+      pi,
+      ctx,
+      "fault",
+      "Unknown host capture requires explicit recover and fresh validation; no automatic replay",
+      "interrupted",
+    );
+    return undefined;
+  }
   if (state.preflightBinding) {
     const issue = preflightAuthorizationIssue(ctx, state.preflightBinding);
     if (issue) {

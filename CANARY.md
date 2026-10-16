@@ -1,6 +1,18 @@
 # Local supervisor validation report
 
-## Latest validated source: opt-in preflight and safe continuation
+## Receipt integration candidate — LOCAL PASS (not merged or installed)
+
+The V2/V3 semantic integration has fresh local validation at code/test/config fingerprint `09641ecbc4b44d590ae8b8d5fc083d117c19e56ab9c349a8f29ba71b88a96d40`: **768 tests / 36 files PASS; 90.20% branches with unchanged 90% gates**, lint complexity maximum 15, and twelve development SDK smoke modes. Its frozen source passed twelve dependency-free package cold modes on each of SDK 1.1/1.2 and six refusal checks using old v1/v2/V3-only readers. Cross-batch v2 migration, exact sibling-branch rejection and unacknowledged committed recovery are covered. Resource samples 100→1000→5000 passed; the raw cache stayed at 128 entries at 5000, while index/session memory still grows with history.
+
+Fresh integration evidence is recorded in [receipt-integration-acceptance.md](./docs/receipt-integration-acceptance.md). Historical results below are baseline evidence only, not integration acceptance. Original main/V2/V3/human-interaction trees and selected settings were preserved; no commit, original-tree merge, publication, installation, credential/model change or second external formal review is claimed. Faux-provider/UI-stub tests do not certify business execution or interactive TUI quality.
+
+## Baseline V3-only receipt-storage candidate (historical)
+
+The implementation is isolated on `docs/supervisor-receipt-retention-plan`, based on `f6d3c7f6cab37bae2f0cb4b63024cb5eae8053ce`. Local source acceptance is **737 tests / 35 files PASS, 90.14% branches with unchanged 90% gates**, plus eleven development SDK smoke modes. The same code fingerprint (`e2578137d0aca2bf91ab7adc2071ef8cc31c7dd647bde5b596e5f33b4fc3e48c`) passed eleven no-package-local-dependency cold modes on each of SDK 1.1 and 1.2, and both old-reader refusal checks. Resource samples at 100/1000/5000 receipts passed. It is not committed, published or installed. Current validation status, raw evidence and remaining gaps are maintained in [the receipt acceptance record](./docs/supervisor-receipt-storage-acceptance.md), not inferred from the historical results below.
+
+The candidate replaces lifetime receipt counts with append-only evidence and bounded raw caching; new persisted checkpoints are v3, with explicit v1 recovery/migration. It does not implement working-directory permissions, automatic new-goal approval, old-version write compatibility or real-business/TUI certification. At that V3-only acceptance, the other worktree's v2 candidate had not been integrated; the current integration separately verifies the actually configured v2 wire format. No new independent formal review is claimed.
+
+## Previously validated source: opt-in preflight and safe continuation (historical)
 
 - Accepted local implementation: **696 tests / 34 files PASS**, **91.06% branch coverage**, unchanged 90% thresholds; TypeScript, lint, formatting and eight isolated SDK/faux-provider modes pass.
 - Opt-in proposal, exact current-branch human approval, separately guarded startup, revision invalidation, fail-closed persistence/lifecycle and retained revocation gates are covered. Legacy supervision, owner-confirmed async waiting and legitimate human-decision waiting remain compatible.
@@ -129,7 +141,7 @@ The public command, task-tool/event, and native boundary seams cover:
 - Common credential-pattern redaction before JSON encoding, nested sensitive input keys, preserved structured tool results, receipt deduplication, and invalid usage accounting rejection.
 - At most **100 supervised tasks**, matching the durable binding limit: start, write/append, and recovery reject oversized plans; exact-boundary plans remain allowed.
 
-Review limits are 30 seconds, 64KB of structured input, 2048 output tokens, 40 checks, 20 resumes, three non-progress continuations, and 500 receipts. Mocked-time tests cover a provider ignoring cancellation; the real SDK interruption scenarios use controlled faux replies rather than waiting for a live provider.
+Review limits are 30 seconds, 64KB of structured input, 2048 output tokens, 40 checks, 20 resumes, three non-progress continuations, and 500 receipts in that historical candidate (the current repair removes this cumulative limit). Mocked-time tests cover a provider ignoring cancellation; the real SDK interruption scenarios use controlled faux replies rather than waiting for a live provider.
 
 ## Native abort/compaction limitation
 

@@ -6,7 +6,7 @@ import { createAdvanceTasksTool } from "../tools";
 import { getBoard, resetState, setBoard } from "../state";
 import { setSessionScopeEnabled } from "../scope";
 import type { CompletionEvidence, TaskBoardSnapshot } from "../types";
-import { createMockAPI, createMockContext } from "./helpers/mocks";
+import { attachMockJournal, createMockAPI, createMockContext } from "./helpers/mocks";
 
 const NOW = "2026-08-23T00:00:00.000Z";
 const board: TaskBoardSnapshot = {
@@ -39,6 +39,7 @@ function evidence(ref = "tool:validation"): CompletionEvidence {
 function setup() {
   const mock = createMockAPI();
   const ctx = createMockContext();
+  attachMockJournal(mock, ctx);
   Object.assign(ctx, { model: { provider: "faux", id: "test" } });
   startSupervisor(mock.api, ctx, "Verify approved work");
   registerEventHandlers(mock.api);
@@ -46,12 +47,24 @@ function setup() {
     event: ToolResultEvent,
     context: ReturnType<typeof createMockContext>,
   ) => void;
+  const callHandler = mock.on.mock.calls.find(
+    ([name]) => name === "tool_call",
+  )?.[1] as typeof handler;
   const observe = (
     id = "validation",
     toolName = "bash",
     exitCode: number | null = 0,
     isError = false,
   ) => {
+    callHandler(
+      {
+        type: "tool_call",
+        toolCallId: id,
+        toolName,
+        input: { command: "npm test" },
+      } as unknown as ToolResultEvent,
+      ctx,
+    );
     handler(
       {
         type: "tool_result",
@@ -142,6 +155,16 @@ describe("supervised host evidence", () => {
   it("exposes receipt IDs without dropping the host structured result", () => {
     const { mock, ctx } = setup();
     const handler = mock.on.mock.calls.find(([name]) => name === "tool_result")?.[1];
+    const callHandler = mock.on.mock.calls.find(([name]) => name === "tool_call")?.[1];
+    callHandler(
+      {
+        type: "tool_call",
+        toolName: "bash",
+        toolCallId: "visible-proof",
+        input: { command: "npm test" },
+      },
+      ctx,
+    );
     const result = handler(
       {
         type: "tool_result",

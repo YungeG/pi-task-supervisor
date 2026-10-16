@@ -25,6 +25,7 @@ import {
   currentExecutionWait,
   holdSupervisor,
   observeTool,
+  prepareToolCapture,
   redact,
   restoreSupervisor,
   reviewSupervisor,
@@ -302,12 +303,19 @@ function registerSessionHandlers(pi: ExtensionAPI, control: Control): void {
       );
     }
   };
-  pi.on("session_start", (_event, ctx) => {
+  const restoreCache = async (ctx: ExtensionContext) => {
+    restore(ctx);
+    const store = currentRuntime().receiptStore;
+    const config = await loadConfig();
+    if (store && currentRuntime().receiptStore === store && config.receiptCache)
+      store.configure(config.receiptCache);
+  };
+  pi.on("session_start", async (_event, ctx) => {
     resetConfig();
-    restore(ctx);
+    await restoreCache(ctx);
   });
-  pi.on("session_tree", (_event, ctx) => {
-    restore(ctx);
+  pi.on("session_tree", async (_event, ctx) => {
+    await restoreCache(ctx);
   });
   pi.on("session_shutdown", (_event, ctx) => {
     control.cancel();
@@ -503,16 +511,35 @@ function registerWorkHandlers(pi: ExtensionAPI, control: Control): void {
         );
     }
   });
+}
+
+function registerReceiptHandlers(pi: ExtensionAPI): void {
+  const blockedCaptures = new Set<string>();
   pi.on("tool_call", (event, ctx) => {
     const reason = taskGate(event.toolName, event.input, ctx);
-    return reason ? { block: true, reason } : undefined;
+    if (reason) return { block: true, reason };
+    try {
+      prepareToolCapture(pi, event);
+    } catch (error) {
+      blockedCaptures.add(event.toolCallId);
+      const reason = error instanceof Error ? error.message : "Receipt capture unavailable";
+      const store = currentRuntime().receiptStore;
+      if (store && !store.healthy) currentRuntime().journalFault = reason;
+      const state = supervisorState();
+      if (state) {
+        state.status = "fault";
+        state.pending = false;
+        state.reason = reason;
+      }
+      return { block: true, reason: `Tool not started: ${reason}` };
+    }
+    return undefined;
   });
   pi.on("tool_result", (event, ctx) => {
+    if (blockedCaptures.delete(event.toolCallId) && event.isError) return undefined;
+    const previousFault = currentRuntime().journalFault;
     try {
-      observeTool(pi, event);
-      const receipt = supervisorState()?.receipts.find(
-        (item) => item.id === `tool:${event.toolCallId}`,
-      );
+      const receipt = observeTool(pi, event);
       if (receipt)
         return {
           content: [
@@ -527,16 +554,47 @@ function registerWorkHandlers(pi: ExtensionAPI, control: Control): void {
             : { structuredContent: event.structuredContent }),
         };
     } catch (error) {
-      holdSupervisor(
-        pi,
-        ctx,
-        "fault",
-        error instanceof Error ? error.message : "Evidence capture failed",
-        "review_failed",
-      );
+      const reason = receiptFailure(pi, ctx, error, previousFault);
+      return {
+        content: [
+          ...event.content,
+          {
+            type: "text" as const,
+            text: `Evidence not recorded: ${reason}. Do not treat this result as a new proof or automatically retry the tool.`,
+          },
+        ],
+        ...(event.structuredContent === undefined
+          ? {}
+          : { structuredContent: event.structuredContent }),
+      };
     }
     return undefined;
   });
+}
+
+function receiptFailure(
+  pi: ExtensionAPI,
+  ctx: ExtensionContext,
+  error: unknown,
+  previousFault: string | undefined,
+): string {
+  const reason = error instanceof Error ? error.message : "Evidence capture failed";
+  const state = supervisorState();
+  const store = currentRuntime().receiptStore;
+  if (store && !store.healthy) {
+    currentRuntime().journalFault = reason;
+    if (state) {
+      state.status = "fault";
+      state.pending = false;
+      state.reason = reason;
+      state.acceptedDigest = undefined;
+    }
+  } else if (state?.status !== "fault") {
+    holdSupervisor(pi, ctx, "fault", reason, "review_failed");
+  }
+  if (currentRuntime().journalFault && previousFault !== reason)
+    ctx.ui.notify(`Evidence not committed; tool may have executed. ${reason}`, "error");
+  return reason;
 }
 
 export function registerEventHandlers(
@@ -548,4 +606,5 @@ export function registerEventHandlers(
   currentRuntime().cancel = control.cancel;
   registerSessionHandlers(pi, control);
   registerWorkHandlers(pi, control);
+  registerReceiptHandlers(pi);
 }

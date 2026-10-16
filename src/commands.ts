@@ -8,6 +8,7 @@ import {
   SUPERVISOR_LIMITS,
 } from "./flow";
 import { currentRuntime } from "./runtime";
+import { loadConfig } from "./config";
 import {
   beginPreflight,
   approvePreflight,
@@ -26,7 +27,6 @@ import {
   startSupervisor,
   supervisorNotice,
   supervisorState,
-  SUPERVISOR_ENTRY,
 } from "./supervisor";
 import { enableSessionScope, isSessionScopeEnabled, updateActiveTools } from "./scope";
 import { getBoardRef, persistEntries, setBoard, updateUI } from "./state";
@@ -110,7 +110,7 @@ function resume(pi: ExtensionAPI, ctx: ExtensionCommandContext): void {
   currentRuntime().cancel();
   try {
     // Write Supervisor first: a partial durable restore is interrupted/faulted, never replayed.
-    if (next) pi.appendEntry(SUPERVISOR_ENTRY, next);
+    if (next) saveSupervisor(pi, next);
     persistEntries(pi, { type: "resume_user", supervisorResumed: Boolean(next) }, updated);
     if (next) currentRuntime().supervisor = next;
     setBoard(updated);
@@ -226,6 +226,8 @@ async function startGoal(
   const previous = supervisorState();
   try {
     startSupervisor(pi, ctx, goal);
+    const config = await loadConfig();
+    if (config.receiptCache) currentRuntime().receiptStore?.configure(config.receiptCache);
     const binding = supervisorState()?.preflightBinding;
     if (binding) markPreflightStarted(pi, ctx, binding);
     enableSessionScope(pi);

@@ -4,6 +4,7 @@ import type { TSchema } from "typebox";
 import { createEmptyBoard } from "./engine";
 import type { SupervisorState } from "./supervisor";
 import type { PreflightState } from "./preflight";
+import type { ReceiptStore } from "./receipt-store";
 import type { TaskBoardSnapshot } from "./types";
 
 export interface TaskRuntime {
@@ -12,6 +13,8 @@ export interface TaskRuntime {
   cancel: () => void;
   manualPauseDepth: number;
   supervisor: SupervisorState | undefined;
+  receiptStore: ReceiptStore | undefined;
+  receiptIdentity: string | undefined;
   preflight: PreflightState | undefined;
   journalFault: string | undefined;
 }
@@ -23,6 +26,8 @@ export function createRuntime(): TaskRuntime {
     cancel: (): void => undefined,
     manualPauseDepth: 0,
     supervisor: undefined as SupervisorState | undefined,
+    receiptStore: undefined as ReceiptStore | undefined,
+    receiptIdentity: undefined as string | undefined,
     preflight: undefined as PreflightState | undefined,
     journalFault: undefined as string | undefined,
   };

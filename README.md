@@ -87,6 +87,18 @@ Under supervision, each review-to-done transition requires a passing **command**
 
 A host tool without structured exit status cannot prove command success; use a host validation tool that exposes it. These receipts establish host observation, not the truth or quality of arbitrary external tool output. The advisor judges goal coverage; the task/evidence gates are deterministic.
 
+## Receipt storage and recovery
+
+There is **no cumulative 500-receipt stop**. Each proof is appended once to Pi's branch-local receipt ledger; Supervisor checkpoints contain metadata and exact bindings rather than repeating all historical receipt bodies. An instance-local cache defaults to 128 entries / 1 MiB of serialized UTF-8 data. Reaching the cache budget evicts cache copies, not audit history or proof validity. Evicted bound and current-review evidence is resolved from its original branch. Compact receipt locators still grow linearly with history; this does not make the entire Pi session constant-memory or impose a new unlimited execution permission.
+
+Potentially mutating tools first record an intent. A lost result stays unknown, late/unmatched results invalidate earlier freshness, and recovery never replays the tool automatically. Validation overlapping unfinished modifications, or started before its task review, cannot prove completion. Failed capture reports the actual evidence error while preserving the original tool result/structured status; it does not repeatedly resend an older acceptance warning.
+
+V1 inline journals and the configured v2 batch format remain readable. V2 uses a bounded read-only archive view: its hash chain, cursor, session/goal scope and complete checkpoint must validate, and necessary pause/fault/stop metadata stays v2 without adding new v2 bodies. An unfinished v1/v2 goal migrates only through explicit `recover` after the existing board/authorization gates, preserving bindings, usage and exact old records while requiring fresh validation. Recovery confirms its checkpoint before publishing active state.
+
+A v1 snapshot at the old 500 limit may have missed later modifications: loading it records one freshness barrier, clears its old acceptance and keeps explicit pauses, budgets and the completed task board. A valid completed v1 goal below saturation and a stopped goal are not indiscriminately reopened or migrated. Format recovery establishes its own subsequent freshness boundary. New goals and recovered work write v3. Old extensions refuse v3 (and older v3-only candidates do not understand its v2 legacy base), so rolling back the package does **not** make every v3 session writable by the old version.
+
+Supervision remains session/explicit-goal scoped, not an inferred working-directory sandbox: changing Git worktrees is not itself a new Supervisor goal. Stop an old goal explicitly before unrelated work; preserve completed history and use a valid fresh board/session for a new goal. Post-acceptance potential mutation still revokes acceptance.
+
 ## Existing async execution
 
 When all claimed tasks have exact `workflow_gate` execution references, the native boundary checks the installed execution owner's versioned `pi-subagents` RPC `ping/status` contract. A complete, current-session snapshot reporting queued/running work establishes a finite wait instead of another advisor call or stagnant continuation. A completed workflow parent with active children still waits.
@@ -100,7 +112,7 @@ The executor still owns result delivery, deduplication and waking Main; Supervis
 - Task tools are removed/blocked until a human command activates the session. Supervisor state is isolated per extension instance.
 - Supervisor holds/faults, board pauses, and real decision gates block task mutation. Completed supervised tasks are frozen; required tasks cannot be discarded or abandoned.
 - The advisor uses the pinned **session runtime** model with no executor tools or separate credential discovery. Common credential patterns are redacted in captured receipt text and advisor packets; this is not a general secret scanner. Do not put credentials in goals, tasks, or tool labels.
-- Reviews have a 30-second bound, a 64KB packet cap, and a 2048-token output cap. Limits: 40 reviews, 20 resumes, three non-progress continuations, 500 receipts, and at most 100 supervised tasks/bindings. Oversized plans are rejected on start, write, and recovery. Explicit recovery resets review/resume/stagnation counters, not approvals or recorded usage.
+- Reviews have a 30-second bound, a 64KB packet cap, and a 2048-token output cap. Limits: 40 reviews, 20 resumes, three non-progress continuations, and at most 100 supervised tasks/bindings. Receipt caches have bounded count/bytes, not a cumulative goal receipt limit. Oversized plans are rejected on start, write, and recovery. Explicit recovery resets review/resume/stagnation counters, not approvals or recorded usage.
 - Packet size is measured in UTF-8 bytes. The complete goal, task board, selected receipt identities/digests, and bound validation receipts are never shortened. When space is tight, only unbound receipt and recent-transcript excerpts are shortened and explicitly marked; durable history is unchanged. Oversized protected material still fails closed before any advisor call.
 - Malformed journals, model failures, timeouts, stale branches, and exhausted budgets stop visibly. There is no unsupervised fallback after a supervised failure.
 - Automatic pre-boundary compaction preserves durable goals/receipts. Compaction hooks cancel in-flight reviews and reject late results.
@@ -131,9 +143,15 @@ Optional `~/.pi/agent/continuous-tasks.json` (or `$PI_CODING_AGENT_DIR/continuou
 ```json
 {
   "maxStagnantSettles": 5,
-  "requireCompletionEvidence": true
+  "requireCompletionEvidence": true,
+  "receiptCache": {
+    "maxEntries": 128,
+    "maxBytes": 1048576
+  }
 }
 ```
+
+`receiptCache.maxEntries` accepts 1–4096; `maxBytes` accepts 16 KiB–64 MiB. These only size the raw cache, not the advisor packet, cumulative receipt count or execution authority. A single oversized cache item remains in the ledger and is read without caching. Status shows cumulative count, cache budget, pending captures and ledger health without writing state or querying an executor.
 
 Missing/invalid settings use safe defaults. `countdownMs` remains parse-compatible but is deprecated and ignored: native continuation has no countdown. Supervisor host-evidence requirements cannot be waived by `requireCompletionEvidence: false`. `phaseCompletionPromptTemplate` may include `{phase}`.
 
@@ -144,7 +162,7 @@ npm ci --ignore-scripts
 npm run check
 ```
 
-`check` runs type checking, lint, format checks, coverage (unchanged 90% branch gate), and eight isolated real-Pi **faux-provider** smokes: board-only, supervised, automatic compaction, paused in-flight review plus compaction, native boundary abort/recovery, ordinary pause/single-command resume with retained counters, owner-confirmed async waiting followed by executor-owned result delivery and fresh Main acceptance, and opt-in preflight with a required/optional inventory, explicit human-command approval and separate start. SDK hosts must bind real command-context actions, including `waitForIdle`; a still-busy host after that callback is rejected rather than treated as settled. Smokes use temporary agent directories, no builtin executor tools or live inference, and verify real settings remain unchanged.
+`check` runs type checking, lint, format checks, coverage (unchanged 90% branch gate), and twelve isolated real-Pi **faux-provider** smokes. The original eight cover board-only, supervised, automatic compaction, paused in-flight review plus compaction, native boundary abort/recovery, ordinary pause/single-command resume with retained counters, owner-confirmed async waiting followed by executor-owned result delivery and fresh Main acceptance, and opt-in preflight with a required/optional inventory, explicit human-command approval and separate start. Four additional modes cover 1000 reads with an evicted validation proof, 500-receipt v1 gap/migration through a real recovery command, interrupted intent recovery without replay, and cross-batch v2 migration preserving its original records. SDK hosts must bind real command-context actions, including `waitForIdle`; a still-busy host after that callback is rejected rather than treated as settled. Smokes use temporary agent directories, no builtin executor tools or live inference, and verify real settings remain unchanged.
 
 Compatibility evidence and limitations: [`CANARY.md`](./CANARY.md). Original workspace design: [`../docs/continuous-tasks-extension-design.md`](../docs/continuous-tasks-extension-design.md) (outside this standalone repository; not included in a Git checkout or package).
 

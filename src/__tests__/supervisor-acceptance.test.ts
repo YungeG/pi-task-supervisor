@@ -6,7 +6,7 @@ import { supervisorState, SUPERVISOR_ENTRY, type Advice } from "../supervisor";
 import { createAdvanceTasksTool } from "../tools";
 import type { CompletionEvidence } from "../types";
 import { activeBoard, ACTIVATION, BOUNDARY, getHandler, lifecycle } from "./helpers/lifecycle";
-import { createMockContext } from "./helpers/mocks";
+import { attachMockJournal, createMockContext } from "./helpers/mocks";
 
 const proof: CompletionEvidence = {
   summary: "Fresh validation",
@@ -128,6 +128,36 @@ describe("complete acceptance, not a percentage heuristic", () => {
     expect(supervisorState()).toMatchObject({ status: "fault", acceptedDigest: undefined });
   });
 
+  it("does not repeat an old acceptance warning when a later result has a different evidence error", async () => {
+    const h = await ready();
+    await h.fire("agent_before_settle", BOUNDARY);
+    await h.fire("tool_result", event("post-accept-write", "write"));
+    h.mock.sendMessage.mockClear();
+    const result = await getHandler(h.mock, "tool_result")(event("orphan-result", "write"), h.ctx);
+    expect(h.mock.sendMessage).not.toHaveBeenCalled();
+    expect(result.content.at(-1).text).toContain("Unmatched or late host result");
+    expect(result.structuredContent).toEqual({ exit_code: 0 });
+    expect(supervisorState()!.status).toBe("fault");
+  });
+
+  it("cannot restore accepted work after a mutation intent even when its result was never captured", async () => {
+    const h = await ready();
+    await h.fire("agent_before_settle", BOUNDARY);
+    expect(supervisorState()!.status).toBe("completed");
+    await h.fire("tool_call", {
+      toolCallId: "after-acceptance-intent",
+      toolName: "write",
+      input: { path: "fixture" },
+    });
+    expect(supervisorState()!.acceptedDigest).toBeUndefined();
+    const ctx = createMockContext(h.ctx.sessionManager.getBranch());
+    attachMockJournal(h.mock, ctx);
+    await getHandler(h.mock, "session_start")({}, ctx);
+    expect(supervisorState()).toMatchObject({ status: "fault", acceptedDigest: undefined });
+    await h.command("recover");
+    expect(supervisorState()!.status).toBe("fault");
+  });
+
   it("rejects journal acceptance when the task board no longer matches", async () => {
     const h = await ready();
     await h.fire("agent_before_settle", BOUNDARY);
@@ -184,12 +214,11 @@ describe("complete acceptance, not a percentage heuristic", () => {
     await h.command("supervise Complete approved work");
     await h.fire("tool_result", event());
     await h.fire("session_before_compact");
-    const saved = structuredClone(supervisorState()!);
     const ctx = createMockContext([
-      ACTIVATION,
+      ...h.ctx.sessionManager.getBranch(),
       { type: "custom", customType: "continuous-tasks:snapshot", data: getBoard() },
-      { type: "custom", customType: SUPERVISOR_ENTRY, data: saved },
     ]);
+    attachMockJournal(h.mock, ctx);
     await getHandler(h.mock, "session_start")({}, ctx);
     expect(supervisorState()).toMatchObject({
       status: "fault",
