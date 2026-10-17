@@ -2,6 +2,8 @@ import { afterEach, describe, expect, it, vi } from "vitest";
 import type { ExtensionContext } from "@earendil-works/pi-coding-agent";
 import { realpathSync, readFileSync, statSync } from "node:fs";
 import type { ReadbackFrame } from "../human-journal";
+import { KeybindingsManager, TUI_KEYBINDINGS } from "@earendil-works/pi-tui";
+import { createMockTheme } from "./helpers/mocks";
 import {
   isTrustedLocalTui,
   requestNativeAnswer,
@@ -52,6 +54,32 @@ function createMockContext(overrides: Partial<ExtensionContext> = {}): Extension
       getBranch: vi.fn(() => []),
     },
     ui: {
+      // Exercise the actual public factory/component, rendering every page before
+      // its configured confirm key. Never return a synthetic "reviewed" DTO.
+      custom: vi.fn(
+        (factory: any) =>
+          new Promise((resolve) => {
+            let completed: unknown;
+            const theme = createMockTheme();
+            vi.mocked(theme.fg).mockImplementation((_color, text) => text);
+            const component = factory(
+              { terminal: { rows: 24 }, requestRender: vi.fn() },
+              theme,
+              new KeybindingsManager(TUI_KEYBINDINGS),
+              (result: unknown) => {
+                completed = result;
+                resolve(result);
+              },
+            );
+            for (let page = 0; page < 10000 && completed === undefined; page++) {
+              component.render(80);
+              component.handleInput("\r");
+            }
+            if (completed === undefined) throw new Error("Scope review did not finish");
+          }),
+      ),
+      setWidget: vi.fn(),
+      setStatus: vi.fn(),
       select: vi.fn(),
       input: vi.fn(),
       notify: vi.fn(),
@@ -309,11 +337,33 @@ describe("requestNativeAnswer - positive mechanism tests", () => {
     process.argv = ["node", trustedCliPath];
   }
 
+  it("maps the displayed Chinese approval label to the unchanged canonical outcome", async () => {
+    setupTrustedTui();
+    const ctx = createMockContext({ mode: "tui", hasUI: true });
+    vi.mocked(ctx.ui.select).mockResolvedValueOnce("允许上述范围");
+    const question: NativeQuestion = {
+      frame: createMockFrame({ sessionId: "test-session" }),
+      kind: "authorization",
+      title: "确认范围",
+      body: "仅修改本地界面；禁止发布",
+    };
+    const answer = await requestNativeAnswer(ctx, question, () => true);
+    expect(vi.mocked(ctx.ui.select).mock.calls[0]?.[1]).toEqual([
+      "稍后决定",
+      "允许上述范围",
+      "不允许",
+      "重新核对全文",
+    ]);
+    expect(answer?.outcome).toBe("approve");
+    expect(answer?.value).toBeUndefined();
+    expect(requireNativeAnswer(ctx, answer, question.frame)).toBe(answer);
+  });
+
   it("returns approve answer when user selects Approve", async () => {
     setupTrustedTui();
     const ctx = createMockContext({ mode: "tui", hasUI: true });
     const selectMock = vi.mocked(ctx.ui.select);
-    selectMock.mockResolvedValueOnce("Approve");
+    selectMock.mockResolvedValueOnce("允许上述范围");
 
     const question: NativeQuestion = {
       frame: createMockFrame({ sessionId: "test-session" }),
@@ -333,7 +383,7 @@ describe("requestNativeAnswer - positive mechanism tests", () => {
     setupTrustedTui();
     const ctx = createMockContext({ mode: "tui", hasUI: true });
     const selectMock = vi.mocked(ctx.ui.select);
-    selectMock.mockResolvedValueOnce("Reject");
+    selectMock.mockResolvedValueOnce("不允许");
 
     const question: NativeQuestion = {
       frame: createMockFrame({ sessionId: "test-session" }),
@@ -353,7 +403,7 @@ describe("requestNativeAnswer - positive mechanism tests", () => {
     setupTrustedTui();
     const ctx = createMockContext({ mode: "tui", hasUI: true });
     const selectMock = vi.mocked(ctx.ui.select);
-    selectMock.mockResolvedValueOnce("Defer");
+    selectMock.mockResolvedValueOnce("稍后决定");
 
     const question: NativeQuestion = {
       frame: createMockFrame({ sessionId: "test-session" }),
@@ -366,11 +416,97 @@ describe("requestNativeAnswer - positive mechanism tests", () => {
     expect(result).toBeUndefined();
   });
 
+  it("keeps the canonical start answer when its native choice is displayed in Chinese", async () => {
+    setupTrustedTui();
+    const ctx = createMockContext({ mode: "tui", hasUI: true });
+    vi.mocked(ctx.ui.select).mockResolvedValueOnce("开始执行");
+    const question: NativeQuestion = {
+      frame: createMockFrame({ sessionId: "test-session", owner: "preflight" }),
+      kind: "choice",
+      purpose: "first-start",
+      title: "首次启动",
+      body: "范围不变",
+      options: ["Later", "Start execution"],
+      displayOptions: ["稍后启动", "开始执行"],
+    };
+    const answer = await requestNativeAnswer(ctx, question, () => true);
+    expect(vi.mocked(ctx.ui.select).mock.calls[0]?.[1]).toEqual([
+      "稍后启动",
+      "开始执行",
+      "重新核对全文",
+    ]);
+    expect(answer?.value).toBe("Start execution");
+    expect(requireNativeAnswer(ctx, answer, question.frame)).toBe(answer);
+  });
+
+  it("does not accept an internal canonical value that was not offered as a UI label", async () => {
+    setupTrustedTui();
+    const ctx = createMockContext({ mode: "tui", hasUI: true });
+    vi.mocked(ctx.ui.select).mockResolvedValueOnce("Approve");
+    expect(
+      await requestNativeAnswer(
+        ctx,
+        {
+          frame: createMockFrame(),
+          kind: "authorization",
+          title: "Local",
+          body: "Only this scope",
+        },
+        () => true,
+      ),
+    ).toBeUndefined();
+  });
+
+  it.each([{ labels: ["same", "same"] }, { labels: ["only one"] }])(
+    "rejects ambiguous or misaligned display labels: %j",
+    async ({ labels }) => {
+      setupTrustedTui();
+      const ctx = createMockContext({ mode: "tui", hasUI: true });
+      const result = await requestNativeAnswer(
+        ctx,
+        {
+          frame: createMockFrame(),
+          kind: "choice",
+          title: "Choose",
+          body: "Scope",
+          options: ["Later", "Start execution"],
+          displayOptions: labels,
+        },
+        () => true,
+      );
+      expect(result).toBeUndefined();
+      expect(ctx.ui.select).not.toHaveBeenCalled();
+    },
+  );
+
+  it("clones display labels before the native UI await without changing canonical values", async () => {
+    setupTrustedTui();
+    const ctx = createMockContext({ mode: "tui", hasUI: true });
+    const labels = ["稍后启动", "开始执行"];
+    vi.mocked(ctx.ui.select).mockImplementation(async () => {
+      labels[1] = "Changed after presentation";
+      return "选项 2";
+    });
+    const result = await requestNativeAnswer(
+      ctx,
+      {
+        frame: createMockFrame(),
+        kind: "choice",
+        title: "Start",
+        body: "Scope",
+        options: ["Later", "Start execution"],
+        displayOptions: labels,
+      },
+      () => true,
+    );
+    expect(result?.value).toBe("Start execution");
+  });
+
   it("returns answer for choice question", async () => {
     setupTrustedTui();
     const ctx = createMockContext({ mode: "tui", hasUI: true });
     const selectMock = vi.mocked(ctx.ui.select);
-    selectMock.mockResolvedValueOnce("Option B");
+    selectMock.mockResolvedValueOnce("选项 2");
 
     const question: NativeQuestion = {
       frame: createMockFrame({ sessionId: "test-session" }),
@@ -465,7 +601,7 @@ describe("requestNativeAnswer - positive mechanism tests", () => {
     let isCurrentFlag = true;
     selectMock.mockImplementation(async () => {
       isCurrentFlag = false; // Become non-current during UI
-      return "Approve";
+      return "允许上述范围";
     });
 
     const question: NativeQuestion = {
@@ -487,7 +623,7 @@ describe("requestNativeAnswer - positive mechanism tests", () => {
 
     selectMock.mockImplementation(async () => {
       controller.abort(); // Abort during UI
-      return "Approve";
+      return "允许上述范围";
     });
 
     const question: NativeQuestion = {
@@ -525,7 +661,10 @@ describe("requestNativeAnswer - positive mechanism tests", () => {
 
     expect(secondResult).toBeUndefined();
 
-    resolveFirst?.("Approve");
+    await vi.waitFor(() => {
+      expect(resolveFirst).toBeDefined();
+    });
+    resolveFirst?.("允许上述范围");
     const firstResult = await firstPromise;
     expect(firstResult?.outcome).toBe("approve");
   });
@@ -567,7 +706,7 @@ describe("requireNativeAnswer - enhanced validation", () => {
     setupTrustedTui();
     const ctx = createMockContext({ mode: "tui", hasUI: true });
     const selectMock = vi.mocked(ctx.ui.select);
-    selectMock.mockResolvedValueOnce("Approve");
+    selectMock.mockResolvedValueOnce("允许上述范围");
 
     const question: NativeQuestion = {
       frame: createMockFrame({ sessionId: "test-session" }),
@@ -595,7 +734,7 @@ describe("requireNativeAnswer - enhanced validation", () => {
     } as any;
     const ctx = createMockContext({ mode: "tui", hasUI: true, sessionManager });
     const selectMock = vi.mocked(ctx.ui.select);
-    selectMock.mockResolvedValueOnce("Approve");
+    selectMock.mockResolvedValueOnce("允许上述范围");
 
     const question: NativeQuestion = {
       frame: createMockFrame({ sessionId: "test-session" }),
@@ -617,7 +756,7 @@ describe("requireNativeAnswer - enhanced validation", () => {
     setupTrustedTui();
     const ctx = createMockContext({ mode: "tui", hasUI: true });
     const selectMock = vi.mocked(ctx.ui.select);
-    selectMock.mockResolvedValueOnce("Approve");
+    selectMock.mockResolvedValueOnce("允许上述范围");
 
     const question: NativeQuestion = {
       frame: createMockFrame({ sessionId: "test-session" }),
@@ -640,7 +779,7 @@ describe("requireNativeAnswer - enhanced validation", () => {
     setupTrustedTui();
     const ctx = createMockContext({ mode: "tui", hasUI: true });
     const selectMock = vi.mocked(ctx.ui.select);
-    selectMock.mockResolvedValueOnce("Approve");
+    selectMock.mockResolvedValueOnce("允许上述范围");
 
     const question: NativeQuestion = {
       frame: createMockFrame({ sessionId: "test-session" }),
@@ -660,7 +799,7 @@ describe("requireNativeAnswer - enhanced validation", () => {
     setupTrustedTui();
     const ctx = createMockContext({ mode: "tui", hasUI: true });
     const selectMock = vi.mocked(ctx.ui.select);
-    selectMock.mockResolvedValueOnce("Approve");
+    selectMock.mockResolvedValueOnce("允许上述范围");
 
     const question: NativeQuestion = {
       frame: createMockFrame({ sessionId: "test-session" }),
@@ -688,7 +827,7 @@ describe("requireNativeAnswer - enhanced validation", () => {
     setupTrustedTui();
     const ctx = createMockContext({ mode: "tui", hasUI: true });
     const selectMock = vi.mocked(ctx.ui.select);
-    selectMock.mockResolvedValueOnce("Approve");
+    selectMock.mockResolvedValueOnce("允许上述范围");
 
     const question: NativeQuestion = {
       frame: createMockFrame({ sessionId: "test-session" }),

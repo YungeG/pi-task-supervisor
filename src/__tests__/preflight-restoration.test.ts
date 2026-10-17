@@ -19,7 +19,7 @@ beforeEach(() => {
 async function proposed(approve = false) {
   const h = preflightLifecycle();
   await h.command("preflight Local fixture");
-  vi.mocked(h.ctx.ui.select).mockResolvedValue(approve ? "Approve" : "Defer");
+  vi.mocked(h.ctx.ui.select).mockResolvedValue(approve ? "允许上述范围" : "稍后决定");
   await createSubmitPreflightTool(h.mock.api).execute(
     "submit",
     {
@@ -101,9 +101,9 @@ it("retains the used start request through later rejection and approval", async 
   const h = await proposed(true);
   await h.command("start");
   const started = state();
-  vi.mocked(h.ctx.ui.select).mockResolvedValue("Reject");
+  vi.mocked(h.ctx.ui.select).mockResolvedValue("不允许");
   await approvePreflight(h.mock.api, h.ctx);
-  vi.mocked(h.ctx.ui.select).mockResolvedValue("Approve");
+  vi.mocked(h.ctx.ui.select).mockResolvedValue("允许上述范围");
   await approvePreflight(h.mock.api, h.ctx);
   h.mock.sendMessage.mockClear();
   restoreWithoutWrites(h);
@@ -122,7 +122,7 @@ it.each(["missing", "exact", "later", "contradictory"])(
       if (type === PREFLIGHT_ENTRY && data.approval) throw new Error("C failed");
       append(type, data);
     });
-    vi.mocked(h.ctx.ui.select).mockResolvedValue("Approve");
+    vi.mocked(h.ctx.ui.select).mockResolvedValue("允许上述范围");
     const result = await approvePreflight(h.mock.api, h.ctx);
     expect(result.projectionPending).toBe(true);
     h.mock.appendEntry.mockImplementation(append);
@@ -210,7 +210,7 @@ function legacy() {
 it("promotes an exact historical typed grant through the actual native first-start producer", async () => {
   const h = legacy();
   restorePreflight(h.ctx);
-  vi.mocked(h.ctx.ui.select).mockResolvedValue("Start execution");
+  vi.mocked(h.ctx.ui.select).mockResolvedValue("开始执行");
   const result = await startApprovedPreflight(h.mock.api, h.ctx);
   expect(result.status).toBe("started");
   expect(result.state.approval).toEqual(h.approved.approval);
@@ -271,13 +271,13 @@ it("rejects native-to-legacy downgrade", async () => {
 
 it("replaces a cleared deferred start using its exact unanswered predecessor", async () => {
   const h = await proposed(true);
-  vi.mocked(h.ctx.ui.select).mockResolvedValue("Later");
+  vi.mocked(h.ctx.ui.select).mockResolvedValue("稍后启动");
   await startApprovedPreflight(h.mock.api, h.ctx);
   const first = state().startRequest!;
-  vi.mocked(h.ctx.ui.select).mockResolvedValue("Defer");
+  vi.mocked(h.ctx.ui.select).mockResolvedValue("稍后决定");
   await approvePreflight(h.mock.api, h.ctx, undefined, "all");
   expect(state().startRequest).toBeUndefined();
-  vi.mocked(h.ctx.ui.select).mockResolvedValue("Later");
+  vi.mocked(h.ctx.ui.select).mockResolvedValue("稍后启动");
   await startApprovedPreflight(h.mock.api, h.ctx);
   expect(state().startRequest).toMatchObject({ supersedes: { requestId: first.id } });
   expect(state().startRequest!.id).not.toBe(first.id);
@@ -287,7 +287,7 @@ it("replaces a cleared deferred start using its exact unanswered predecessor", a
 it("validates legacy approval at the original native start prefix before later revoke", async () => {
   const h = legacy();
   restorePreflight(h.ctx);
-  vi.mocked(h.ctx.ui.select).mockResolvedValue("Start execution");
+  vi.mocked(h.ctx.ui.select).mockResolvedValue("开始执行");
   expect((await startApprovedPreflight(h.mock.api, h.ctx)).status).toBe("started");
   await h.command(`revoke ${h.approved.planId}`);
   h.mock.sendMessage.mockClear();

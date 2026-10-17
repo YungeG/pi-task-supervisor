@@ -1,6 +1,20 @@
 # Changelog
 
-## Unreleased native-human / receipt integration candidate
+## Unreleased unified UI integration — final acceptance pending
+
+- Wire `/task-supervisor tasks` to the full readonly board, fixed confirmation/history/acceptance entries even with zero tasks, filtering and two-level return. Historical material and absent/unknown evidence never grant new authority.
+- Paginate complete pre-answer scope material; retain short native purpose/request titles, exact canonical business values, explicit invalid-input retry/defer and independent first-start confirmation.
+- Coordinate only this extension’s own board/native views and widget, with fresh original publication after release and stale lifecycle cleanup. Preserve text-only status, no footer takeover or cross-extension guarantee, and all machine/owner/proof/carrier gates.
+- Full/coverage/all12-smoke/native acceptance is pending for this integrated source; SDK1.2 remains MISSING. Older PASS and dual-version pilots below are historical input, not acceptance of this revision. No commit/install/publication/business operation is claimed.
+
+## Historical UI readability candidate
+
+- Keep current-session preflight state visible on an empty board, with approved-not-started, prior-start reauthorization and held-state wording; no UI-based grants or execution inference.
+- Replace raw JSON notifications/tool presentation with human-readable feedback and expandable complete scope. Preserve original machine payloads, canonical answers, owner records and all gates.
+- Structure native confirmation material and use safe-first Chinese labels mapped to unchanged internal options. Retain exact business options and significant scope whitespace; no new framework or dependency.
+- Local checks: 1082 tests, unchanged 90% coverage gate, twelve SDK smokes, dual-version real CLI/PTY pilots and native-theme/width previews. Not committed, merged, installed or used on a business session.
+
+## Historical native-human / receipt integration candidate
 
 - Native typed board authorization/choice/information and required-only preflight approval, with separate no-ID first start. Bare chat and ordinary SDK/RPC command text do not approve new scope.
 - Reuse the Supervisor owner's strict v1/v2/v3 history/ledger validation for physical first-start readback. Keep readonly recovery views, cache-only human repairs, explicit migrations and one continuation carrying the exact execution agreement.

@@ -44,13 +44,19 @@ Do not leave the existing Git source enabled alongside the npm source: they have
 - `pause` cancels an advisor immediately and pauses Main/the board. `stop` also stops supervision and prevents silent fallback to board continuation.
 - `resume` jointly resumes a confirmed ordinary human pause of the board and supervisor without resetting counters, usage, epoch, or evidence. Legacy/unknown pauses and stronger holds resume only the board and explicitly require inspection plus `recover`; no automatic Main turn is started. Decisions, pending host work, wrong sessions, and inconsistent state do not gain joint recovery. `decide`/`resolve` collect a native response for the exact current decision; command answer text is not authorization. `recover` retains its explicit counter-reset semantics and never grants other approvals or restarts external writers. Faulted completed boards require stopping and re-planning.
 - `status` is read-only even while disabled or journal-faulted. It reports the goal, host activity, claimed batch, soft check point, all available gate information, advisor-only usage/limits, unknown external run status, and the next valid human action.
-- `tasks` opens a scrollable full list, including completed/abandoned tasks; select a task to inspect its details and retained evidence. This read-only view works even when task tools are disabled or the supervisor journal is faulted, and never activates supervision or schedules work.
+- `/task-supervisor tasks` opens a full readonly TUI board with fixed 总览 / 确认与回应 / 最终验收 entries, even with zero tasks. Filter tasks by status/phase and inspect complete details and retained evidence; Esc returns from a detail/filter to the list, then to the editor. It works while disabled or journal-faulted and never activates supervision or schedules work. RPC/print retain their existing text/select fallback.
 
 Activation is a durable session entry. Resuming restores it; independent sessions remain disabled. Ordinary forks inherit the board/activation but **not the source session's supervisor**. A fork carrying native approvals cannot inherit their source-session authority and remains held for inspection. Any unfinished supervisor restored after restart/tree navigation becomes an interrupted fault requiring inspection and explicit recovery, never an active-but-idle badge.
 
 ## Native human responses (local source candidate)
 
-New approvals support the trusted local Node Pi CLI/TUI with real stdin/stdout TTYs and a recoverable session JSONL file. The first structured request opens Pi's native select/input: respond there once; no decision ID or second resolve command is needed. Bare chat, RPC/print, ordinary SDK custom UI, model flags and copied result objects do not submit new approval. This is a trusted-host boundary, not authentication against malicious same-process/OS programs.
+The UI readability candidate keeps planning, awaiting authorization and approved-but-not-started visible even before tasks exist. Native prompts group the complete selected/unselected permissions, limits, risks, prohibitions and reconfirmation conditions instead of duplicating the full scope as JSON. Chinese display choices map to unchanged internal outcomes; arbitrary business-choice values remain verbatim. Required-only selection and a separate first-start confirmation are unchanged.
+
+Human notifications and interactive tool results link to `/task-supervisor tasks → 确认与回应`; non-TUI command text and machine-facing content/details remain unchanged. Expanded preflight results retain the complete original request, explicitly marked as not being a current grant. The readonly history separates the current request, latest saved branch response and preflight material: missing/unconfirmed history is shown as absent/unknown, not replaced by an older answer. Viewing history grants no authority.
+
+Before the native final select/input, a readonly paginated scope review renders all material with visible significant whitespace/control escapes. Review alone is not an answer; the final short title identifies the purpose/request. Users can review again. Invalid information is explicitly unsaved and offers an explicit retry or defer; rejected input is not echoed. Required-only permissions, indexed business choices mapped to exact original values, and the separate first-start confirmation remain unchanged. UI checks are local SDK-boundary simulations, not new native product acceptance. Full/coverage/native validation is still pending for this integrated revision; SDK1.2 is MISSING this round. No installation, merge or business use is claimed.
+
+New approvals support the trusted local Node Pi CLI/TUI with real stdin/stdout TTYs and a recoverable session JSONL file. The first structured request opens the complete readonly scope review, then Pi's native select/input; no decision ID or second resolve command is needed. Bare chat, RPC/print, ordinary SDK custom UI, model flags and copied result objects do not submit new approval. This is a trusted-host boundary, not authentication against malicious same-process/OS programs.
 
 `workflow_gate` proposals declare `decision.spec.version: 1` and one kind: `authorization` with exact `scope`/`prohibitions`; `choice` with exact options; or `information` with `text`/`integer`/`date` format. Only authorization approval grants that displayed scope. Choice/information resolve their information gate without new business rights. Main supplies a complete same-task `supersedes` replacement for legacy/rejected gates; this changes metadata only, never task execution/evidence.
 
@@ -75,18 +81,21 @@ Task mutation is blocked during planning/approval and when a bound grant is miss
 In the interactive terminal, a persistent board appears above the editor. It uses the existing session snapshot, not a separate task store:
 
 ```text
-╭─ Tasks  2/6 done · 4 unfinished
-│  Workflow: active · Phase 2: Implement
-│  ▶ doing  t-2.1  Login endpoint
-│  ◇ review t-2.2  Error handling
-│  ○ queued t-3.1  Documentation · waiting for t-2.1; waiting for phase 3
-│  ○ queued t-3.2  Final acceptance · waiting for t-2.2, t-3.1; waiting for phase 3
-╰─ /task-supervisor tasks · 2 folded
+Tasks · 已完成 2/6 · 未结束 3 · 放弃 1
+目标：[supervisor] 本次已记录目标
+状态：监督已启用 · 阶段：Implement
+注意：所在阶段待处理
+下一步：查看状态
+处理中（任务记录） · t-2.1 Login endpoint
+/task-supervisor tasks · 另 2 项未结束
+最终验收：尚未记录目标验收
 ```
 
-The widget uses Pi's active theme, a subtle left rail, aligned status/ID columns, and bold titles for implementing/reviewing tasks. Monochrome glyphs and labels keep status readable without color: `▶ doing` (implementing), `◇ review` (reviewing), `● ready`, `○ queued` (configured), and `· draft`. IDs are capped at 14 display columns; full IDs remain in the read-only list. Zero overflow/fold counts are omitted from the footer; overflow appears as `+N more`.
+The compact widget uses the active theme and at most eight single terminal lines. It separates done from abandoned, prioritizes unfinished tasks, and labels recorded task/external-reference state without claiming a live execution heartbeat. Full IDs, prompts, dependencies, evidence and risks remain in the readonly board; navigation consumes one frozen capture, so reopen to see newer facts. Fresh empty sessions have no resident widget, but the three fixed board entries remain reachable.
 
-The widget is capped at eight single terminal lines and prioritizes implementing/reviewing tasks, then ready and planned tasks. It shows unmet dependencies, later-phase gates, execution references (status unknown), pending decisions, pause reasons, supervisor holds/faults, and a compact next-action line. Long lines are truncated to terminal width; the full list/details remain available through `/task-supervisor tasks` (also `/continuous-tasks tasks`). Completed and abandoned tasks are folded, never auto-deleted; abandoned tasks are counted separately from verified completion. Empty fresh sessions have no widget. RPC/print modes have no custom widget; RPC can use the native list command.
+Use ↑↓ to scroll full details in both terminal modes. Pi fullscreen reserves PgUp/PgDn for its host viewport; those keys are not promised for embedded detail scrolling. Component page bindings remain available when the host forwards them; this extension does not intercept host keys or use an overlay as an ownership workaround.
+
+The status bar is text-only through the existing Pi status API; this extension does not replace the footer. Opening its own board or native question suppresses only its own resident widget. A native question preempts and actually joins its own reader; the final valid release resnapshots through the original publisher. Session/tree/shutdown cleanup invalidates stale displays. This coordinates only this extension's A/C views, not arbitrary third-party chrome or a cross-extension atomic lease. RPC/print have no custom widget and keep the original text/select behavior.
 
 ## Closed loop and evidence
 

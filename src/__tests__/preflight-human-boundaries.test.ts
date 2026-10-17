@@ -20,7 +20,7 @@ afterEach(() => {
 async function submitted() {
   const h = preflightLifecycle();
   await h.command("preflight Local fixture");
-  vi.mocked(h.ctx.ui.select).mockResolvedValue("Defer");
+  vi.mocked(h.ctx.ui.select).mockResolvedValue("稍后决定");
   await createSubmitPreflightTool(h.mock.api).execute(
     "submit",
     { preflightId: currentRuntime().preflight!.preflightId, proposal: localProposal },
@@ -33,7 +33,7 @@ async function submitted() {
 
 async function approved(selection?: string) {
   const h = await submitted();
-  vi.mocked(h.ctx.ui.select).mockResolvedValue("Approve");
+  vi.mocked(h.ctx.ui.select).mockResolvedValue("允许上述范围");
   const result = await approvePreflight(h.mock.api, h.ctx, undefined, selection);
   return { h, result };
 }
@@ -91,7 +91,7 @@ it("denies a fabricated NativeAnswer DTO that was not produced by requestNativeA
 
 it("defer does not change approval state and produces no sendMessage", async () => {
   const h = await submitted();
-  vi.mocked(h.ctx.ui.select).mockResolvedValue("Defer");
+  vi.mocked(h.ctx.ui.select).mockResolvedValue("稍后决定");
   h.mock.sendMessage.mockClear();
   const result = await approvePreflight(h.mock.api, h.ctx);
   expect(result.status).toBe("deferred");
@@ -102,7 +102,7 @@ it("defer does not change approval state and produces no sendMessage", async () 
 
 it("reject does not grant approval and never starts", async () => {
   const h = await submitted();
-  vi.mocked(h.ctx.ui.select).mockResolvedValue("Reject");
+  vi.mocked(h.ctx.ui.select).mockResolvedValue("不允许");
   h.mock.sendMessage.mockClear();
   const result = await approvePreflight(h.mock.api, h.ctx);
   expect(result.status).toBe("rejected");
@@ -121,14 +121,14 @@ it("partial approval missing a required permission stays awaiting_authorization"
   expect(currentRuntime().preflight?.started).toBeUndefined();
   expect(supervisorState()).toBeUndefined();
   // Cannot start with missing required permissions
-  vi.mocked(h.ctx.ui.select).mockResolvedValue("Start execution");
+  vi.mocked(h.ctx.ui.select).mockResolvedValue("开始执行");
   await expect(startApprovedPreflight(h.mock.api, h.ctx)).rejects.toThrow();
 });
 
 it("identical resubmit returns already_saved without a new native prompt", async () => {
   const h = preflightLifecycle();
   await h.command("preflight Local fixture");
-  vi.mocked(h.ctx.ui.select).mockResolvedValue("Defer");
+  vi.mocked(h.ctx.ui.select).mockResolvedValue("稍后决定");
   const planning = currentRuntime().preflight!;
   const first = await createSubmitPreflightTool(h.mock.api).execute(
     "submit",
@@ -160,7 +160,7 @@ it("retains confirmed approval under cache write failure with zero sendMessage",
     if (type === PREFLIGHT_ENTRY && data.approval) throw new Error("cache write failed");
     append(type, data);
   });
-  vi.mocked(h.ctx.ui.select).mockResolvedValue("Approve");
+  vi.mocked(h.ctx.ui.select).mockResolvedValue("允许上述范围");
   h.mock.sendMessage.mockClear();
   const result = await approvePreflight(h.mock.api, h.ctx);
   expect(result.projectionPending).toBe(true);
@@ -185,7 +185,7 @@ it("aborted signal prevents approval and leaves state unchanged", async () => {
 
 it("throws when plan ID hint does not match the current preflight plan", async () => {
   const h = await submitted();
-  vi.mocked(h.ctx.ui.select).mockResolvedValue("Approve");
+  vi.mocked(h.ctx.ui.select).mockResolvedValue("允许上述范围");
   await expect(approvePreflight(h.mock.api, h.ctx, "stale-plan-id")).rejects.toThrow(/stale/i);
 });
 
@@ -217,7 +217,7 @@ it("tampered journal leaf blocks preflightEvidence", async () => {
 
 it("session mismatch on restore throws and preserves the prior fault", async () => {
   const h = await submitted();
-  vi.mocked(h.ctx.ui.select).mockResolvedValue("Approve");
+  vi.mocked(h.ctx.ui.select).mockResolvedValue("允许上述范围");
   await approvePreflight(h.mock.api, h.ctx);
   const faultBefore = currentRuntime().journalFault;
   // Change session identity to simulate a stale session callback
@@ -231,7 +231,7 @@ it("session mismatch on restore throws and preserves the prior fault", async () 
 it("start on a non-approved plan throws without side effects", async () => {
   const h = await submitted();
   // State is awaiting_authorization, not approved
-  vi.mocked(h.ctx.ui.select).mockResolvedValue("Start execution");
+  vi.mocked(h.ctx.ui.select).mockResolvedValue("开始执行");
   h.mock.sendMessage.mockClear();
   await expect(startApprovedPreflight(h.mock.api, h.ctx)).rejects.toThrow();
   expect(currentRuntime().preflight?.started).toBeUndefined();
@@ -244,7 +244,7 @@ it("active-tools adapter blocks approval when tools are already enabled", async 
   // Simulate that session scope is already active (tools enabled from a prior start)
   const { setSessionScopeEnabled } = await import("../scope");
   setSessionScopeEnabled(true);
-  vi.mocked(h.ctx.ui.select).mockResolvedValue("Approve");
+  vi.mocked(h.ctx.ui.select).mockResolvedValue("允许上述范围");
   // Approval should still work (scope is independent of approval)
   const result = await approvePreflight(h.mock.api, h.ctx);
   expect(result.status).toBe("approved");

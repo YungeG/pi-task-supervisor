@@ -289,16 +289,19 @@ describe("state", () => {
       expect(ctx.ui.setStatus).toHaveBeenCalledWith("til-done-active", undefined);
     });
 
-    it("shows phase label and done count", () => {
+    it("shows state and done count in the single TUI entry", () => {
       const ctx = createMockContext([]);
       const board = makeSampleBoard(); // Phase 2 active, 1 done / 2 total
 
       updateUI(ctx, board);
 
-      expect(ctx.ui.setStatus).toHaveBeenCalledWith("til-done", "1/2 - Phase 2");
+      expect(ctx.ui.setStatus).toHaveBeenCalledWith(
+        "til-done",
+        "任务流程已启用（任务记录） · 已完成 1/2",
+      );
     });
 
-    it("shows active items for implementing/reviewing tasks", () => {
+    it("clears the legacy active-items key for implementing/reviewing tasks", () => {
       const ctx = createMockContext([]);
       const now = new Date().toISOString();
       const board: TaskBoardSnapshot = {
@@ -336,11 +339,8 @@ describe("state", () => {
 
       updateUI(ctx, board);
 
-      // Should set the active lines
-      expect(ctx.ui.setStatus).toHaveBeenCalledWith(
-        "til-done-active",
-        "[t-1.1] Build feature\n[t-1.2] Review feature",
-      );
+      // Active task rows now belong to the compact board, not a second status entry.
+      expect(ctx.ui.setStatus).toHaveBeenCalledWith("til-done-active", undefined);
     });
 
     it("shows done state when all tasks are terminal", () => {
@@ -392,7 +392,10 @@ describe("state", () => {
 
       updateUI(ctx, board);
 
-      expect(ctx.ui.setStatus).toHaveBeenCalledWith("til-done", "2/2 - No active phase");
+      expect(ctx.ui.setStatus).toHaveBeenCalledWith(
+        "til-done",
+        "任务记录已结束 · 已完成 1/2 · 放弃 1",
+      );
       expect(ctx.ui.setStatus).toHaveBeenCalledWith("til-done-active", undefined);
     });
 
@@ -405,7 +408,7 @@ describe("state", () => {
       expect(ctx.ui.setStatus).not.toHaveBeenCalled();
     });
 
-    it("shows 'No active phase' when no active phase exists but tasks remain", () => {
+    it("shows current state when no active phase exists but tasks remain", () => {
       const ctx = createMockContext([]);
       const now = new Date().toISOString();
       const board: TaskBoardSnapshot = {
@@ -431,7 +434,7 @@ describe("state", () => {
 
       updateUI(ctx, board);
 
-      expect(ctx.ui.setStatus).toHaveBeenCalledWith("til-done", "0/1 - No active phase");
+      expect(ctx.ui.setStatus).toHaveBeenCalledWith("til-done", "只读规划 · 已完成 0/1");
     });
 
     it("clears active status when no implementing/reviewing tasks", () => {

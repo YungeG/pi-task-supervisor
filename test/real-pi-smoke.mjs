@@ -5,7 +5,7 @@ import { dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import { fauxAssistantMessage, fauxProvider, fauxToolCall } from "@earendil-works/pi-ai";
 import { Type } from "typebox";
-import { stripTerminalSequences, visibleWidth } from "@earendil-works/pi-tui";
+import { KeybindingsManager, TUI_KEYBINDINGS, stripTerminalSequences, visibleWidth } from "@earendil-works/pi-tui";
 
 const longReceipts = process.argv.includes("--long-receipts");
 const receiptReadCount = longReceipts ? Number(process.env.PI_RECEIPT_SMOKE_COUNT ?? 1000) : 0;
@@ -472,8 +472,15 @@ try {
   session = created.session;
   const extensionErrors = [];
   const widgetHistory = [];
+  let reviewedWidgetPublication = false;
   let widgetLines = [];
-  let listOptions = [];
+  const uiScriptErrors = [];
+  const scopeMaterial = [];
+  const boardMaterial = [];
+  let customMode = "scope";
+  function assertNoUiScriptErrors() {
+    if (uiScriptErrors.length) throw uiScriptErrors[0];
+  }
   let taskDetails = "";
   // Real SDK callbacks with a UI stub, not a real terminal or human visual certification.
   const uiContext = {
@@ -482,12 +489,55 @@ try {
       taskDetails = message;
     },
     async select(_title, options) {
-      listOptions = options;
-      if (preflight && options.includes("Approve") && options.includes("Defer")) return preflightApprovalEnabled ? "Approve" : "Defer";
-      if (preflight && options.includes("Start execution")) return "Start execution";
+      if (preflight && options.includes("允许上述范围") && options.includes("稍后决定")) return preflightApprovalEnabled ? "允许上述范围" : "稍后决定";
+      if (preflight && options.includes("开始执行")) return "开始执行";
       return options[0];
     },
+    custom(factory) {
+      return new Promise((resolveCustom, rejectCustom) => {
+        try {
+          let completed = false;
+          const component = factory(
+            { terminal: { rows: 40 }, requestRender() {} }, widgetThemes[0],
+            new KeybindingsManager(TUI_KEYBINDINGS),
+            (value) => { completed = true; resolveCustom(value); },
+          );
+          const render = () => {
+            const lines = component.render(120).map(stripTerminalSequences);
+            (customMode === "scope" ? scopeMaterial : boardMaterial).push(lines.join("\n"));
+            return lines.join("\n");
+          };
+          const press = (key) => { component.handleInput(key); return render(); };
+          render();
+          if (customMode === "scope") {
+            for (let page = 0; page < 10000 && !completed; page++) {
+              if (!render().includes("只读核对（非作答）")) throw new Error("Expected actual scope-review page");
+              press("\r");
+            }
+          } else {
+            const detail = () => {
+              press("\r");
+              let previous = render();
+              for (let line = 0; line < 10000; line++) {
+                const next = press("\u001b[B");
+                if (next === previous) { press("\u001b"); return; }
+                previous = next;
+              }
+              throw new Error("Read-only detail never reached its end");
+            };
+            // Fixed confirmation + acceptance routes, then both original task details.
+            for (let item = 1; item <= 4; item++) { press("\u001b[B"); detail(); }
+            press("\u001b");
+          }
+          if (!completed) throw new Error("Real custom component did not finish");
+        } catch (error) {
+          uiScriptErrors.push(error);
+          rejectCustom(error);
+        }
+      });
+    },
     setWidget(key, content, options) {
+      try {
       if (key !== "continuous-tasks:board") throw new Error(`Unexpected widget: ${key}`);
       widgetLines = [];
       if (content) {
@@ -513,6 +563,9 @@ try {
         }
       }
       widgetHistory.push([...widgetLines]);
+      if (latestSupervisor(sessionManager)?.status === "reviewing" && widgetLines.some((line) =>
+        line.includes("监督检查中") || line.includes("宿主工作中"))) reviewedWidgetPublication = true;
+      } catch (error) { uiScriptErrors.push(error); throw error; }
     },
   };
   const uiBindings = {
@@ -522,6 +575,7 @@ try {
     commandContextActions: { waitForIdle: () => session.waitForIdle() },
   };
   await session.bindExtensions(uiBindings);
+  assertNoUiScriptErrors();
   if (widgetLines.length) throw new Error("Fresh session had a stale task widget");
   if (session.extensionRunner.getActiveTools().includes("workflow_gate")) {
     throw new Error("A fresh session exposed task tools before user activation");
@@ -577,6 +631,7 @@ try {
       `approve ${plan.planId} A1`,
       session.extensionRunner.createCommandContext(),
     );
+    assertNoUiScriptErrors();
     const approved = latestPreflight(sessionManager);
     const control = sessionManager
       .getBranch()
@@ -681,24 +736,31 @@ try {
   const snapshot = await waitForCompletion(sessionManager);
   await session.agent.waitForIdle();
 
+  assertNoUiScriptErrors();
   if (
-    !widgetHistory.some((lines) => lines.some((line) => line.includes("▶ doing"))) ||
-    !widgetHistory.some((lines) => lines.some((line) => line.includes("◇ review"))) ||
-    !widgetLines.some((line) => line.includes("2/2 done · 0 unfinished")) ||
-    widgetLines.some((line) => line.includes("✓ done"))
+    !widgetHistory.some((lines) => lines.some((line) => line.includes("处理中（任务记录）"))) ||
+    !widgetHistory.some((lines) => lines.some((line) => line.includes("核验中"))) ||
+    !widgetLines.some((line) => line.includes("已完成 2/2 · 未结束 0 · 放弃 0")) ||
+    widgetLines.some((line) => line.includes("任务已完成 ·"))
   )
     throw new Error("Widget missed lifecycle progress or failed to fold completed tasks");
   if (
     supervised &&
-    !widgetHistory.some((lines) => lines.some((line) => line.includes("Supervisor: reviewing")))
+    !reviewedWidgetPublication
   )
     throw new Error("Widget did not update for a supervisor-only review transition");
   const branchBeforeList = JSON.stringify(sessionManager.getBranch());
   const startsBeforeList = agentStarts;
+  customMode = "board";
   await enableCommand.handler("tasks", session.extensionRunner.createCommandContext());
+  assertNoUiScriptErrors();
   if (
-    listOptions.length !== 2 ||
-    !taskDetails.includes("Evidence:") ||
+    snapshot.tasks.length !== 2 ||
+    !snapshot.tasks.every((task) => boardMaterial.join("\n").includes(task.id)) ||
+    !boardMaterial.join("\n").includes("证据 summary：") ||
+    !boardMaterial.join("\n").includes("确认与回应") ||
+    !boardMaterial.join("\n").includes("最近已保存回应") ||
+    !boardMaterial.join("\n").includes("最终验收") ||
     JSON.stringify(sessionManager.getBranch()) !== branchBeforeList ||
     agentStarts !== startsBeforeList
   )
@@ -790,7 +852,7 @@ try {
   });
   session = resumed.session;
   await session.bindExtensions(uiBindings);
-  if (!widgetLines.some((line) => line.includes("2/2 done · 0 unfinished")))
+  if (!widgetLines.some((line) => line.includes("已完成 2/2 · 未结束 0 · 放弃 0")))
     throw new Error("Resume did not restore the task widget from session data");
   if (!session.extensionRunner.getActiveTools().includes("workflow_gate")) {
     throw new Error("Resuming the session did not restore activated task tools");

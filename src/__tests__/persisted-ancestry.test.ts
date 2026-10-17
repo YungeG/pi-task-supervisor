@@ -1,3 +1,4 @@
+import { installCustomUI } from "./helpers/custom-ui";
 import { afterEach, beforeEach, expect, it, vi } from "vitest";
 import fs from "node:fs";
 import { syncBuiltinESMExports } from "node:module";
@@ -16,6 +17,7 @@ import { trustedCliRoots } from "../human-ui";
 import { createMockAPI, createMockContext } from "./helpers/mocks";
 import { localProposal } from "./helpers/preflight";
 
+const drivers: ReturnType<typeof installCustomUI>[] = [];
 const dirs: string[] = [];
 const argv = process.argv;
 const descriptors = [process.stdin, process.stdout].map((s) =>
@@ -38,6 +40,7 @@ afterEach(() => {
   });
   for (const dir of dirs.splice(0)) fs.rmSync(dir, { recursive: true, force: true });
   vi.restoreAllMocks();
+  for (const ui of drivers.splice(0)) ui.assertNoScriptErrors();
 });
 function manager() {
   const dir = fs.mkdtempSync(join(tmpdir(), "native-ancestry-"));
@@ -56,7 +59,11 @@ function host(session: SessionManager) {
     event: unknown,
     context: typeof ctx,
   ) => unknown;
-  return { ...mock, ctx, restore: () => restore({}, ctx) };
+  const ui = installCustomUI(ctx, (d) => {
+    d.reviewAll();
+  });
+  drivers.push(ui);
+  return { ...mock, ctx, ui, restore: () => restore({}, ctx) };
 }
 it("rejects a native tool-result descendant whose C parent failed to persist", async () => {
   // Actual SDK persistence/leaf/getBranch behavior; only native UI source boundary is simulated.
@@ -68,7 +75,7 @@ it("rejects a native tool-result descendant whose C parent failed to persist", a
   });
   const h = host(session);
   const plan = beginPreflight(h.api, h.ctx, "Local fixture");
-  vi.mocked(h.ctx.ui.select).mockResolvedValue("Approve");
+  vi.mocked(h.ctx.ui.select).mockResolvedValue("允许上述范围");
   let failed = false;
   fs.appendFileSync = (path: unknown, body: unknown, ...rest: unknown[]) => {
     if (path === session.getSessionFile() && typeof body === "string") {

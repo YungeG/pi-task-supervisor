@@ -24,7 +24,7 @@ beforeEach(() => {
 async function ready(approve = true) {
   const h = preflightLifecycle();
   await h.command("preflight Local fixture");
-  vi.mocked(h.ctx.ui.select).mockResolvedValue(approve ? "Approve" : "Defer");
+  vi.mocked(h.ctx.ui.select).mockResolvedValue(approve ? "允许上述范围" : "稍后决定");
   await createSubmitPreflightTool(h.mock.api).execute(
     "submit",
     { preflightId: currentRuntime().preflight!.preflightId, proposal: localProposal },
@@ -45,7 +45,7 @@ async function missingCache() {
     if (type === PREFLIGHT_ENTRY && data.approval) throw new Error("C write failed");
     append(type, data);
   });
-  vi.mocked(h.ctx.ui.select).mockResolvedValue("Approve");
+  vi.mocked(h.ctx.ui.select).mockResolvedValue("允许上述范围");
   const saved = await approvePreflight(h.mock.api, h.ctx);
   expect(saved.projectionPending).toBe(true);
   expect(saved.confirmed?.kind).toBe("approve");
@@ -122,7 +122,7 @@ it("rejects startup inspection under a foreign owner or without its requested pl
 });
 it("keeps native preflight scope bound to the original Supervisor goal", async () => {
   const h = await ready();
-  vi.mocked(h.ctx.ui.select).mockResolvedValue("Start execution");
+  vi.mocked(h.ctx.ui.select).mockResolvedValue("开始执行");
   expect((await startApprovedPreflight(h.mock.api, h.ctx)).status).toBe("started");
   const state = currentRuntime().preflight!;
   currentRuntime().supervisor!.goal = "Different goal";
@@ -145,7 +145,7 @@ it("retains exactly one start A/B/S when C fails and repairs only C", async () =
     if (type === PREFLIGHT_ENTRY && data.started) throw new Error("started C failed");
     append(type, data);
   });
-  vi.mocked(h.ctx.ui.select).mockResolvedValue("Start execution");
+  vi.mocked(h.ctx.ui.select).mockResolvedValue("开始执行");
   const saved = await startApprovedPreflight(h.mock.api, h.ctx);
   expect(saved).toMatchObject({
     status: "already_saved",
@@ -168,7 +168,7 @@ it("Later saves only start metadata, not a start control or Supervisor", async (
   const count = h.entries.filter(
     (e) => e.customType === "continuous-tasks:preflight-control",
   ).length;
-  vi.mocked(h.ctx.ui.select).mockResolvedValue("Later");
+  vi.mocked(h.ctx.ui.select).mockResolvedValue("稍后启动");
   expect((await startApprovedPreflight(h.mock.api, h.ctx)).status).toBe("deferred");
   expect(
     h.entries.filter((e) => e.customType === "continuous-tasks:preflight-control"),
@@ -183,7 +183,7 @@ it.each(["request epoch", "pending input"])(
     vi.mocked(h.ctx.ui.select).mockImplementation(async () => {
       if (invalidation === "request epoch") currentRuntime().humanEpoch++;
       else vi.mocked(h.ctx.hasPendingMessages).mockReturnValue(true);
-      return "Start execution";
+      return "开始执行";
     });
     expect((await startApprovedPreflight(h.mock.api, h.ctx)).status).toBe("deferred");
     expect(currentRuntime().preflight?.started).toBeUndefined();
@@ -281,11 +281,11 @@ it("shows saved-result repair guidance instead of asking for approval again", as
 });
 it("delivers rejection and partial permission state to Main without an execution agreement", async () => {
   const h = await ready(false);
-  vi.mocked(h.ctx.ui.select).mockResolvedValue("Reject");
+  vi.mocked(h.ctx.ui.select).mockResolvedValue("不允许");
   await approvePreflight(h.mock.api, h.ctx);
   expect(preflightContext(h.ctx)).toContain("selection was rejected");
   expect(preflightStatusLines(h.ctx).join("\n")).toContain("selection was rejected");
-  vi.mocked(h.ctx.ui.select).mockResolvedValue("Approve");
+  vi.mocked(h.ctx.ui.select).mockResolvedValue("允许上述范围");
   const partial = await approvePreflight(h.mock.api, h.ctx, undefined, "A2");
   expect(partial.status).toBe("partial");
   expect(preflightContext(h.ctx)).toContain("No complete current authorization");

@@ -1,3 +1,8 @@
+const drivers: ReturnType<typeof installCustomUI>[] = [];
+afterEach(() => {
+  for (const ui of drivers.splice(0)) ui.assertNoScriptErrors();
+});
+import { installCustomUI } from "./helpers/custom-ui";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { randomUUID } from "node:crypto";
 import * as fs from "node:fs";
@@ -489,7 +494,7 @@ describe("publisher integration (real journal files)", () => {
     sessionId: string,
     leafId: string,
   ): ExtensionContext {
-    return {
+    const ctx = {
       mode: "tui",
       hasUI: true,
       sessionManager: {
@@ -499,12 +504,19 @@ describe("publisher integration (real journal files)", () => {
         getBranch: vi.fn(() => []),
       },
       ui: {
+        setWidget: vi.fn(),
+        setStatus: vi.fn(),
         select: vi.fn(),
         input: vi.fn(),
         notify: vi.fn(),
       },
       signal: undefined,
     } as unknown as ExtensionContext;
+    const ui = installCustomUI(ctx, (d) => {
+      d.reviewAll();
+    });
+    drivers.push(ui);
+    return ctx;
   }
 
   function createMockAPI(): ExtensionAPI {
@@ -567,7 +579,7 @@ describe("publisher integration (real journal files)", () => {
 
     // Get a real NativeAnswer through requestNativeAnswer
     const selectMock = vi.mocked(ctx.ui.select);
-    selectMock.mockResolvedValueOnce("Approve");
+    selectMock.mockResolvedValueOnce("允许上述范围");
 
     const decision = baseSnapshot.decision;
     const scope = decisionScope(decision);
@@ -677,7 +689,7 @@ describe("publisher integration (real journal files)", () => {
 
     // Try to publish another control for the same request
     const selectMock = vi.mocked(ctx.ui.select);
-    selectMock.mockResolvedValueOnce("Approve");
+    selectMock.mockResolvedValueOnce("允许上述范围");
 
     const question: NativeQuestion = {
       frame,

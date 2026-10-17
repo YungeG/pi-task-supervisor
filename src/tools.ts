@@ -27,7 +27,8 @@ import {
 import type { AdvanceEdit, TaskBoardSnapshot, TaskEdit, TaskWorkflowEvent } from "./types";
 import { writeTasks, applyEdits, compileBoard, createEmptyBoard, claimReadyTasks } from "./engine";
 import { cloneBoard, getStatusCounts, isSafeBoundedText } from "./validation";
-import { getBoardRef, setBoard, persistEntries, updateUI } from "./state";
+import { getBoardRef, setBoard, persistEntries, updateUI, refreshUI } from "./state";
+import { preflightNotice, preflightDetailText } from "./human-presentation";
 import { loadConfig, resolvePhasePrompt } from "./config";
 import { assertObservedEvidence, bindCompletion } from "./supervisor";
 import { isSessionScopeEnabled } from "./scope";
@@ -137,6 +138,8 @@ function renderColoredBoardResult(text: string, _snapshot: TaskBoardSnapshot, th
   return new Text(colored, 0, 0);
 }
 
+const TASK_DETAILS_HINT = "详情：/task-supervisor tasks → 确认与回应";
+
 export function createSubmitPreflightTool(
   pi: ExtensionAPI,
 ): ToolDefinition<
@@ -151,6 +154,24 @@ export function createSubmitPreflightTool(
     parameters: SubmitPreflightParams,
     promptSnippet:
       "Submit a complete read-only preflight proposal; only the user can approve and separately start it.",
+    renderCall(_args, theme) {
+      return new Text(theme.fg("toolTitle", theme.bold("执行前方案确认")), 0, 0);
+    },
+    renderResult(result, options, theme) {
+      const details = result.details as
+        | (Partial<PreflightHumanResult> & { error?: string })
+        | undefined;
+      if (details?.error)
+        return new Text(
+          theme.fg("error", `方案未提交：${details.error}\n${TASK_DETAILS_HINT}`),
+          0,
+          0,
+        );
+      const notice = preflightNotice(details ?? {});
+      const extra = options.expanded ? preflightDetailText(details ?? {}) : "";
+      const message = `${extra ? `${notice.message}\n\n${extra}` : notice.message}\n${TASK_DETAILS_HINT}`;
+      return new Text(theme.fg(notice.level === "warning" ? "warning" : "text", message), 0, 0);
+    },
     async execute(_id, params, signal, _onUpdate, ctx) {
       try {
         if (signal?.aborted) throw new Error("Preflight submission cancelled");
@@ -164,6 +185,7 @@ export function createSubmitPreflightTool(
           params.proposal,
           signal,
         );
+        refreshUI(ctx);
         return {
           content: [{ type: "text" as const, text: JSON.stringify(outcome) }],
           details: outcome,
@@ -905,11 +927,30 @@ export function createWorkflowGateTool(
       );
     },
 
-    renderResult(result, _options, theme) {
+    renderResult(result, options, theme, context?: { readonly isError: boolean }) {
       const details = result.details as TaskToolDetails | undefined;
-      const text = result.content[0] && "text" in result.content[0] ? result.content[0].text : "";
-      if (details?.error) return new Text(theme.fg("error", details.error), 0, 0);
-      return new Text(theme.fg("success", text), 0, 0);
+      if (details?.error)
+        return new Text(theme.fg("error", `${details.error}\n${TASK_DETAILS_HINT}`), 0, 0);
+      const snapshot = details?.snapshot;
+      let message = snapshot
+        ? "任务门槛已更新；回应不代表任务验收通过，其他权限和证据要求仍有效。"
+        : "正在等待任务门槛结果，尚未取得可展示的记录。";
+      if (snapshot?.decision)
+        message =
+          snapshot.decision.response === "rejected"
+            ? "本次范围未获允许；任务仍在等待完整替代方案，不会自动重复询问。"
+            : "请求已保存，等待人工回应；尚未新增权限。可使用 /task-supervisor decide。";
+      if (context?.isError)
+        message = snapshot
+          ? "回应已保存，但门槛状态同步未完成；无需重复确认。请检查 /task-supervisor repair-decision，其他门槛仍有效。"
+          : "门槛结果需要检查，不要据此重复执行或推断已取得授权。";
+      const text =
+        options.expanded && snapshot ? `${message}\n\n${formatBoardText(snapshot)}` : message;
+      return new Text(
+        theme.fg(context?.isError ? "warning" : "text", `${text}\n${TASK_DETAILS_HINT}`),
+        0,
+        0,
+      );
     },
   };
 }

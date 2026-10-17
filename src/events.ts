@@ -11,7 +11,8 @@ import { restoreBoardHuman, boardHumanContext, canReplaceBoardDecision } from ".
 import { claimedExecutionRefs, executionWaitTimer, waitForExecutions } from "./async-execution";
 import { currentRuntime } from "./runtime";
 import { preflightContext, preflightTaskIssue, restorePreflight } from "./preflight";
-import { TASK_WIDGET_KEY } from "./board-ui";
+import { invalidateTaskWidget, TASK_WIDGET_KEY } from "./board-ui";
+import { closeReadOnlyView } from "./ui-view-lifecycle";
 import { loadConfig, resetConfig } from "./config";
 import { formatContinuePrompt, formatHiddenContext } from "./formatting";
 import {
@@ -283,9 +284,27 @@ function restoreFaultedSupervisor(pi: ExtensionAPI, ctx: ExtensionContext): void
   }
 }
 
+function clearOwnedUI(ctx: ExtensionContext): void {
+  if (ctx.hasUI) {
+    if (ctx.mode === "tui") {
+      const keys = ["til-done", "til-done-active", "continuous-supervisor"];
+      for (const key of [...keys, TASK_WIDGET_KEY]) {
+        try {
+          if (key === TASK_WIDGET_KEY) ctx.ui.setWidget(key, undefined);
+          else ctx.ui.setStatus(key, undefined);
+        } catch {
+          // Shutdown cleanup is best-effort and owns no other extension's keys.
+        }
+      }
+    } else ctx.ui.setStatus("continuous-supervisor", undefined);
+  }
+}
+
 function registerSessionHandlers(pi: ExtensionAPI, control: Control): void {
-  const restore = (ctx: ExtensionContext) => {
+  const restore = async (ctx: ExtensionContext) => {
     control.cancel();
+    invalidateTaskWidget(ctx);
+    await closeReadOnlyView(ctx);
     let board = createEmptyBoard();
     setBoard(board);
     currentRuntime().journalFault = undefined;
@@ -298,9 +317,9 @@ function registerSessionHandlers(pi: ExtensionAPI, control: Control): void {
       board = restoreBoardHuman(ctx, reconstructState(ctx));
       restoreSessionScope(pi, ctx);
       setBoard(board);
-      updateUI(ctx, board);
       restorePreflight(ctx);
       restoreSupervisor(pi, ctx);
+      updateUI(ctx, board);
       updateActiveTools(pi, isSessionScopeEnabled());
     } catch (error) {
       // Do not reinterpret malformed durable state as an inactive, safe-to-continue supervisor.
@@ -313,7 +332,7 @@ function registerSessionHandlers(pi: ExtensionAPI, control: Control): void {
       setSessionScopeEnabled(false);
       updateActiveTools(pi, false);
       updateUI(ctx, board);
-      if (ctx.hasUI)
+      if (ctx.hasUI && ctx.mode !== "tui")
         ctx.ui.setStatus("continuous-supervisor", "Supervisor: fault (invalid journal)");
       pi.sendMessage(
         {
@@ -327,7 +346,7 @@ function registerSessionHandlers(pi: ExtensionAPI, control: Control): void {
     }
   };
   const restoreCache = async (ctx: ExtensionContext) => {
-    restore(ctx);
+    await restore(ctx);
     const store = currentRuntime().receiptStore;
     const config = await loadConfig();
     if (store && currentRuntime().receiptStore === store && config.receiptCache)
@@ -340,13 +359,12 @@ function registerSessionHandlers(pi: ExtensionAPI, control: Control): void {
   pi.on("session_tree", async (_event, ctx) => {
     await restoreCache(ctx);
   });
-  pi.on("session_shutdown", (_event, ctx) => {
+  pi.on("session_shutdown", async (_event, ctx) => {
     control.cancel();
     setSessionScopeEnabled(false);
-    if (ctx.hasUI) {
-      ctx.ui.setStatus("continuous-supervisor", undefined);
-      if (ctx.mode === "tui") ctx.ui.setWidget(TASK_WIDGET_KEY, undefined);
-    }
+    invalidateTaskWidget(ctx);
+    await closeReadOnlyView(ctx);
+    clearOwnedUI(ctx);
   });
   pi.on("session_before_compact", (_event, ctx) => {
     control.cancel();

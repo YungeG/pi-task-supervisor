@@ -44,6 +44,7 @@ import { startSupervisor, supervisorNotice, supervisorState } from "./supervisor
 import { formatFlowStatus, flowFacts } from "./flow";
 import { getBoardRef } from "./state";
 import { enableSessionScope, updateActiveTools } from "./scope";
+import { readablePreflight } from "./human-presentation";
 
 type ConfirmedProof = Extract<ReadbackProof, { status: "confirmed" }>;
 export interface PreflightHumanResult {
@@ -196,19 +197,18 @@ async function present(
     !runtime.journalFault &&
     !ctx.hasPendingMessages() &&
     journalDigest(own(ctx)) === fingerprint;
-  const unselected =
-    base.proposal?.permissions.filter((p) => !ids.includes(p.id)).map((p) => p.id) ?? [];
+  const presentation = readablePreflight(base, ids, start);
   try {
     return await requestNativeAnswer(
       ctx,
       {
         frame,
         kind: start ? "choice" : "authorization",
-        title: start
-          ? "Start approved preflight execution?"
-          : "Authorize exact preflight permissions?",
-        body: `Goal: ${base.goal}\nEntire proposal: ${JSON.stringify(base.proposal)}\nSelected IDs: ${JSON.stringify(ids)}\nExplicitly unselected rights: ${JSON.stringify(unselected)}\nApproval does not start execution. All prohibitions and reconfirmation conditions remain binding.\nExact scope: ${JSON.stringify(start ? preflightStartScope(base, approvalDigest(ctx, base)) : preflightPermissionScope(base, ids))}`,
-        ...(start ? { options: ["Later", "Start execution"] } : {}),
+        purpose: start ? "first-start" : "authorization",
+        ...presentation,
+        ...(start
+          ? { options: ["Later", "Start execution"], displayOptions: ["稍后启动", "开始执行"] }
+          : {}),
       },
       current,
       signal ? AbortSignal.any([signal, controller.signal]) : controller.signal,

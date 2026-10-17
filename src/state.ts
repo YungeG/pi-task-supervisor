@@ -9,7 +9,9 @@ import {
   isValidSnapshotV2,
 } from "./validation";
 import { phaseLabel } from "./formatting";
-import { updateTaskWidget } from "./board-ui";
+import { TASK_WIDGET_KEY, updateTaskWidget } from "./board-ui";
+import { captureUiSummary } from "./ui-capture";
+import { formatStatusbar } from "./status-ui";
 
 import { currentRuntime } from "./runtime";
 
@@ -108,10 +110,42 @@ export function persistEntries(
 
 // ── UI Sync ──
 
+/** Optional view refresh must not turn a saved result into an owner failure. */
+export function refreshUI(ctx: ExtensionContext): void {
+  try {
+    updateUI(ctx, getBoardRef());
+  } catch {
+    // The original structured carrier/owner result remains authoritative.
+  }
+}
+
 /** Updates the persistent task widget and existing status bar. */
 export function updateUI(ctx: ExtensionContext, snapshot: Readonly<TaskBoardSnapshot>): void {
   if (!ctx.hasUI) return;
-  updateTaskWidget(ctx, snapshot);
+  if (ctx.mode === "tui") {
+    try {
+      const summary = captureUiSummary(ctx, snapshot);
+      updateTaskWidget(ctx, snapshot, summary);
+      ctx.ui.setStatus("til-done-active", undefined);
+      ctx.ui.setStatus("continuous-supervisor", undefined);
+      ctx.ui.setStatus("til-done", formatStatusbar(summary));
+    } catch {
+      // Capture/transport is optional; never turn it into a durable journal fault.
+      for (const key of ["til-done", "til-done-active", "continuous-supervisor"]) {
+        try {
+          ctx.ui.setStatus(key, undefined);
+        } catch {
+          // Attempt the remaining owned keys even if one transport call fails.
+        }
+      }
+      try {
+        ctx.ui.setWidget(TASK_WIDGET_KEY, undefined);
+      } catch {
+        // The original owner/carrier result remains authoritative.
+      }
+    }
+    return;
+  }
 
   if (snapshot.tasks.length === 0) {
     ctx.ui.setStatus("til-done", undefined);

@@ -32,7 +32,8 @@ import {
   supervisorState,
 } from "./supervisor";
 import { enableSessionScope, isSessionScopeEnabled, updateActiveTools } from "./scope";
-import { getBoardRef, persistEntries, setBoard, updateUI } from "./state";
+import { getBoardRef, persistEntries, setBoard, updateUI, refreshUI } from "./state";
+import { preflightNotice, boardNotice } from "./human-presentation";
 import { cloneBoard, hasActionableTasks } from "./validation";
 
 function notifyError(ctx: ExtensionCommandContext, message: string): void {
@@ -154,6 +155,12 @@ function resume(pi: ExtensionAPI, ctx: ExtensionCommandContext): void {
   }
 }
 
+function withTaskDetails(ctx: ExtensionCommandContext, message: string): string {
+  return ctx.hasUI && ctx.mode === "tui"
+    ? `${message}\n详情：/task-supervisor tasks → 确认与回应`
+    : message;
+}
+
 async function resolveDecision(
   pi: ExtensionAPI,
   ctx: ExtensionCommandContext,
@@ -165,13 +172,9 @@ async function resolveDecision(
   if (id !== undefined && id !== board.decision.id) throw new Error("Decision id is stale");
   await ctx.waitForIdle();
   const result = await answerBoardDecision(pi, ctx);
-  const explanation =
-    result.status === "legacy"
-      ? "A complete structured replacement is required from Main; old chat/command text cannot approve it."
-      : result.status === "unsupported"
-        ? "New approvals require the trusted local Pi CLI/TUI and a recoverable session file."
-        : "Other gates still apply.";
-  ctx.ui.notify(`Native decision: ${result.status}. ${explanation}`, "info");
+  const notice = boardNotice(result);
+  refreshUI(ctx);
+  ctx.ui.notify(withTaskDetails(ctx, notice.message), notice.level);
   if (result.status === "approved" || result.status === "answered") continueNow(pi, ctx);
 }
 
@@ -197,6 +200,7 @@ async function beginPlanning(
   try {
     enableSessionScope(pi);
     updateActiveTools(pi, true);
+    refreshUI(ctx);
     const content = preflightContext(ctx);
     if (!content) throw new Error("Preflight planning context changed before dispatch");
     pi.sendMessage(
@@ -224,7 +228,9 @@ async function startGoal(
     if (!planning) throw new Error("No preflight plan exists");
     inspectPreflightStart(ctx, planning.goal, planId);
     const outcome = await startApprovedPreflight(pi, ctx, planId);
-    ctx.ui.notify(JSON.stringify(outcome), "info");
+    const notice = preflightNotice(outcome);
+    refreshUI(ctx);
+    ctx.ui.notify(withTaskDetails(ctx, notice.message), notice.level);
     if (outcome.status === "started") {
       try {
         const config = await loadConfig();
@@ -377,8 +383,9 @@ async function preflightCommand(
     id,
     selection.length ? selection.join(" ") : undefined,
   );
-  ctx.ui.notify(JSON.stringify(outcome), "info");
-  status(ctx);
+  const notice = preflightNotice(outcome);
+  refreshUI(ctx);
+  ctx.ui.notify(withTaskDetails(ctx, notice.message), notice.level);
   return true;
 }
 

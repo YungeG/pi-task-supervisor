@@ -1,3 +1,4 @@
+import { ESC, installCustomUI } from "./helpers/custom-ui";
 import type { ExtensionCommandContext } from "@earendil-works/pi-coding-agent";
 import { beforeEach, describe, expect, it, vi } from "vitest";
 import { registerCommands } from "../commands";
@@ -273,13 +274,17 @@ describe("continuous-tasks command", () => {
       setSessionScopeEnabled(false);
       vi.mocked(ctx.ui.select).mockImplementation(async (_title, options) => options[0]);
 
+      const ui = installCustomUI(ctx, (d) => {
+        d.open(0);
+        d.scrollAll();
+        d.press(ESC);
+        d.press(ESC);
+      });
       await commandHandler(mockAPI, command)("tasks", ctx);
+      ui.assertNoScriptErrors();
 
-      expect(ctx.ui.select).toHaveBeenCalledOnce();
-      expect(ctx.ui.notify).toHaveBeenCalledWith(
-        expect.stringContaining("Paused: User hold"),
-        "info",
-      );
+      expect(ctx.ui.select).not.toHaveBeenCalled();
+      expect(ui.rendered.join("\n")).toContain("User hold");
       expect(getBoard()).toEqual(snapshot);
       expect(isSessionScopeEnabled()).toBe(false);
       expect(supervisorState()).toBeUndefined();
@@ -301,12 +306,15 @@ describe("continuous-tasks command", () => {
     setSessionScopeEnabled(false);
     vi.mocked(ctx.ui.select).mockImplementation(async (_title, options) => options[0]);
 
+    const ui = installCustomUI(ctx, (d) => {
+      d.open(0);
+      d.scrollAll();
+      d.press(ESC);
+      d.press(ESC);
+    });
     await commandHandler(mockAPI, "task-supervisor")("tasks", ctx);
-
-    expect(ctx.ui.notify).toHaveBeenCalledWith(
-      expect.stringContaining("Fault: Invalid supervisor journal"),
-      "info",
-    );
+    ui.assertNoScriptErrors();
+    expect(ui.rendered.join("\n")).toContain("Invalid supervisor journal");
     expect(currentRuntime().journalFault).toBe("Invalid supervisor journal");
     expect(isSessionScopeEnabled()).toBe(false);
     expect(mockAPI.appendEntry).not.toHaveBeenCalled();

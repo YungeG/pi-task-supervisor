@@ -1,6 +1,21 @@
 # Local supervisor validation report
 
-## Human interaction + receipt v2/v3 integration — local checks PASS, not merged/installed
+## Unified UI integration — current full/native acceptance PENDING
+
+The isolated integration now connects the full readonly `/task-supervisor tasks` route (including zero-task confirmation/history), paginated pre-answer scope review and explicit invalid-input retry. Saved branch history is readable material, not a new grant. Its own board/native UI suppress only its own widget and resume fresh; status remains text-only with no footer takeover or cross-extension atomicity guarantee. Machine/owner/proof/carrier/receipt/budget gates are unchanged.
+
+Current focused/static and ordinary unit/SDK-simulation evidence is recorded in the I2A/I2B handoffs under `unified-ui-design-20261016/`. Full coverage/check, all12 final smokes and actual native product/source-negative gates remain outstanding until the parent runs them on the final frozen source. **SDK1.2 is MISSING for this round.** Earlier PASS/dual-SDK statements below describe historical revisions, not this integrated UI. No commit/install/reload/publication/business approval is implied.
+
+## Historical input: UI readability candidate — isolated local checks PASS
+
+Based on exact commit `20d5886031f109da4f6d919ffc8f6ba078c0e9e1` in `feat/task-supervisor-ui-20261016`. That historical revision’s `npm run check` passed **1082 tests / 49 files**, statements **93.75%**, branches **90.11% (3372/3742)**, functions **98.52%**, lines **95.80%**, full typecheck/lint/format and the unchanged **12** SDK smoke modes. Coverage thresholds and lint limits are unchanged.
+
+- Native system/dark/light themes passed 90 phase/width text-render checks (20–120 columns), preserving the eight-line cap. Actual Pi1.1/1.2 CLI/PTY board/preflight pilots passed, including 80-column/24-row functional cases; real double-TTY ordinary-SDK auto-approval remained rejected before UI. Test keystrokes and text/ANSI evidence do not prove human identity, full graphical visual quality or business behavior.
+- Original machine-facing results and canonical `Approve`/`Reject`/`Start execution` values are retained. Scope whitespace, all permission fields/prohibitions and reauthorization history have focused regressions. Core authorization, human journal/control, preflight schema/reducers, receipt store, runtime, supervisor and flow policy source hashes match the base.
+- Very long scope dialogs remain native controls, not a custom scrollable screen. Full material is not truncated and remains readable in expanded preflight tool records; this is not a claim that every permission fits on one terminal viewport. Input-validation retry behavior and a new web frontend are outside this iteration.
+- Current artifacts: `/home/ygguo/.pi/agent/worktrees-artifacts/pi-task-supervisor-ui-20261016/` (accepted check log, native CLI reports, render previews and final handoff). Original source and the independent recovery-experience worktree remain untouched. No staging/commit/push/install/reload/business operation is authorized for this candidate. Reports below are historical inputs, not current UI acceptance.
+
+## Historical input: human interaction + receipt v2/v3 integration — local checks PASS, not merged/installed
 
 Current candidate is isolated on `integrate/human-interaction-r2-receipt-v3-20261016`, based on fixed commit `d1199c24fa70941ad3a9244594fcf4ecd24cb7c9`. Final `npm run check`: **1044 tests / 48 files PASS**, statements **93.66%**, branches **90.02% (3267/3629)**, functions **98.49%**, lines **95.68%**, full typecheck/lint/format and all **12** SDK/faux smokes. Thresholds and lint limits are unchanged. Original V2's 15 regression cases were retained and ported to the V3 writer / retained-V2 reader interfaces, not deleted or disabled.
 

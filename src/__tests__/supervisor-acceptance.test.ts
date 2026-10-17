@@ -78,10 +78,7 @@ describe("complete acceptance, not a percentage heuristic", () => {
     ]);
     await getHandler(h.mock, "session_start")({}, ctx);
     expect(supervisorState()?.status).toBe("completed");
-    expect(ctx.ui.setStatus).toHaveBeenLastCalledWith(
-      "continuous-supervisor",
-      "Supervisor: completed (0/20 resumes)",
-    );
+    expect(ctx.ui.setStatus).toHaveBeenLastCalledWith("til-done", "需检查 · 已完成 1/1");
     expect(
       await h.fire("tool_call", { toolName: "write_tasks", input: { mode: "append" } }),
     ).toMatchObject({ block: true });
@@ -188,7 +185,8 @@ describe("complete acceptance, not a percentage heuristic", () => {
     ]);
     await getHandler(h.mock, "session_tree")({}, ctx);
     expect(supervisorState()).toBeUndefined();
-    expect(ctx.ui.setStatus).toHaveBeenLastCalledWith("continuous-supervisor", undefined);
+    expect(ctx.ui.setStatus).toHaveBeenCalledWith("continuous-supervisor", undefined);
+    expect(ctx.ui.setStatus).toHaveBeenLastCalledWith("til-done", undefined);
   });
 
   it.each(["abandoned", "execution", "uncovered", "missing-proof", "changed-task"])(

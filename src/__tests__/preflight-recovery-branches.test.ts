@@ -69,7 +69,7 @@ function fixture() {
     leaf = entry.id;
     appendFileSync(path, JSON.stringify(entry) + "\n");
   });
-  vi.mocked(ctx.ui.select).mockResolvedValue("Approve");
+  vi.mocked(ctx.ui.select).mockResolvedValue("允许上述范围");
   return { ...mock, ctx, path, entries };
 }
 

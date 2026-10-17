@@ -1,3 +1,5 @@
+import { installCustomUI } from "./helpers/custom-ui";
+import { visibleWidth } from "@earendil-works/pi-tui";
 import { afterEach, beforeEach, expect, it, vi } from "vitest";
 import { appendFileSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
@@ -24,6 +26,7 @@ import { resetState } from "../state";
 import { createMockAPI, createMockContext } from "./helpers/mocks";
 import { localProposal } from "./helpers/preflight";
 
+const drivers: ReturnType<typeof installCustomUI>[] = [];
 const dirs: string[] = [];
 const argv = process.argv;
 const descriptors = [process.stdin, process.stdout].map((s) =>
@@ -45,6 +48,7 @@ afterEach(() => {
   });
   for (const dir of dirs.splice(0)) rmSync(dir, { recursive: true, force: true });
   vi.restoreAllMocks();
+  for (const ui of drivers.splice(0)) ui.assertNoScriptErrors();
 });
 function fixture() {
   const mock = createMockAPI();
@@ -72,8 +76,12 @@ function fixture() {
     leaf = entry.id;
     appendFileSync(path, JSON.stringify(entry) + "\n");
   });
-  vi.mocked(ctx.ui.select).mockResolvedValue("Approve");
-  return { ...mock, ctx, path, entries };
+  vi.mocked(ctx.ui.select).mockResolvedValue("允许上述范围");
+  const ui = installCustomUI(ctx, (d) => {
+    d.reviewAll();
+  });
+  drivers.push(ui);
+  return { ...mock, ctx, path, entries, ui };
 }
 async function submitted(h: ReturnType<typeof fixture>) {
   const planning = beginPreflight(h.api, h.ctx, "Local fixture");
@@ -100,6 +108,73 @@ function failCache(h: ReturnType<typeof fixture>) {
   });
   return append;
 }
+
+it("shows every permission limit and prohibition in structured native text rather than duplicated JSON", async () => {
+  const h = fixture();
+  vi.mocked(h.ctx.ui.select).mockResolvedValue("稍后决定");
+  await submitted(h);
+  h.ui.assertNoScriptErrors();
+  const material = h.ui.reviewedMaterial.join("").replaceAll("·", " ").replaceAll("\\\\", "\\");
+  const title = vi.mocked(h.ctx.ui.select).mock.calls[0]?.[0] ?? "";
+  expect(title).toContain("请求 ");
+  expect(title).not.toContain("\n");
+  expect(visibleWidth(title)).toBeLessThanOrEqual(64);
+  expect(material).toContain("目标：Local fixture");
+  expect(material).toContain("本次允许");
+  expect(material).toContain("未选择，本次不授权");
+  expect(material).toContain("禁止事项");
+  expect(material).not.toContain("Entire proposal:");
+  expect(material).not.toContain('{"summary"');
+  for (const permission of localProposal.permissions) {
+    for (const value of [
+      permission.id,
+      permission.action,
+      permission.target,
+      permission.environment,
+      permission.limits,
+      permission.risks,
+      permission.fallback,
+      permission.reconfirm,
+    ])
+      expect(material).toContain(value);
+  }
+  for (const value of [
+    ...localProposal.steps,
+    ...localProposal.acceptance,
+    ...localProposal.prohibitions,
+    ...localProposal.reconfirm,
+  ])
+    expect(material).toContain(value);
+  expect(h.entries.some((entry) => entry.customType === "continuous-tasks:preflight-control")).toBe(
+    false,
+  );
+});
+
+it("preserves significant whitespace in the displayed scope instead of silently normalizing paths or limits", async () => {
+  const h = fixture();
+  const planning = beginPreflight(h.api, h.ctx, "Local fixture");
+  const proposal = structuredClone(localProposal);
+  proposal.permissions[0]!.target = "source  files";
+  proposal.permissions[0]!.limits = "No publish\nNo install";
+  vi.mocked(h.ctx.ui.select).mockResolvedValue("稍后决定");
+  await createSubmitPreflightTool(h.api).execute(
+    "submit",
+    { preflightId: planning.preflightId, proposal },
+    undefined,
+    undefined,
+    h.ctx,
+  );
+  h.ui.assertNoScriptErrors();
+  const material = h.ui.reviewedMaterial.join("").replaceAll("·", " ").replaceAll("\\\\", "\\");
+  const title = vi.mocked(h.ctx.ui.select).mock.calls[0]?.[0] ?? "";
+  expect(title).toContain("请求 ");
+  expect(title).not.toContain("\n");
+  expect(visibleWidth(title)).toBeLessThanOrEqual(64);
+  expect(material).toContain('"source  files"');
+  expect(material).toContain('"No publish\\nNo install"');
+  expect(currentRuntime().preflight?.proposal?.permissions[0]?.target).toBe("source  files");
+  expect(currentRuntime().preflight?.approval).toBeUndefined();
+});
 
 it("native submit approves required only without starting", async () => {
   const h = fixture();
@@ -132,6 +207,22 @@ it("native submit approves required only without starting", async () => {
   expect(h.ctx.waitForIdle).not.toHaveBeenCalled();
   expect(h.sendMessage).not.toHaveBeenCalled();
 });
+it("does not lose the saved machine result or create a fault when optional widget refresh fails", async () => {
+  const h = fixture();
+  vi.mocked(h.ctx.ui.select).mockImplementationOnce(async () => {
+    vi.mocked(h.ctx.ui.setWidget).mockImplementation(() => {
+      throw new Error("UI transport unavailable");
+    });
+    return "允许上述范围";
+  });
+  const result = await submitted(h);
+  expect(result.isError).not.toBe(true);
+  expect(result.details.status).toBe("approved");
+  expect(JSON.parse((result.content[0] as { text: string }).text)).toEqual(result.details);
+  expect(currentRuntime().journalFault).toBeUndefined();
+  expect(h.sendMessage).not.toHaveBeenCalled();
+});
+
 it("tells Main that approved permissions are not started and offers no-ID start", async () => {
   const h = fixture();
   await submitted(h);
@@ -172,7 +263,7 @@ it("rejects reuse of a permission request UUID as a start request", async () => 
 });
 it("rebinds changed permission selection after defer to a fresh logical request", async () => {
   const h = fixture();
-  vi.mocked(h.ctx.ui.select).mockResolvedValueOnce("Defer");
+  vi.mocked(h.ctx.ui.select).mockResolvedValueOnce("稍后决定");
   await submitted(h);
   const first = currentRuntime().preflight!;
   if (first.version !== 2 || !first.permissionRequest) throw new Error("No native request fixture");
@@ -237,7 +328,7 @@ it("does not publish first startup when the live start control cannot be saved",
   const h = fixture();
   await submitted(h);
   Object.assign(h.ctx, { model: { provider: "faux", id: "test" } });
-  vi.mocked(h.ctx.ui.select).mockResolvedValue("Start execution");
+  vi.mocked(h.ctx.ui.select).mockResolvedValue("开始执行");
   const append = h.appendEntry.getMockImplementation() as (kind: string, data: unknown) => void;
   h.appendEntry.mockImplementation((kind: string, data: unknown) => {
     if (kind === "continuous-tasks:preflight-control")
@@ -257,7 +348,7 @@ it("retains the confirmed start response when S persistence fails without retryi
   const h = fixture();
   await submitted(h);
   Object.assign(h.ctx, { model: { provider: "faux", id: "test" } });
-  vi.mocked(h.ctx.ui.select).mockResolvedValue("Start execution");
+  vi.mocked(h.ctx.ui.select).mockResolvedValue("开始执行");
   const append = h.appendEntry.getMockImplementation() as (kind: string, data: unknown) => void;
   h.appendEntry.mockImplementation((kind: string, data: unknown) => {
     if (kind === "continuous-tasks:supervisor") throw new Error("S failed");
@@ -276,7 +367,7 @@ it("retains Supervisor counters in a read-only hold when preflight restoration t
   const { preflightLifecycle } = await import("./helpers/preflight");
   const h = preflightLifecycle();
   await h.command("preflight Local fixture");
-  vi.mocked(h.ctx.ui.select).mockResolvedValue("Approve");
+  vi.mocked(h.ctx.ui.select).mockResolvedValue("允许上述范围");
   await createSubmitPreflightTool(h.mock.api).execute(
     "submit",
     { preflightId: currentRuntime().preflight!.preflightId, proposal: localProposal },
@@ -329,11 +420,35 @@ it("retains Supervisor counters in a read-only hold when preflight restoration t
   expect(h.mock.sendMessage.mock.calls.some(([, options]) => options.triggerTurn)).toBe(false);
 });
 
+it("shows one concise permission notification and keeps technical status explicitly available", async () => {
+  const { preflightLifecycle } = await import("./helpers/preflight");
+  const h = preflightLifecycle();
+  await h.command("preflight Local fixture");
+  vi.mocked(h.ctx.ui.select).mockResolvedValue("稍后决定");
+  await createSubmitPreflightTool(h.mock.api).execute(
+    "submit",
+    { preflightId: currentRuntime().preflight!.preflightId, proposal: localProposal },
+    undefined,
+    undefined,
+    h.ctx,
+  );
+  vi.mocked(h.ctx.ui.notify).mockClear();
+  h.mock.sendMessage.mockClear();
+  await h.command("approve");
+  expect(h.ctx.ui.notify).toHaveBeenCalledTimes(1);
+  expect(vi.mocked(h.ctx.ui.notify).mock.calls[0]?.[0]).toContain("权限已确认");
+  expect(vi.mocked(h.ctx.ui.notify).mock.calls[0]?.[0]).not.toContain("Preflight plan:");
+  expect(currentRuntime().preflight?.started).toBeUndefined();
+  expect(h.mock.sendMessage).not.toHaveBeenCalled();
+  await h.command("status");
+  expect(vi.mocked(h.ctx.ui.notify).mock.calls.at(-1)?.[0]).toContain("Preflight plan:");
+});
+
 it("native no-ID first start confirms separately and dispatches once", async () => {
   const { preflightLifecycle } = await import("./helpers/preflight");
   const h = preflightLifecycle();
   await h.command("preflight Local fixture");
-  vi.mocked(h.ctx.ui.select).mockResolvedValue("Approve");
+  vi.mocked(h.ctx.ui.select).mockResolvedValue("允许上述范围");
   const outcome = await createSubmitPreflightTool(h.mock.api).execute(
     "submit",
     { preflightId: currentRuntime().preflight!.preflightId, proposal: localProposal },
@@ -341,9 +456,33 @@ it("native no-ID first start confirms separately and dispatches once", async () 
     undefined,
     h.ctx,
   );
+  h.ui.assertNoScriptErrors();
   expect(outcome.details.status).toBe("approved");
+  expect(currentRuntime().preflight?.approval?.permissionIds).toEqual(["A1"]);
+  expect(h.ui.reviewedMaterial.length).toBeGreaterThan(0);
+  expect(
+    h.entries.filter((entry) => entry.customType === "continuous-tasks:supervisor"),
+  ).toHaveLength(0);
+  vi.mocked(h.ctx.ui.select).mockResolvedValueOnce("稍后启动");
+  const later = await startApprovedPreflight(h.mock.api, h.ctx);
+  h.ui.assertNoScriptErrors();
+  expect(later.status).toBe("deferred");
+  expect(currentRuntime().preflight?.started).toBeUndefined();
+  expect(
+    h.entries.filter((entry) => entry.customType === "continuous-tasks:supervisor"),
+  ).toHaveLength(0);
+  const [title, offered] = vi.mocked(h.ctx.ui.select).mock.calls.at(-1)!;
+  expect(title).toContain("首次启动");
+  expect(title).toContain("请求 ");
+  expect(title).not.toContain("\n");
+  expect(visibleWidth(title)).toBeLessThanOrEqual(64);
+  expect(offered).toContain("稍后启动");
   h.mock.sendMessage.mockClear();
+  vi.mocked(h.ctx.ui.notify).mockClear();
   await h.command("start");
+  const notices = vi.mocked(h.ctx.ui.notify).mock.calls.map(([message]) => message);
+  expect(notices.some((message) => message.trim().startsWith("{"))).toBe(false);
+  expect(notices.join("\n")).toContain("启动确认已保存");
   expect(
     h.entries.find((entry) => entry.customType === "continuous-tasks:supervisor")?.data,
   ).toMatchObject({
@@ -366,3 +505,37 @@ it("native no-ID first start confirms separately and dispatches once", async () 
     1,
   );
 });
+
+it("mandatory widget hide failure defers owner permission before review/native controls without a journal fault", async () => {
+  const h = fixture();
+  vi.mocked(h.ctx.ui.setWidget).mockImplementation(() => {
+    throw new Error("mandatory hide failed");
+  });
+  const result = await submitted(h);
+  h.ui.assertNoScriptErrors();
+  expect(result.details.status).toBe("deferred");
+  expect(h.ui.custom).not.toHaveBeenCalled();
+  expect(h.ctx.ui.select).not.toHaveBeenCalled();
+  expect(h.entries.some((entry) => entry.customType === "continuous-tasks:preflight-control")).toBe(
+    false,
+  );
+  expect(currentRuntime().journalFault).toBeUndefined();
+  expect(currentRuntime().preflight?.approval).toBeUndefined();
+});
+
+it.each([false, true])(
+  "externally observes real scope-driver assertion errors after production returns (afterDone=%s)",
+  async (afterDone) => {
+    const h = fixture();
+    const marker = afterDone ? "AFTER_REVIEW_DONE_MARKER" : "BEFORE_REVIEW_DONE_MARKER";
+    const ui = installCustomUI(h.ctx, (d) => {
+      if (afterDone) d.reviewAll();
+      expect(marker).toBe("deliberate failed script assertion");
+    });
+    const result = await submitted(h);
+    expect(() => {
+      ui.assertNoScriptErrors();
+    }).toThrow(marker);
+    expect(result.details.status).toBe(afterDone ? "approved" : "deferred");
+  },
+);

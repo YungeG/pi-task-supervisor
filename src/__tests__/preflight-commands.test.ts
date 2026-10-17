@@ -1,4 +1,5 @@
-import { beforeEach, describe, expect, it } from "vitest";
+import { preflightNotice } from "../human-presentation";
+import { beforeEach, describe, expect, it, vi } from "vitest";
 import { resetState, getBoard } from "../state";
 import { setSessionScopeEnabled } from "../scope";
 import { supervisorState } from "../supervisor";
@@ -154,3 +155,30 @@ describe("opt-in human preflight commands", () => {
     );
   });
 });
+
+it.each(["tui", "rpc", "print"] as const)(
+  "adds the command details entry only in TUI (%s)",
+  async (mode) => {
+    resetState();
+    setSessionScopeEnabled(false);
+    const h = preflightLifecycle();
+    await h.command("preflight Local fixture");
+    await createSubmitPreflightTool(h.mock.api).execute(
+      "submit",
+      {
+        preflightId: latest(h).preflightId,
+        proposal: localProposal,
+      },
+      undefined,
+      undefined,
+      h.ctx,
+    );
+    Object.assign(h.ctx, { mode });
+    await h.command("approve");
+    h.ui.assertNoScriptErrors();
+    const message = vi.mocked(h.ctx.ui.notify).mock.calls.at(-1)?.[0];
+    if (mode === "tui") expect(message).toContain("详情：/task-supervisor tasks → 确认与回应");
+    else expect(message).toBe(preflightNotice({ status: "unsupported" }).message);
+    expect(h.mock.sendUserMessage).not.toHaveBeenCalled();
+  },
+);

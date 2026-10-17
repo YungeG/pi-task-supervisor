@@ -6,6 +6,7 @@ import type {
 import type { DecisionRecord, TaskBoardSnapshot } from "./types";
 import { CUSTOM_SNAPSHOT_TYPE } from "./types";
 import { cloneBoard, isValidSnapshotV2, isSafeBoundedText } from "./validation";
+import { readableBoardRequest } from "./human-presentation";
 import { validDecisionSpec, validDecisionInformation } from "./decision-spec";
 import { getBoardRef, setBoard, updateUI, reconstructState } from "./state";
 import { currentRuntime, type ProjectionRepairHint } from "./runtime";
@@ -117,11 +118,9 @@ function questionFor(decision: DecisionRecord, frame: NativeQuestion["frame"]): 
   return {
     frame,
     kind: spec.kind,
-    title: decision.question,
-    body:
-      spec.kind === "authorization"
-        ? `${decision.whyUserOwned}\nScope: ${spec.scope}\nProhibited:\n${spec.prohibitions.join("\n")}`
-        : decision.whyUserOwned,
+    ...readableBoardRequest(decision),
+    purpose: spec.kind === "choice" ? "business-choice" : spec.kind,
+    ...(spec.kind === "information" ? { informationFormat: spec.format } : {}),
     options: decision.options,
     informationValidator: (value) => validDecisionInformation(spec, value),
   };
@@ -236,6 +235,45 @@ function verifiedProjection(proof: ConfirmedProof): {
     },
   };
 }
+/** Historical material only: never restores a projection or establishes current authority. */
+export function readBoardHumanPresentation(
+  ctx: ExtensionContext,
+):
+  | { status: "available"; confirmed: SavedBoardAnswer }
+  | { status: "absent" }
+  | { status: "unknown"; reason: string } {
+  try {
+    const persisted = inspectRestorableSession(ctx);
+    const branch = persisted?.branch ?? ctx.sessionManager.getBranch();
+    const controls = branch.filter(
+      (node) =>
+        node.type === "custom" &&
+        node.customType === "continuous-tasks:event" &&
+        node.data &&
+        typeof node.data === "object" &&
+        "humanInteraction" in node.data,
+    );
+    if (!controls.length) return { status: "absent" };
+    const journal = persisted ?? inspectSessionJournal(sessionJournalView(ctx));
+    let latest: SavedBoardAnswer | undefined;
+    for (const node of controls) {
+      if (!("data" in node)) throw new Error("Invalid board control");
+      const frame = (node.data as { humanInteraction: { owner?: string; requestId?: string } })
+        .humanInteraction;
+      if (frame.owner !== "board" || typeof frame.requestId !== "string")
+        throw new Error("Invalid board control frame");
+      const proof = findReadbackProof(journal, "board", frame.requestId);
+      if (proof.status !== "confirmed") throw new Error("Unconfirmed board control");
+      latest = verifiedProjection(proof).confirmed;
+    }
+    return latest
+      ? { status: "available", confirmed: structuredClone(latest) }
+      : { status: "absent" };
+  } catch {
+    return { status: "unknown", reason: "历史回应未核验：文件、分支或原 owner 证明需要检查。" };
+  }
+}
+
 /** Restore confirmed results into the derived view without ever dispatching Main. */
 export function restoreBoardHuman(
   ctx: ExtensionContext,

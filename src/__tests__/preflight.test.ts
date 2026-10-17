@@ -373,7 +373,7 @@ describe("current-branch human control and persistence", () => {
   it("does not fabricate a leaf/control ID from a no-op host", async () => {
     const h = await proposed();
     h.mock.appendEntry.mockImplementation(() => {});
-    vi.mocked(h.ctx.ui.select).mockResolvedValue("Approve");
+    vi.mocked(h.ctx.ui.select).mockResolvedValue("允许上述范围");
     await expect(
       approvePreflight(h.mock.api, h.ctx, currentRuntime().preflight!.planId, "A1"),
     ).rejects.toThrow();

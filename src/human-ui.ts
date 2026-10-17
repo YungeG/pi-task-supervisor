@@ -4,6 +4,10 @@ import { dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import type { ReadbackFrame } from "./human-journal";
 import { isSafeBoundedText } from "./validation";
+import { createScopeReview } from "./human-scope-view";
+import { suspendTaskWidget } from "./board-ui";
+import { closeReadOnlyView } from "./ui-view-lifecycle";
+import { visibleWidth, truncateToWidth, stripTerminalSequences } from "@earendil-works/pi-tui";
 
 /**
  * N2a native TUI transport utility.
@@ -119,7 +123,12 @@ export interface NativeQuestion {
   readonly title: string;
   readonly body: string;
   readonly options?: readonly string[];
+  /** Display-only labels aligned with canonical options; never persisted as answers. */
+  readonly displayOptions?: readonly string[];
   readonly informationValidator?: (value: string) => boolean;
+  /** Display-only metadata; never grants authority or replaces the owner validator. */
+  readonly purpose?: "authorization" | "business-choice" | "first-start" | "information";
+  readonly informationFormat?: "text" | "integer" | "date";
 }
 
 /** Opaque answer recognized only by private WeakMap. */
@@ -140,6 +149,11 @@ interface AnswerMetadata {
 
 const answerRegistry = new WeakMap<object, AnswerMetadata>();
 const activeQuestions = new WeakMap<object, Promise<NativeAnswer | undefined>>();
+
+/** Queries the original operation lock without creating an answer or admission. */
+export function hasActiveNativeQuestion(ctx: ExtensionContext): boolean {
+  return activeQuestions.has(ctx.sessionManager);
+}
 
 /**
  * Request native answer through trusted TUI.
@@ -176,21 +190,36 @@ export async function requestNativeAnswer(
   const clonedQuestion = cloneQuestion(question);
 
   // Create promise and register
-  const answerPromise = performNativeInteraction(
-    ctx,
-    clonedQuestion,
-    sessionId,
-    leafId,
-    isCurrent,
-    operationSignal,
-  );
+  // Establish the original lock before closeReadOnlyView can synchronously abort
+  // a reader whose cleanup reenters this seam.
+  let displayToken: ReturnType<typeof suspendTaskWidget>;
+  const answerPromise = Promise.resolve().then(() => {
+    if (
+      !interactionCurrent(ctx, sessionId, leafId, isCurrent, operationSignal) ||
+      !purposeFor(clonedQuestion) ||
+      !validDisplayMetadata(clonedQuestion)
+    )
+      return undefined;
+    displayToken = suspendTaskWidget(ctx);
+    if (!displayToken) return undefined;
+    return performNativeInteraction(
+      ctx,
+      clonedQuestion,
+      sessionId,
+      leafId,
+      isCurrent,
+      operationSignal,
+    );
+  });
   activeQuestions.set(sessionKey, answerPromise);
 
   try {
     const answer = await answerPromise;
+    if (!interactionCurrent(ctx, sessionId, leafId, isCurrent, operationSignal)) return undefined;
     return answer;
   } finally {
     activeQuestions.delete(sessionKey);
+    displayToken?.release();
   }
 }
 
@@ -201,8 +230,26 @@ function cloneQuestion(question: NativeQuestion): NativeQuestion {
     title: question.title,
     body: question.body,
     options: question.options ? [...question.options] : undefined,
+    displayOptions: question.displayOptions ? [...question.displayOptions] : undefined,
     informationValidator: question.informationValidator,
+    purpose: question.purpose,
+    informationFormat: question.informationFormat,
   };
+}
+
+function interactionCurrent(
+  ctx: ExtensionContext,
+  sessionId: string,
+  leafId: string,
+  isCurrent: () => boolean,
+  signal?: AbortSignal,
+): boolean {
+  return (
+    ctx.sessionManager.getSessionId() === sessionId &&
+    branchContains(ctx, leafId) &&
+    isCurrent() &&
+    !signal?.aborted
+  );
 }
 
 async function performNativeInteraction(
@@ -213,7 +260,8 @@ async function performNativeInteraction(
   isCurrent: () => boolean,
   signal?: AbortSignal,
 ): Promise<NativeAnswer | undefined> {
-  const result = await invokeUI(ctx, question, signal);
+  const current = () => interactionCurrent(ctx, sessionId, leafId, isCurrent, signal);
+  const result = await invokeUI(ctx, question, current, signal);
   if (result === undefined) return undefined;
 
   // Re-check session identity and active branch after UI
@@ -242,59 +290,273 @@ async function performNativeInteraction(
   return answer;
 }
 
+type Purpose = NonNullable<NativeQuestion["purpose"]>;
+const REVIEW_AGAIN = Symbol("review-again");
+const RETRY_INPUT = Symbol("retry-input");
+const REVIEW_LABEL = "重新核对全文";
+// Non-overlay custom replaces only the editor. Same explicit host budget as C0.
+const HOST_CHROME_ROWS = 10;
+
+function canonicalLaterStart(question: NativeQuestion): boolean {
+  return (
+    question.frame.owner === "preflight" &&
+    question.options?.length === 2 &&
+    question.options[0] === "Later" &&
+    question.options[1] === "Start execution"
+  );
+}
+
+function purposeFor(question: NativeQuestion): Purpose | undefined {
+  const purpose =
+    question.purpose === undefined
+      ? question.kind === "choice"
+        ? "business-choice"
+        : question.kind
+      : question.purpose;
+  if (purpose === "authorization" && question.kind === "authorization") return purpose;
+  if (purpose === "information" && question.kind === "information") return purpose;
+  if (purpose === "business-choice" && question.kind === "choice") return purpose;
+  if (purpose === "first-start" && question.kind === "choice" && canonicalLaterStart(question))
+    return purpose;
+  return undefined;
+}
+
+function validDisplayMetadata(question: NativeQuestion): boolean {
+  if (question.informationFormat !== undefined) {
+    if (question.kind !== "information") return false;
+    if (!["text", "integer", "date"].includes(question.informationFormat)) return false;
+  }
+  if (question.kind !== "choice") return true;
+  if (!question.options?.length) return false;
+  // Validate the original mapping even though final business labels are indexed.
+  const labels = question.displayOptions ?? question.options;
+  return labels.length === question.options.length && new Set(labels).size === labels.length;
+}
+
+function formatHint(question: NativeQuestion): string {
+  if (question.informationFormat === "integer") return "整数";
+  if (question.informationFormat === "date") return "日期 YYYY-MM-DD";
+  return "文本，最多1000字";
+}
+
+/** Escape non-ASCII/control/bidi code points in requestId to printable ASCII. */
+function escapeRequestId(raw: string): string {
+  let result = "";
+  for (const char of raw) {
+    const code = char.codePointAt(0) ?? 0;
+    if (code >= 0x20 && code <= 0x7e) {
+      result += char;
+    } else if (code > 0xffff) {
+      result += `\\u{${code.toString(16)}}`;
+    } else {
+      result += `\\u${code.toString(16).padStart(4, "0")}`;
+    }
+  }
+  return result;
+}
+
+/** Build a final native title: purpose/format hint + captured requestId identity, ≤64 cols. */
+function finalTitle(base: string, question: NativeQuestion): string {
+  const escaped = escapeRequestId(question.frame.requestId);
+  const full = `${base} — 请求 ${escaped}`;
+  if (visibleWidth(full) <= 64) return full;
+  return stripTerminalSequences(truncateToWidth(full, 64, "…"));
+}
+
+function reviewText(question: NativeQuestion, purpose: Purpose): string {
+  const contents = [question.title, question.body];
+  if (question.kind === "choice") {
+    contents.push(...(question.options ?? []).map((value, index) => `选项 ${index + 1}\n${value}`));
+  }
+  if (purpose === "information") contents.push(`格式：${formatHint(question)}`);
+  return contents.join("\n\n");
+}
+
+async function reviewScope(
+  ctx: ExtensionContext,
+  text: string,
+  current: () => boolean,
+  signal?: AbortSignal,
+): Promise<boolean> {
+  if (!current()) return false;
+  let component: ReturnType<typeof createScopeReview> | undefined;
+  let abort: (() => void) | undefined;
+  let completion: "reviewed" | "cancelled" | undefined;
+  try {
+    const result = await ctx.ui.custom<"reviewed" | "cancelled">(
+      (tui, theme, keybindings, done) => {
+        const validBeforeFactory = current();
+        const finish = (value: "reviewed" | "cancelled") => {
+          if (completion !== undefined) return;
+          completion = value;
+          done(value);
+        };
+        component = createScopeReview(
+          text,
+          {
+            theme,
+            keybindings,
+            requestRender: () => {
+              tui.requestRender();
+            },
+            rows: () => Math.max(0, tui.terminal.rows - HOST_CHROME_ROWS),
+          },
+          finish,
+        );
+        abort = () => {
+          component?.dispose();
+          finish("cancelled");
+        };
+        signal?.addEventListener("abort", abort, { once: true });
+        if (!validBeforeFactory || !current()) abort();
+        return component;
+      },
+    );
+    return current() && result === "reviewed" && completion === "reviewed";
+  } finally {
+    if (abort) signal?.removeEventListener("abort", abort);
+    component?.dispose();
+  }
+}
+
 async function invokeUI(
   ctx: ExtensionContext,
   question: NativeQuestion,
+  current: () => boolean,
   signal?: AbortSignal,
 ): Promise<string | undefined> {
   try {
-    if (question.kind === "authorization") {
-      return await invokeAuthorization(ctx, question, signal);
+    const purpose = purposeFor(question);
+    if (!purpose || !validDisplayMetadata(question) || !current()) return undefined;
+    await closeReadOnlyView(ctx);
+    if (!current()) return undefined;
+    const text = reviewText(question, purpose);
+    let needsReview = true;
+    while (current()) {
+      if (needsReview) {
+        if (!current()) return undefined;
+        const reviewed = await reviewScope(ctx, text, current, signal);
+        if (!current() || !reviewed) return undefined;
+      }
+      if (!current()) return undefined;
+      const result = await invokeFinalUI(ctx, question, purpose, current, signal);
+      if (!current()) return undefined;
+      if (result === REVIEW_AGAIN || result === RETRY_INPUT) {
+        needsReview = result === REVIEW_AGAIN;
+      } else return result;
     }
-    if (question.kind === "choice") {
-      return await invokeChoice(ctx, question, signal);
-    }
-    return await invokeInformation(ctx, question, signal);
+    return undefined;
   } catch {
-    // UI interaction failed or cancelled
+    // No custom fallback, summary approval, or implicit retry after UI failure.
     return undefined;
   }
 }
 
-async function invokeAuthorization(
+async function selectOffered(
   ctx: ExtensionContext,
-  question: NativeQuestion,
+  title: string,
+  labels: string[],
+  current: () => boolean,
   signal?: AbortSignal,
-): Promise<string | undefined> {
-  const displayTitle = question.body ? `${question.title}\n\n${question.body}` : question.title;
-  return ctx.ui.select(displayTitle, ["Defer", "Approve", "Reject"], { signal });
+): Promise<number | undefined> {
+  if (!current()) return undefined;
+  const selected = await ctx.ui.select(title, [...labels], { signal });
+  if (!current() || selected === undefined) return undefined;
+  const index = labels.indexOf(selected);
+  return index < 0 ? undefined : index;
 }
 
-async function invokeChoice(
+async function invokeFinalUI(
   ctx: ExtensionContext,
   question: NativeQuestion,
+  purpose: Purpose,
+  current: () => boolean,
   signal?: AbortSignal,
-): Promise<string | undefined> {
-  if (!question.options || question.options.length === 0) return undefined;
-  const displayTitle = question.body ? `${question.title}\n\n${question.body}` : question.title;
-  return ctx.ui.select(displayTitle, [...question.options], { signal });
+): Promise<string | typeof REVIEW_AGAIN | typeof RETRY_INPUT | undefined> {
+  if (purpose === "information") return invokeInformation(ctx, question, current, signal);
+  if (purpose === "authorization") {
+    const index = await selectOffered(
+      ctx,
+      finalTitle("范围确认（全文已核对）", question),
+      ["稍后决定", "允许上述范围", "不允许", REVIEW_LABEL],
+      current,
+      signal,
+    );
+    if (!current()) return undefined;
+    return index === 3 ? REVIEW_AGAIN : ["Defer", "Approve", "Reject"][index ?? -1];
+  }
+  if (purpose === "first-start") {
+    const index = await selectOffered(
+      ctx,
+      finalTitle("首次启动（全文已核对）", question),
+      ["稍后启动", "开始执行", REVIEW_LABEL],
+      current,
+      signal,
+    );
+    if (!current()) return undefined;
+    if (index === 2) return REVIEW_AGAIN;
+    return index === 1 ? question.options?.[1] : undefined;
+  }
+  return invokeBusinessChoice(ctx, question, current, signal);
+}
+
+async function invokeBusinessChoice(
+  ctx: ExtensionContext,
+  question: NativeQuestion,
+  current: () => boolean,
+  signal?: AbortSignal,
+): Promise<string | typeof REVIEW_AGAIN | undefined> {
+  const labels = [
+    "稍后决定（不提交）",
+    ...(question.options ?? []).map((_, i) => `选项 ${i + 1}`),
+    REVIEW_LABEL,
+  ];
+  const index = await selectOffered(
+    ctx,
+    finalTitle("业务选择（全文已核对）", question),
+    labels,
+    current,
+    signal,
+  );
+  if (!current() || index === undefined || index === 0) return undefined;
+  if (index === labels.length - 1) return REVIEW_AGAIN;
+  return question.options?.[index - 1];
 }
 
 async function invokeInformation(
   ctx: ExtensionContext,
   question: NativeQuestion,
+  current: () => boolean,
   signal?: AbortSignal,
-): Promise<string | undefined> {
-  const result = await ctx.ui.input(question.title, question.body, { signal });
-  if (result === undefined) return undefined;
+): Promise<string | typeof REVIEW_AGAIN | typeof RETRY_INPUT | undefined> {
+  if (!current()) return undefined;
+  const result = await ctx.ui.input(
+    finalTitle(`补充信息：${formatHint(question)}`, question),
+    undefined,
+    { signal },
+  );
+  if (!current() || result === undefined) return undefined;
 
-  // Validate safe bounded text (max 1000 chars, no secrets)
-  if (!isSafeBoundedText(result, 1000)) return undefined;
-
-  if (question.informationValidator && !question.informationValidator(result)) {
-    return undefined;
-  }
-  return result;
+  // Original bounded-text check precedes the unchanged owner validator. Never
+  // trim, convert, prefill, or echo rejected input through any UI transport.
+  const safe = isSafeBoundedText(result, 1000);
+  if (safe && (!question.informationValidator || question.informationValidator(result)))
+    return result;
+  if (!current()) return undefined;
+  const title = finalTitle(
+    safe ? `未保存：需要${formatHint(question)}` : "未保存：需要安全且不超过1000字的信息",
+    question,
+  );
+  const index = await selectOffered(
+    ctx,
+    title,
+    ["稍后输入", "重新输入", REVIEW_LABEL],
+    current,
+    signal,
+  );
+  if (!current()) return undefined;
+  if (index === 1) return RETRY_INPUT;
+  return index === 2 ? REVIEW_AGAIN : undefined;
 }
 
 function mapResultToAnswer(

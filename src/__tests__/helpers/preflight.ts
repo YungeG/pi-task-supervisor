@@ -1,10 +1,13 @@
+import { installCustomUI } from "./custom-ui";
 import { appendFileSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { trustedCliRoots } from "../../human-ui";
+const drivers: ReturnType<typeof installCustomUI>[] = [];
 const cleanups: Array<() => void> = [];
 afterEach(() => {
   for (const cleanup of cleanups.splice(0).reverse()) cleanup();
+  for (const ui of drivers.splice(0)) ui.assertNoScriptErrors();
 });
 import { afterEach, vi } from "vitest";
 import { lifecycle } from "./lifecycle";
@@ -35,7 +38,7 @@ export function preflightLifecycle() {
   const header = JSON.stringify({ type: "session", version: 3, id: "test-session" }) + "\n";
   writeFileSync(path, header);
   Object.assign(h.ctx.sessionManager, { getSessionFile: vi.fn(() => path) });
-  vi.mocked(h.ctx.ui.select).mockResolvedValue("Defer");
+  vi.mocked(h.ctx.ui.select).mockResolvedValue("稍后决定");
   const entries: Array<{
     type: "custom";
     id: string;
@@ -60,19 +63,24 @@ export function preflightLifecycle() {
     leaf = id;
     appendFileSync(path, JSON.stringify(entries.at(-1)) + "\n");
   });
+  const ui = installCustomUI(h.ctx, (d) => {
+    d.reviewAll();
+  });
+  drivers.push(ui);
   const command = async (args: string) => {
     vi.mocked(h.ctx.ui.select).mockImplementation(async (_title, options) =>
-      options.includes("Start execution") ? "Start execution" : "Approve",
+      options.includes("开始执行") ? "开始执行" : "允许上述范围",
     );
     try {
       await h.command(args);
     } finally {
-      vi.mocked(h.ctx.ui.select).mockResolvedValue("Defer");
+      vi.mocked(h.ctx.ui.select).mockResolvedValue("稍后决定");
     }
   };
   return {
     ...h,
     command,
+    ui,
     entries,
     path,
     syncJournal: () => {

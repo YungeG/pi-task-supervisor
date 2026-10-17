@@ -1,3 +1,4 @@
+import { installCustomUI } from "./helpers/custom-ui";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { appendFileSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
@@ -25,6 +26,7 @@ import { setSessionScopeEnabled } from "../scope";
 import type { TaskBoardSnapshot } from "../types";
 import { createMockAPI, createMockContext } from "./helpers/mocks";
 
+const drivers: ReturnType<typeof installCustomUI>[] = [];
 const dirs: string[] = [];
 const argv = process.argv;
 const ttyDescriptors = [
@@ -50,6 +52,7 @@ afterEach(() => {
   });
   for (const dir of dirs.splice(0)) rmSync(dir, { recursive: true, force: true });
   vi.restoreAllMocks();
+  for (const ui of drivers.splice(0)) ui.assertNoScriptErrors();
 });
 function baseBoard(): TaskBoardSnapshot {
   return {
@@ -134,12 +137,17 @@ function fixture(board: TaskBoardSnapshot) {
   });
   mock.api.appendEntry("continuous-tasks:snapshot", board);
   setBoard(board);
-  vi.mocked(ctx.ui.select).mockResolvedValue("Approve");
+  vi.mocked(ctx.ui.select).mockResolvedValue("允许上述范围");
   Object.assign(ctx.ui, { input: vi.fn(async () => "42") });
+  const ui = installCustomUI(ctx, (d) => {
+    d.reviewAll();
+  });
+  drivers.push(ui);
   return {
     ...mock,
     ctx,
     path,
+    ui,
     failWrites: (predicate: (kind: string) => boolean) => {
       fail = predicate;
     },
@@ -169,7 +177,7 @@ describe("board owner live publisher and carrier", () => {
     "delivers the saved %s value in the one tool result",
     async (kind) => {
       const test = fixture(baseBoard());
-      if (kind === "choice") vi.mocked(test.ctx.ui.select).mockResolvedValue("Option B");
+      if (kind === "choice") vi.mocked(test.ctx.ui.select).mockResolvedValue("选项 2");
       const decision = waitingBoard(kind).decision!;
       const result = await createWorkflowGateTool(test.api).execute(
         "gate",
@@ -178,7 +186,12 @@ describe("board owner live publisher and carrier", () => {
         undefined,
         test.ctx,
       );
+      test.ui.assertNoScriptErrors();
       expect(result.isError).not.toBe(true);
+      expect(result.content).toHaveLength(1);
+      expect(test.ui.reviewedMaterial.join("")).toContain("User-owned·information");
+      if (kind === "choice")
+        expect(vi.mocked(test.ctx.ui.select).mock.calls.at(-1)?.[1]).toContain("选项 2");
       const text = JSON.stringify(result.content);
       expect(text).toContain(kind === "choice" ? "Option B" : "42");
       expect(text).toContain("controlEntryId");
@@ -194,6 +207,10 @@ describe("board owner live publisher and carrier", () => {
       ([name]) => name === "task-supervisor",
     )![1];
     await command.handler("decide", test.ctx);
+    expect(test.ctx.ui.notify).toHaveBeenCalledWith(
+      expect.stringContaining("详情：/task-supervisor tasks → 确认与回应"),
+      "info",
+    );
     expect(test.sendMessage).toHaveBeenCalledTimes(1);
     expect(test.sendMessage.mock.calls[0]![0].content).toContain('"value":"42"');
     expect(test.sendMessage.mock.calls[0]![0].content).toContain('"kind":"information"');
@@ -415,7 +432,7 @@ describe("board owner live publisher and carrier", () => {
 
   it("records an actual authorization rejection once and never asks the terminal decision again", async () => {
     const test = fixture(waitingBoard("authorization"));
-    vi.mocked(test.ctx.ui.select).mockResolvedValue("Reject");
+    vi.mocked(test.ctx.ui.select).mockResolvedValue("不允许");
     const rejected = await answerBoardDecision(test.api, test.ctx);
     expect(rejected).toMatchObject({
       status: "rejected",
@@ -525,3 +542,39 @@ describe("board owner live publisher and carrier", () => {
     },
   );
 });
+
+it.each(["Later", "稍后决定", "重新核对全文"])(
+  "saves the original reserved business value %s through the real indexed owner UI",
+  async (value) => {
+    const test = fixture(baseBoard());
+    const decision = { ...waitingBoard("choice").decision!, options: [value, "Other value"] };
+    vi.mocked(test.ctx.ui.select).mockResolvedValueOnce("选项 1");
+    const result = await createWorkflowGateTool(test.api).execute(
+      "gate",
+      {
+        action: "wait_for_decision",
+        taskId: "t1",
+        decision,
+      },
+      undefined,
+      undefined,
+      test.ctx,
+    );
+    test.ui.assertNoScriptErrors();
+    expect(vi.mocked(test.ctx.ui.select).mock.calls.at(-1)?.[1]).toContain("选项 1");
+    expect(result.isError).not.toBe(true);
+    expect(
+      result.content.map((part) => (part.type === "text" ? part.text : "")).join(""),
+    ).toContain(`"value":"${value}"`);
+    expect(getBoard().workflowStatus).toBe("active");
+    expect(test.sendMessage).not.toHaveBeenCalled();
+    const branch = inspectSessionJournal(sessionJournalView(test.ctx)).branch;
+    expect(
+      branch.filter(
+        (node) =>
+          node.customType === "continuous-tasks:event" &&
+          (node.data as { type?: unknown }).type === "resolve_decision",
+      ),
+    ).toHaveLength(1);
+  },
+);
