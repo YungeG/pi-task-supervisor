@@ -86,8 +86,9 @@ describe("visible task board", () => {
     updateUI(ctx, snapshot);
     const lines = widget(ctx).render(200);
     expect(lines).toHaveLength(8);
-    expect(lines[0]).toBe("Tasks · 已完成 1/7 · 未结束 5 · 放弃 1");
-    expect(lines[2]).toContain("阶段：Implement");
+    expect(lines[3]).toContain("已完成 1/7 · 未结束 5 · 放弃 1");
+    expect(lines[3]).toContain("█");
+    expect(lines[4]).toContain("阶段：Implement");
     expect(lines[5]).toContain("核验中 · review Task review");
     expect(lines[6]).toBe("/task-supervisor tasks · 另 4 项未结束");
     const summary = captureUiSummary(ctx, snapshot);
@@ -100,7 +101,7 @@ describe("visible task board", () => {
     expect(notes).not.toContain("依赖 done 未完成");
     expect(notes).toContain("未编译");
     expect(notes).toContain("执行状态未知");
-    expect(lines[2]).toContain("执行状态未知");
+    expect(lines[0]).toContain("执行状态未知");
     expect(ctx.ui.setWidget).toHaveBeenCalledWith(TASK_WIDGET_KEY, expect.any(Function), {
       placement: "aboveEditor",
     });
@@ -292,7 +293,7 @@ describe("visible task board", () => {
       const ui =
         mode === "tui"
           ? installCustomUI(ctx, (d) => {
-              d.open(3);
+              d.open(4);
               d.scrollAll();
               d.press(ESC);
               d.press(ESC);
@@ -449,7 +450,7 @@ describe("visible task board", () => {
     expect(plain[6]).not.toContain("0 folded");
     const theme = createMockTheme();
     widget(ctx, theme).render(200);
-    expect(theme.fg).toHaveBeenCalledWith("muted", expect.stringContaining("Tasks"));
+    expect(theme.fg).toHaveBeenCalledWith("muted", expect.stringContaining("已完成"));
     expect(theme.fg).toHaveBeenCalledWith("warning", expect.stringContaining("注意："));
     currentRuntime().journalFault = "Invalid journal";
     updateTaskWidget(ctx, snapshot);
@@ -471,7 +472,7 @@ describe("visible task board", () => {
       const ui =
         mode === "tui"
           ? installCustomUI(ctx, (d) => {
-              d.open(3);
+              d.open(4);
               d.scrollAll();
               d.press(ESC);
               d.press(ESC);
@@ -516,7 +517,7 @@ describe("visible task board", () => {
           ? installCustomUI(ctx, (d) => {
               snapshot.tasks[0]!.title = "Changed during selection";
               currentRuntime().supervisor!.reason = "Changed during selection";
-              d.open(3);
+              d.open(4);
               d.scrollAll();
               d.press(ESC);
               d.press(ESC);

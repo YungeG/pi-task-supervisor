@@ -502,8 +502,8 @@ try {
             new KeybindingsManager(TUI_KEYBINDINGS),
             (value) => { completed = true; resolveCustom(value); },
           );
-          const render = () => {
-            const lines = component.render(120).map(stripTerminalSequences);
+          const render = (width = 120) => {
+            const lines = component.render(width).map(stripTerminalSequences);
             (customMode === "scope" ? scopeMaterial : boardMaterial).push(lines.join("\n"));
             return lines.join("\n");
           };
@@ -525,8 +525,18 @@ try {
               }
               throw new Error("Read-only detail never reached its end");
             };
-            // Fixed confirmation + acceptance routes, then both original task details.
-            for (let item = 1; item <= 4; item++) { press("\u001b[B"); detail(); }
+            // The three fixed routes remain stable; phase headings are now selectable.
+            for (let item = 1; item <= 2; item++) { press("\u001b[B"); detail(); }
+            for (const id of ["t-1.1", "t-2.1"]) {
+              let found = false;
+              for (let step = 0; step < 250; step++) {
+                const selected = render(80).split("\n").find((line) => line.startsWith("→ ")) ?? "";
+                if (selected.includes(` · ${id} `)) { detail(); found = true; break; }
+                if (selected.startsWith("→ ▸")) press("\r");
+                press("\u001b[B");
+              }
+              if (!found) throw new Error(`Original task detail not reachable: ${id}`);
+            }
             press("\u001b");
           }
           if (!completed) throw new Error("Real custom component did not finish");

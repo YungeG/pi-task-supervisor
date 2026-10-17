@@ -81,7 +81,7 @@ function harness(view = fixture(), rows = 24) {
     rows: () => rows,
   };
   const board = createReadOnlyBoard(view, env, done);
-  const render = (width = 100) => board.render(width).map(stripTerminalSequences).join("\n");
+  const render = (width = 80) => board.render(width).map(stripTerminalSequences).join("\n");
   const key = (data: string) => board.handleInput?.(data);
   return {
     board,
@@ -171,13 +171,20 @@ function select(h: Harness, label: string): void {
   for (let i = 0; i < 110; i++) {
     if (
       h
-        .render(160)
+        .render(80)
         .split("\n")
         .some((line) => line.startsWith("→ ") && line.includes(label))
     ) {
       h.key("\r");
       return;
     }
+    if (
+      h
+        .render(80)
+        .split("\n")
+        .some((line) => line.startsWith("→ ▸"))
+    )
+      h.key("\r");
     h.key(down);
   }
   throw new Error(`No selectable row: ${label}`);
@@ -283,7 +290,9 @@ describe("createReadOnlyBoard navigation", () => {
         task("p1abandoned", "abandoned"),
       ]),
     );
-    const text = h.render(160);
+    h.render(80);
+    select(h, "▸ P1");
+    const text = h.render(80);
     const order = ["p1review", "p1doing", "p1ready", "p1draft", "p1done", "p1abandoned", "p2doing"];
     expect(order.map((id) => text.indexOf(` · ${id} `))).toEqual(
       order.map((id) => text.indexOf(` · ${id} `)).sort((a, b) => a - b),
@@ -340,13 +349,23 @@ describe("createReadOnlyBoard navigation", () => {
     expect(readAll(h)).toContain("line-79");
     h.key(esc);
     expect(h.render()).toContain("未结束 / 全部阶段");
-    expect(h.render()).toContain("→ P1 · 待开始（已就绪） · b");
+    expect(
+      h
+        .render(80)
+        .split("\n")
+        .find((line) => line.startsWith("→ ")),
+    ).toContain("待开始（已就绪） · b");
     h.key("f");
     h.render();
     h.key("f");
     expect(h.render()).toContain("选择固定筛选");
     h.key(esc);
-    expect(h.render()).toContain("→ P1 · 待开始（已就绪） · b");
+    expect(
+      h
+        .render(80)
+        .split("\n")
+        .find((line) => line.startsWith("→ ")),
+    ).toContain("待开始（已就绪） · b");
     expect(h.done).not.toHaveBeenCalled();
     h.key(esc);
     expect(h.done).toHaveBeenCalledTimes(1);
@@ -374,6 +393,8 @@ describe("createReadOnlyBoard navigation", () => {
     });
     h.key("j");
     h.key("j");
+    h.key("j");
+    h.key("o");
     h.key("j");
     h.key("o");
     const initial = h.render();
@@ -775,8 +796,13 @@ function isolatedDetail(prompt: string, resize: boolean): Promise<IsolatedDetail
       rows: () => 24, requestRender: () => {},
     }, () => { closed = true; });
     board.render(80);
-    for (let i = 0; i < 3; i++) board.handleInput("\\u001b[B");
-    board.handleInput("\\r");
+    for (let i = 0; i < 110; i++) {
+      const selected = board.render(80).map(stripTerminalSequences).find(line => line.startsWith("→ ")) || "";
+      if (selected.includes("title-bounded")) { board.handleInput("\\r"); break; }
+      if (selected.startsWith("→ ▸")) board.handleInput("\\r");
+      board.handleInput("\\u001b[B");
+      if (i === 109) throw new Error("Bounded task is not reachable");
+    }
     let wideMaterial = "";
     if (workerData.resize) {
       wideMaterial += board.render(80).map(stripTerminalSequences).join("");
@@ -936,7 +962,7 @@ describe("parent board acceptance", () => {
       headline: { source: "receipt" as const, level: "error" as const, text: "需检查" },
     };
     const lines = renderCompactBoard(summary, 40, theme);
-    expect(lines[2]?.startsWith("状态：需检查")).toBe(true);
+    expect(lines[0]?.startsWith("状态：需检查")).toBe(true);
     expect(lines.every((line) => visibleWidth(line) <= 40)).toBe(true);
   });
 

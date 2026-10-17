@@ -3,6 +3,7 @@ import {
   type Component,
   type SelectItem,
   SelectList,
+  HStack,
   ScrollView,
   Text,
   Key,
@@ -71,28 +72,38 @@ function goals(summary: UiSummary): string {
     : "未提供/未知";
 }
 
-/** Fixed slots keep attention and the full-board entry ahead of optional task rows. */
+function progressLine(summary: UiSummary): string {
+  const { done, total } = summary.counts;
+  const filled = total > 0 ? Math.floor((12 * done) / total) : 0;
+  const cells = Math.max(0, Math.min(12, filled));
+  return `${counts(summary)}  ${"█".repeat(cells)}${"░".repeat(12 - cells)}`;
+}
+
+/** State, blocker and next action precede secondary task records; never infer a grant. */
 export function renderCompactBoard(summary: UiSummary, width: number, theme: Theme): string[] {
   if (!summary.visible) return [];
   const w = dimension(width);
   const task = [...summary.tasks]
     .sort((a, b) => STATUS_ORDER[a.status] - STATUS_ORDER[b.status] || a.phase - b.phase)
     .find((item) => item.status !== "done" && item.status !== "abandoned");
-  const blocker = summary.blockers[0];
-  const attention = blocker?.text ?? summary.headline.text;
+  const attention = summary.blockers[0]?.text ?? summary.headline.text;
   const other = Math.max(0, summary.blockers.length - 1);
   const lines = [
-    `Tasks · ${counts(summary)}`,
-    `目标：${goals(summary)}`,
-    `状态：${summary.headline.text} · 阶段：${summary.phase ?? "未提供/未知"}`,
+    `状态：${summary.headline.text}`,
     `注意：${other ? `其他 ${other} 项 · ` : ""}${attention}`,
     `下一步：${summary.next.text}`,
+    `─ ${progressLine(summary)}`,
+    `目标：${goals(summary)} · 阶段：${summary.phase ?? "未提供/未知"}`,
     ...(task ? [`${STATUS_LABEL[task.status]} · ${task.id} ${task.title}`] : []),
     `${ENTRY}${summary.counts.unfinished > 1 ? ` · 另 ${summary.counts.unfinished - 1} 项未结束` : ""}`,
     `最终验收：${summary.acceptance}`,
   ];
   return lines.map((line, index) =>
-    truncateToWidth(theme.fg(index === 3 ? "warning" : "muted", singleLine(line)), w, "…"),
+    truncateToWidth(
+      theme.fg(index === 1 ? "warning" : index === 2 ? "accent" : "muted", singleLine(line)),
+      w,
+      "…",
+    ),
   );
 }
 
@@ -233,12 +244,30 @@ class ReadOnlyBoard implements Component {
   private closed = false;
   private small = true;
   private bodyRows = 1;
+  private collapsed = new Set<number>();
+  private previewKey = "";
+  private previewLines: string[] = [];
 
   constructor(
     private view: UiBoardView,
     private env: UiViewEnvironment,
     private done: () => void,
-  ) {}
+  ) {
+    const current =
+      view.board.phases.find((phase) => phase.status === "active")?.phase ??
+      this.tasks().find((task) => task.status !== "done" && task.status !== "abandoned")?.phase ??
+      this.phaseIds()[0];
+    this.collapsed = new Set(this.phaseIds().filter((phase) => phase !== current));
+  }
+
+  private phaseIds(): number[] {
+    return [
+      ...new Set([
+        ...this.view.board.phases.map((p) => p.phase),
+        ...this.view.board.tasks.map((t) => t.phase),
+      ]),
+    ].sort((a, b) => a - b);
+  }
 
   private tasks(): TaskRecord[] {
     return this.view.board.tasks
@@ -249,15 +278,38 @@ class ReadOnlyBoard implements Component {
       })
       .sort((a, b) => a.phase - b.phase || STATUS_ORDER[a.status] - STATUS_ORDER[b.status]);
   }
+  private phaseItems(phase: number, tasks: readonly TaskRecord[]): SelectItem[] {
+    const title =
+      this.view.board.phases.find((item) => item.phase === phase)?.title ?? "未命名阶段";
+    const done = tasks.filter((task) => task.status === "done").length;
+    const collapsed = this.collapsed.has(phase);
+    const header = {
+      value: `phase:${phase}`,
+      label: singleLine(
+        `${collapsed ? "▸" : "▾"} P${phase} · ${title} · 已完成 ${done}/${tasks.length}`,
+      ),
+    };
+    return [
+      header,
+      ...(collapsed
+        ? []
+        : tasks.map((task, index) => ({
+            value: `task:${task.id}`,
+            label: singleLine(
+              `  ${index === tasks.length - 1 ? "└─" : "├─"} ${STATUS_LABEL[task.status]} · ${task.id} ${task.title}`,
+            ),
+          }))),
+    ];
+  }
+
   private items(): SelectItem[] {
+    const tasks = this.tasks();
     return [
       ...FIXED_ITEMS,
-      ...this.tasks().map((task) => ({
-        value: `task:${task.id}`,
-        label: singleLine(
-          `P${task.phase} · ${STATUS_LABEL[task.status]} · ${task.id} ${task.title}`,
-        ),
-      })),
+      ...this.phaseIds().flatMap((phase) => {
+        const matching = tasks.filter((task) => task.phase === phase);
+        return matching.length ? this.phaseItems(phase, matching) : [];
+      }),
     ];
   }
   private filters(): SelectItem[] {
@@ -294,6 +346,143 @@ class ReadOnlyBoard implements Component {
   private filterLabel(): string {
     return `筛选：${FILTER_LABEL[this.taskFilter]} / ${this.phase === undefined ? "全部阶段" : `P${this.phase}`}`;
   }
+  private renderList(width: number, rows: number): string[] {
+    const items = this.mode === "filters" ? this.filters() : this.items();
+    const index =
+      this.mode === "filters"
+        ? this.filterIndex
+        : Math.max(
+            0,
+            items.findIndex((item) => item.value === this.selected),
+          );
+    const empty = this.mode === "list" && !this.tasks().length;
+    const available = rows - (empty ? 1 : 0);
+    const lines = this.list(items, index, available).render(width).slice(0, available);
+    if (empty)
+      lines.push(
+        this.view.board.tasks.length
+          ? "没有匹配任务（不代表目标完成）"
+          : "暂无任务；确认与回应、总览和验收仍可查看",
+      );
+    return lines;
+  }
+
+  private previewOverview(): string {
+    const summary = this.view.summary;
+    const document = this.view.documents.find((item) => item.id === "overview");
+    return [
+      `下一步：${summary.next.text}`,
+      ...summary.blockers.map((line) => `注意：${line.text}`),
+      `目标：${goals(summary)}`,
+      `最终验收：${summary.acceptance}`,
+      document?.reason ?? "完整诊断与捕获标识请进入总览",
+    ].join("\n");
+  }
+
+  private previewTask(): string {
+    const task = this.view.board.tasks.find((item) => `task:${item.id}` === this.selected);
+    if (!task) return "未知：未提供材料";
+    return [
+      task.title,
+      `状态：${STATUS_LABEL[task.status]}（不是执行器心跳）`,
+      "任务说明（预览，不是完整核对）：",
+      task.prompt,
+      `依赖：${task.dependencies.join("、") || "无依赖"}`,
+      `完成证据：${task.completionEvidence?.summary ?? "未记录"}`,
+      "完整证据、风险与元数据请进入任务详情",
+    ].join("\n");
+  }
+
+  private previewRecords(): string {
+    if (this.selected === "acceptance")
+      return [
+        `监督 owner 目标验收：${this.view.summary.acceptance}`,
+        "任务完成不等于目标验收",
+        `最终验收任务：${this.view.board.finalAcceptanceTaskId ?? "未提供/未知"}`,
+        "完整任务证据与 owner 材料请进入最终验收",
+      ].join("\n");
+    const availability = { available: "可查看", unknown: "未知", absent: "无此记录" };
+    return [
+      "原请求/历史回应，不代表当前授权",
+      ...this.view.documents
+        .filter((doc) =>
+          ["current-board-request", "latest-board-response", "preflight"].includes(doc.id),
+        )
+        .map(
+          (doc) =>
+            `${doc.title}：${availability[doc.availability]}${doc.reason ? ` · ${doc.reason}` : ""}`,
+        ),
+      "这里没有批准、恢复或启动入口",
+      "原始全文与已保存原值请进入确认与回应",
+    ].join("\n");
+  }
+
+  private previewText(): string {
+    if (this.selected === "overview") return this.previewOverview();
+    if (this.selected.startsWith("phase:")) {
+      const phase = Number(this.selected.slice(6));
+      return [
+        "阶段完整任务记录（不受当前筛选影响）",
+        ...this.view.board.tasks
+          .filter((task) => task.phase === phase)
+          .map((task) => `${task.id} · ${STATUS_LABEL[task.status]} · ${task.title}`),
+      ].join("\n");
+    }
+    if (this.selected.startsWith("task:")) return this.previewTask();
+    return this.previewRecords();
+  }
+
+  private renderPreview(width: number): string[] {
+    const key = `${this.selected}\u0000${width}`;
+    if (key !== this.previewKey) {
+      this.previewLines = fullLines(this.previewText(), width);
+      this.previewKey = key;
+    }
+    const hint = this.selected.startsWith("phase:")
+      ? "预览 · Enter 展开/折叠"
+      : "只读预览 · Enter 查看全文";
+    return [
+      this.env.theme.fg("accent", truncateToWidth(hint, width, "…")),
+      ...this.previewLines.slice(0, this.bodyRows - 1),
+    ];
+  }
+
+  private renderBody(width: number): string[] {
+    if (this.mode === "detail") return this.renderDetail(width);
+    if (this.mode !== "list" || width < 100 || this.bodyRows < 4)
+      return this.renderList(width, this.bodyRows);
+    const leftWidth = Math.min(54, Math.floor(width * 0.44));
+    const rightWidth = width - leftWidth - 3;
+    return new HStack(
+      [
+        {
+          component: new Text(this.renderList(leftWidth, this.bodyRows).join("\n"), 0, 0),
+          basis: leftWidth,
+          grow: 0,
+          shrink: 0,
+        },
+        {
+          component: new Text(
+            Array(this.bodyRows).fill(this.env.theme.fg("muted", "│")).join("\n"),
+            0,
+            0,
+          ),
+          basis: 1,
+          grow: 0,
+          shrink: 0,
+        },
+        {
+          component: new Text(this.renderPreview(rightWidth).join("\n"), 0, 0),
+          grow: 1,
+          minSize: 1,
+        },
+      ],
+      { gap: 1 },
+    )
+      .render(width)
+      .slice(0, this.bodyRows);
+  }
+
   render(width: number): string[] {
     if (this.closed) return [];
     const w = dimension(width);
@@ -301,39 +490,21 @@ class ReadOnlyBoard implements Component {
     this.small = w < 24 || rows < 8;
     if (this.small) return rows ? [truncateToWidth("Esc 返回 · 窗口过小", w, "")] : [];
     this.bodyRows = Math.min(18, rows - 6);
-    const s = this.view.summary;
+    const summary = this.view.summary;
     const header = [
-      `任务看板 · 只读快照 · generation ${s.scope.generation} · capturedAt ${s.scope.capturedAt}`,
-      `目标：${goals(s)}`,
-      `状态：${s.headline.text}`,
-      counts(s),
+      `${summary.headline.text} · 任务看板（只读快照）`,
+      `下一步：${summary.next.text}`,
+      progressLine(summary),
+      "─".repeat(w),
       this.mode === "detail" ? this.detailTitle : this.filterLabel(),
     ];
-    let body: string[];
-    if (this.mode === "detail") body = this.renderDetail(w);
-    else {
-      const items = this.mode === "filters" ? this.filters() : this.items();
-      const index =
-        this.mode === "filters"
-          ? this.filterIndex
-          : Math.max(
-              0,
-              items.findIndex((item) => item.value === this.selected),
-            );
-      const empty = this.mode === "list" && items.length === FIXED_ITEMS.length;
-      const explanation = this.view.board.tasks.length
-        ? "没有匹配任务（不代表目标完成）"
-        : "暂无任务；确认与回应、总览和验收仍可查看";
-      const available = this.bodyRows - (empty ? 1 : 0);
-      body = this.list(items, index, available).render(w).slice(0, available);
-      if (empty) body.push(explanation);
-    }
+    const body = this.renderBody(w);
     const hint =
       this.mode === "detail"
         ? `Esc 回列表 · ↑↓ 滚动 · ${this.scroll.scrollTop + 1}/${this.detailLines.length} 行`
         : this.mode === "filters"
           ? "Esc 回列表 · ↑↓ 选择固定筛选 · Enter 应用"
-          : "Esc 返回编辑器 · ↑↓ 选择 · Enter 查看 · f 筛选";
+          : "Esc 返回编辑器 · ↑↓ 选择 · Enter 查看/折叠 · f 筛选";
     return [
       ...header.map((line) => this.env.theme.fg("text", singleLine(line))),
       ...body,
@@ -356,19 +527,28 @@ class ReadOnlyBoard implements Component {
       .render(width)
       .slice(this.scroll.scrollTop, this.scroll.scrollTop + this.bodyRows);
   }
+  private detailsFor(value: string): { title: string; text: string } | undefined {
+    const title = FIXED_ITEMS.find((item) => item.value === value)?.label ?? "任务详情";
+    if (value === "overview") return { title, text: overviewText(this.view) };
+    if (value === "confirmation") return { title, text: confirmationText(this.view) };
+    if (value === "acceptance") return { title, text: acceptanceText(this.view) };
+    const task = this.view.board.tasks.find((item) => `task:${item.id}` === value);
+    return task ? { title, text: taskText(this.view, task) } : undefined;
+  }
+
   private open(value: string): void {
-    this.detailTitle = FIXED_ITEMS.find((item) => item.value === value)?.label ?? "任务详情";
-    if (value === "overview") this.detail = overviewText(this.view);
-    else if (value === "confirmation") this.detail = confirmationText(this.view);
-    else if (value === "acceptance") this.detail = acceptanceText(this.view);
-    else {
-      const task = this.view.board.tasks.find((item) => `task:${item.id}` === value);
-      if (!task) return;
-      this.detail = taskText(this.view, task);
+    if (value.startsWith("phase:")) {
+      const phase = Number(value.slice(6));
+      if (this.collapsed.has(phase)) this.collapsed.delete(phase);
+      else this.collapsed.add(phase);
+      return;
     }
+    const details = this.detailsFor(value);
+    if (!details) return;
+    this.detailTitle = details.title;
     this.detail =
       "空白显示：␠ 表示显著空格；\\t/\\r/\\uXXXX 表示原控制字符、非普通空白与超宽字素。\n" +
-      this.detail;
+      details.text;
     this.detailWidth = 0;
     this.scroll.scrollToStart();
     this.mode = "detail";
@@ -383,6 +563,7 @@ class ReadOnlyBoard implements Component {
   private applyFilter(value: string): void {
     if (value === "all" || value === "unfinished" || value === "ended") this.taskFilter = value;
     else this.phase = value === "phase:all" ? undefined : Number(value.slice("phase:".length));
+    if (this.phase !== undefined) this.collapsed.delete(this.phase);
     if (!this.items().some((item) => item.value === this.selected)) this.selected = "overview";
     this.mode = "list";
   }
@@ -436,6 +617,7 @@ class ReadOnlyBoard implements Component {
   }
   invalidate(): void {
     this.detailWidth = 0;
+    this.previewKey = "";
     this.scroll.invalidate();
   }
   dispose(): void {

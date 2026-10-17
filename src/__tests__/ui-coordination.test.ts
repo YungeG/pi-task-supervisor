@@ -574,7 +574,7 @@ it("real board filtering and detail-return retain the frozen capture while owner
     const filtered = d.press(ENTER);
     expect(filtered).toContain("筛选：已结束");
     expect(filtered).not.toContain("Approved work");
-    d.open(3);
+    d.open(4);
     d.scrollAll();
     expect(d.press(ESC)).toContain("筛选：已结束");
     expect(d.doneCount).toBe(0);

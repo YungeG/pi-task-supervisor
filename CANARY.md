@@ -1,6 +1,14 @@
 # Local supervisor validation report
 
-## Unified UI integration — current full/native acceptance PENDING
+## Structured readonly UI candidate — isolated validation
+
+This presentation-only revision is based on committed `a7d3eafbb36f5c69d4bf067bd34067c75624efab`. It adopts the selected action-first header, collapsible phase tree and wide native master/detail preview. It uses captured values and local navigation only; no approval, recovery, startup, persistence, receipt or execution behavior changes. Complete original details, capture identity, whitespace, evidence and two-level return remain available.
+
+The ordinary SDK UI driver is adapted only from positional task rows to visible task-ID navigation because phases now have selectable headers. All original machine/proof/source-negative assertions and explicit script-error reporting remain. Current focused/adjacent/static checks and bounded SDK samples are recorded separately under `structured-ui-implementation-20261017/`; full coverage/check and actual candidate-component terminal evidence must be accepted on the final source. Older product CLI/human/peer/visual evidence below is not a new PASS for this layout. **SDK1.2 remains MISSING.**
+
+No main-branch write, staging/commit/push, installed-snapshot/configuration change, existing-session reload or business action is authorized for this isolated candidate. A standalone candidate-component PTY can demonstrate rendering/navigation mechanics only, not production-factory admission, human reading or business acceptance.
+
+## Historical input: unified UI integration — pre-acceptance source report
 
 The isolated integration now connects the full readonly `/task-supervisor tasks` route (including zero-task confirmation/history), paginated pre-answer scope review and explicit invalid-input retry. Saved branch history is readable material, not a new grant. Its own board/native UI suppress only its own widget and resume fresh; status remains text-only with no footer takeover or cross-extension atomicity guarantee. Machine/owner/proof/carrier/receipt/budget gates are unchanged.
 

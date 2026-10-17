@@ -81,17 +81,23 @@ Task mutation is blocked during planning/approval and when a bound grant is miss
 In the interactive terminal, a persistent board appears above the editor. It uses the existing session snapshot, not a separate task store:
 
 ```text
-Tasks · 已完成 2/6 · 未结束 3 · 放弃 1
-目标：[supervisor] 本次已记录目标
-状态：监督已启用 · 阶段：Implement
+状态：监督已启用
 注意：所在阶段待处理
 下一步：查看状态
+─ 已完成 2/6 · 未结束 3 · 放弃 1  ████░░░░░░░░
+目标：[supervisor] 本次已记录目标 · 阶段：Implement
 处理中（任务记录） · t-2.1 Login endpoint
 /task-supervisor tasks · 另 2 项未结束
 最终验收：尚未记录目标验收
 ```
 
 The compact widget uses the active theme and at most eight single terminal lines. It separates done from abandoned, prioritizes unfinished tasks, and labels recorded task/external-reference state without claiming a live execution heartbeat. Full IDs, prompts, dependencies, evidence and risks remain in the readonly board; navigation consumes one frozen capture, so reopen to see newer facts. Fresh empty sessions have no resident widget, but the three fixed board entries remain reachable.
+
+The structured readonly board keeps captured state and the original next-step guidance before secondary progress. A thin separator divides that summary from the fixed 总览 / 确认与回应 / 最终验收 routes and a phase/task tree. The captured active phase starts expanded; Enter on a phase only expands/collapses local navigation. Status and phase filters remain independent, including empty/no-match states.
+
+At 100 columns or wider, native TUI layout puts a readonly preview beside the tree; narrower terminals remain single-column. Previews show meaningful task/state/record summaries, not capture JSON. Enter on a task or fixed route still opens the complete original material with all IDs, whitespace, evidence, risks and capture identity; Esc returns to the same filter/cursor, then to the editor. A preview is neither full-material review nor an answer. The progress bar counts only done tasks, not abandoned tasks or goal acceptance. No recovery/approval/start callback is added to this view.
+
+This structural revision is an isolated presentation candidate. It does not change the installed package or reload any current/business session. Its current source and terminal-component validation are recorded separately; earlier native product pilots must not be relabeled as acceptance of this new layout.
 
 Use ↑↓ to scroll full details in both terminal modes. Pi fullscreen reserves PgUp/PgDn for its host viewport; those keys are not promised for embedded detail scrolling. Component page bindings remain available when the host forwards them; this extension does not intercept host keys or use an overlay as an ownership workaround.
 

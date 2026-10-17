@@ -1,5 +1,12 @@
 # Changelog
 
+## Isolated structural UI candidate — acceptance pending
+
+- Present owner state, blockers and next-step guidance before a factual task-completion bar; keep done, abandoned and final acceptance distinct.
+- Group readonly navigation into collapsible phases, retaining fixed overview/history/acceptance routes and independent status/phase filters. Preserve selected task/filter on return from complete details.
+- Use native wide-screen master/detail previews from 100 columns; preserve single-column narrow/full-material views and visible readonly-snapshot labeling. Keep diagnostic JSON and capture IDs in full details rather than the primary peek.
+- Navigation changes presentation state only. Native authorization, receipt/history validation, recovery, startup, immutable capture and own-view/widget coordination remain unchanged. No main merge, installation or current-session reload is part of this isolated revision; SDK1.2 remains MISSING.
+
 ## Unreleased unified UI integration — final acceptance pending
 
 - Wire `/task-supervisor tasks` to the full readonly board, fixed confirmation/history/acceptance entries even with zero tasks, filtering and two-level return. Historical material and absent/unknown evidence never grant new authority.
