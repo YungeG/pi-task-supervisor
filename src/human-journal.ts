@@ -92,9 +92,9 @@ export interface JournalLimits {
   maxEntries: number;
 }
 const LIMITS: JournalLimits = {
-  maxBytes: 256 * 1024 * 1024,
-  maxLineBytes: 8 * 1024 * 1024,
-  maxEntries: 200_000,
+  maxBytes: 2 * 1024 * 1024 * 1024,
+  maxLineBytes: 16 * 1024 * 1024,
+  maxEntries: 500_000,
 };
 
 function validateLimits(limits: JournalLimits): void {

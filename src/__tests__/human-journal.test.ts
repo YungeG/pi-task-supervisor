@@ -1,6 +1,14 @@
 import { afterEach, describe, expect, it } from "vitest";
 import { createHash } from "node:crypto";
-import { mkdtempSync, readFileSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
+import {
+  mkdtempSync,
+  readFileSync,
+  rmSync,
+  statSync,
+  symlinkSync,
+  truncateSync,
+  writeFileSync,
+} from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { loadEntriesFromFile } from "../../node_modules/@earendil-works/pi-coding-agent/dist/core/session-manager.js";
@@ -298,6 +306,87 @@ describe("journal limits", () => {
       () => inspectSessionJournal({ path, sessionId: "s", leafId: "n9" }, limits),
       "JOURNAL_LIMIT",
     );
+  });
+});
+
+describe("expanded default journal capacity (bounded synthetic fixtures only)", () => {
+  function sparseInvalidJournal(size: number): SessionJournalView & { path: string } {
+    const path = join(makeDir(), "sparse-capacity.jsonl");
+    writeFileSync(path, "{invalid-json}\n");
+    truncateSync(path, size);
+    const stat = statSync(path);
+    expect(stat.size).toBe(size);
+    // Only sparse metadata is large. Never read or allocate the declared GiB body.
+    expect(stat.blocks * 512).toBeLessThan(64 * 1024);
+    return { path, sessionId: "s", leafId: null };
+  }
+
+  function sizedHeader(lineBytes: number): SessionJournalView {
+    const path = join(makeDir(), "bounded-header.jsonl");
+    const prefix = '{"type":"session","version":3,"id":"s","fixturePadding":"';
+    const suffix = '"}';
+    const padding = "x".repeat(lineBytes - Buffer.byteLength(prefix + suffix));
+    writeFileSync(path, prefix + padding + suffix + "\n");
+    expect(statSync(path).size).toBe(lineBytes + 1);
+    return { path, sessionId: "s", leafId: null };
+  }
+
+  it("smoke: a small sparse fixture reaches structural validation without allocating its body", () => {
+    const view = sparseInvalidJournal(8 * 1024 * 1024);
+    expectCode(() => inspectSessionJournal(view), "JOURNAL_INVALID");
+  });
+
+  it("permits the declared 2GiB byte boundary, still rejects malformed structure, and rejects one byte above", () => {
+    const view = sparseInvalidJournal(2_147_483_648);
+    expectCode(() => inspectSessionJournal(view), "JOURNAL_INVALID");
+    expect(statSync(view.path).size).toBe(2_147_483_648);
+    truncateSync(view.path, 2_147_483_649);
+    expectCode(() => inspectSessionJournal(view), "JOURNAL_LIMIT");
+  });
+
+  it.each([8_388_609, 16_777_216])(
+    "parses a complete valid header with %i physical line bytes under default limits",
+    (bytes) => {
+      const view = sizedHeader(bytes);
+      const journal = inspectSessionJournal(view);
+      expect(journal.sessionId).toBe("s");
+      expect(journal.nodes.size).toBe(0);
+      expect(journal.branch).toEqual([]);
+    },
+  );
+
+  it("rejects a physical line one byte above 16MiB", () => {
+    expectCode(() => inspectSessionJournal(sizedHeader(16_777_217)), "JOURNAL_LIMIT");
+  });
+
+  it("keeps the entry-count guard and physical proof checks at a scaled three/four-entry boundary", () => {
+    const f = fixture();
+    const witness = {
+      type: "custom",
+      id: "witness",
+      parentId: f.control.id,
+      customType: "continuous-tasks:human-readback",
+      data: {
+        version: 1,
+        controlEntryId: f.control.id,
+        controlDigest: hash(f.control),
+        frame: f.frame,
+      },
+    };
+    const limits: JournalLimits = { maxBytes: 4096, maxLineBytes: 2048, maxEntries: 3 };
+    writeJournal(f.path, [f.header, f.base, f.control, witness]);
+    const view = { ...f.view, leafId: witness.id };
+    const journal = inspectSessionJournal(view, limits);
+    expect(journal.branch.map((node) => node.id)).toEqual(["base", "control", "witness"]);
+    expect(findReadbackProof(journal, "board", "request").status).toBe("confirmed");
+    writeJournal(f.path, [
+      f.header,
+      f.base,
+      f.control,
+      witness,
+      { type: "custom", id: "extra", parentId: witness.id },
+    ]);
+    expectCode(() => inspectSessionJournal({ ...view, leafId: "extra" }, limits), "JOURNAL_LIMIT");
   });
 });
 
