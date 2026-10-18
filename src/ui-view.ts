@@ -218,13 +218,48 @@ function computeTaskSummaries(
 
 // ── Visibility ──
 
+function hasOnlyHistoricalPreflight(input: UiSummaryInput): boolean {
+  const { preflight, supervisor } = input;
+  if (!preflight) return true;
+  if (!supervisor || !supervisor.preflightBinding) return false;
+  const binding = supervisor.preflightBinding;
+  return (
+    preflight.phase === "started" &&
+    preflight.goal === supervisor.goal &&
+    preflight.preflightId === binding.preflightId &&
+    preflight.planId === binding.planId &&
+    preflight.planDigest === binding.planDigest
+  );
+}
+
+/** Explicit stop leaves history, not a resident work indicator. Independent attention stays visible. */
+function isQuietStoppedHistory(input: UiSummaryInput): boolean {
+  const { board, supervisor, facts, repairs } = input;
+  if (supervisor?.sessionId !== input.scope.sessionId || supervisor.status !== "stopped")
+    return false;
+  if (supervisor.pending || ["active", "waiting_for_decision"].includes(board.workflowStatus))
+    return false;
+  if (board.tasks.some((task) => task.executionRef)) return false;
+  if (!hasOnlyHistoricalPreflight(input)) return false;
+  return ![
+    board.decision,
+    repairs?.board,
+    repairs?.preflight,
+    facts.journalFault,
+    facts.receiptIssue,
+    facts.preflightIssue,
+  ].some(Boolean);
+}
+
 function computeVisible(
   input: UiSummaryInput,
   counts: UiCounts,
   goals: readonly UiGoal[],
 ): boolean {
   const { board, facts, repairs } = input;
-  if (hasIdentityIssue(input) || goals.length > 0) return true;
+  if (hasIdentityIssue(input)) return true;
+  if (isQuietStoppedHistory(input)) return false;
+  if (goals.length > 0) return true;
   if (counts.total > 0) return true;
   if (board.workflowStatus !== "inactive") return true;
   if (board.decision) return true;

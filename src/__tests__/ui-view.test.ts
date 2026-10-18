@@ -316,6 +316,61 @@ describe("task summaries", () => {
 // ── Visibility ──
 
 describe("visibility", () => {
+  it.each(["inactive", "paused", "completed"] as const)(
+    "hides quiet stopped %s history without discarding its summary",
+    (workflowStatus) => {
+      const result = buildUiSummary(
+        input({
+          board: board([task("t1", workflowStatus === "completed" ? "done" : "implementing")], {
+            workflowStatus,
+          }),
+          supervisor: supervisorState({ status: "stopped", holdCause: "advisor_hold" }),
+          facts: facts({ idle: false, pending: true }),
+        }),
+      );
+      expect(result.visible).toBe(false);
+      expect(result.counts.total).toBe(1);
+      expect(result.goals[0]?.text).toBe("Test goal");
+    },
+  );
+  it.each(["planning", "awaiting_authorization", "approved", "revoked"] as const)(
+    "does not hide new preflight %s behind an old stopped supervisor",
+    (phase) => {
+      const result = buildUiSummary(
+        input({
+          board: board([], { workflowStatus: "paused" }),
+          supervisor: supervisorState({ status: "stopped" }),
+          preflight: preflightState({ phase }),
+        }),
+      );
+      expect(result.visible).toBe(true);
+    },
+  );
+  it("only treats a started preflight as stopped history when the complete retained binding matches", () => {
+    const preflight = preflightState({
+      phase: "started",
+      goal: "Test goal",
+      planId: "plan-1",
+      planDigest: "a".repeat(64),
+    });
+    const supervisor = supervisorState({
+      status: "stopped",
+      preflightBinding: { preflightId: "pf-1", planId: "plan-1", planDigest: "a".repeat(64) },
+    });
+    const value = input({ board: board([], { workflowStatus: "paused" }), supervisor, preflight });
+    expect(buildUiSummary(value).visible).toBe(false);
+    expect(
+      buildUiSummary({ ...value, supervisor: { ...supervisor, preflightBinding: undefined } })
+        .visible,
+    ).toBe(true);
+    for (const changed of [
+      { ...preflight, goal: "Another goal" },
+      { ...preflight, planId: "new-plan" },
+      { ...preflight, planDigest: "b".repeat(64) },
+      { ...preflight, preflightId: "another-preflight" },
+    ])
+      expect(buildUiSummary({ ...value, preflight: changed }).visible).toBe(true);
+  });
   it("empty board, inactive, no facts → false", () => {
     const result = buildUiSummary(
       input({ board: board([], { workflowStatus: "inactive", phases: [] }) }),

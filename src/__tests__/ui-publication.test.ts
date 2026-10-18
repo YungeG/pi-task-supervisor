@@ -1,5 +1,7 @@
 import { beforeEach, describe, expect, it, vi } from "vitest";
 import type { TUI } from "@earendil-works/pi-tui";
+import type { TaskBoardSnapshot } from "../types";
+import { setSessionScopeEnabled } from "../scope";
 import * as capture from "../ui-capture";
 import * as compact from "../board-view";
 import * as status from "../status-ui";
@@ -8,7 +10,13 @@ import { createEmptyBoard } from "../engine";
 import { currentRuntime } from "../runtime";
 import { getBoard, resetState, setBoard, updateUI } from "../state";
 import { createWriteTasksTool } from "../tools";
-import { reviewSupervisor, startSupervisor, supervisorState } from "../supervisor";
+import {
+  reviewSupervisor,
+  startSupervisor,
+  supervisorState,
+  holdSupervisor,
+  prepareToolCapture,
+} from "../supervisor";
 import { lifecycle } from "./helpers/lifecycle";
 import {
   attachMockJournal,
@@ -54,6 +62,180 @@ describe("resident UI publication", () => {
     resetState();
   });
 
+  it("clears resident status and card after stop while retaining the paused 4-done/1-doing/7-queued history", async () => {
+    const h = lifecycle();
+    setSessionScopeEnabled(true);
+    setBoard(activeBoard());
+    h.mock.api.appendEntry("continuous-tasks:activation", { version: 1, enabled: true });
+    const footer = new Map<string, string | undefined>();
+    const widgets = new Map<string, unknown>();
+    vi.mocked(h.ctx.ui.setStatus).mockImplementation((key, value) => {
+      footer.set(key, value);
+    });
+    vi.mocked(h.ctx.ui.setWidget).mockImplementation((key, value) => {
+      widgets.set(key, value);
+    });
+    startSupervisor(h.mock.api, h.ctx, "Synthetic resident-history fixture");
+    const board: TaskBoardSnapshot = {
+      ...activeBoard(),
+      generation: 47,
+      finalAcceptanceTaskId: "t12",
+      tasks: Array.from({ length: 12 }, (_, i) => ({
+        ...activeBoard().tasks[0]!,
+        id: `t${i + 1}`,
+        status: i < 4 ? "done" : i === 4 ? "implementing" : "configured",
+        // Historical shape fixture only; this test does not assert task/goal acceptance.
+        ...(i < 4
+          ? {
+              completionEvidence: {
+                summary: "Previously saved synthetic UI fixture",
+                refs: [
+                  {
+                    kind: "review" as const,
+                    label: "Fixture history only",
+                    status: "passed" as const,
+                    ref: "fixture:historical-review",
+                  },
+                ],
+              },
+            }
+          : {}),
+      })),
+    };
+    setBoard(board);
+    holdSupervisor(h.mock.api, h.ctx, "paused", "Historical advisor hold", "advisor_hold");
+    updateUI(h.ctx, board);
+    expect(footer.get("til-done")).toBeDefined();
+    await h.command("stop");
+    expect(supervisorState()?.status).toBe("stopped");
+    expect(getBoard().workflowStatus).toBe("paused");
+    expect(getBoard().tasks).toEqual(board.tasks);
+    for (const key of ["til-done", "til-done-active", "continuous-supervisor"])
+      expect(footer.get(key)).toBeUndefined();
+    expect(widgets.get(TASK_WIDGET_KEY)).toBeUndefined();
+    expect(h.mock.sendMessage.mock.calls.some(([, options]) => options?.triggerTurn)).toBe(false);
+    const view = capture.captureUiBoardView(h.ctx, getBoard());
+    expect(view.board.tasks).toEqual(board.tasks);
+    expect(view.summary.counts).toEqual({ total: 12, done: 4, abandoned: 0, unfinished: 8 });
+    expect(supervisorState()?.holdCause).toBe("advisor_hold");
+    vi.mocked(h.ctx.isIdle).mockReturnValue(false);
+    vi.mocked(h.ctx.hasPendingMessages).mockReturnValue(true);
+    updateUI(h.ctx, getBoard());
+    expect(footer.get("til-done")).toBeUndefined();
+    expect(widgets.get(TASK_WIDGET_KEY)).toBeUndefined();
+    vi.mocked(h.ctx.isIdle).mockReturnValue(true);
+    vi.mocked(h.ctx.hasPendingMessages).mockReturnValue(false);
+    await h.fire("session_tree");
+    expect(footer.get("til-done")).toBeUndefined();
+    expect(widgets.get(TASK_WIDGET_KEY)).toBeUndefined();
+    expect(getBoard().tasks).toEqual(board.tasks);
+    const writes = h.mock.appendEntry.mock.calls.length;
+    await h.command("status");
+    expect(h.ctx.ui.notify).toHaveBeenLastCalledWith(expect.stringContaining("4/12 done"), "info");
+    const custom = vi.fn(async () => undefined);
+    Object.assign(h.ctx.ui, { custom });
+    await h.command("tasks");
+    expect(custom).toHaveBeenCalledOnce();
+    expect(h.mock.appendEntry).toHaveBeenCalledTimes(writes);
+    expect(getBoard().tasks).toEqual(board.tasks);
+    expect(footer.get("til-done")).toBeUndefined();
+    expect(widgets.get(TASK_WIDGET_KEY)).toBeUndefined();
+  });
+  it.each([
+    "pause",
+    "fault",
+    "journal",
+    "repair",
+    "preflight-repair",
+    "execution",
+    "receipt",
+    "decision",
+    "foreign",
+    "pending",
+  ])(
+    "keeps real %s attention visible instead of treating every idle host as finished",
+    async (kind) => {
+      const h = lifecycle();
+      setSessionScopeEnabled(true);
+      setBoard(activeBoard());
+      startSupervisor(h.mock.api, h.ctx, "Synthetic attention fixture");
+      if (kind === "receipt")
+        prepareToolCapture(h.mock.api, {
+          type: "tool_call",
+          toolName: "write",
+          toolCallId: "pending",
+          input: {},
+        });
+      if (kind === "pause" || kind === "fault")
+        await h.command(kind === "pause" ? "pause Human pause" : "pause Existing work");
+      else await h.command("stop");
+      if (kind === "fault")
+        holdSupervisor(h.mock.api, h.ctx, "fault", "Independent failure", "review_failed");
+      if (kind === "journal") currentRuntime().journalFault = "Independent integrity fault";
+      if (kind === "repair")
+        currentRuntime().boardRepair = {
+          sessionId: "test-session",
+          controlEntryId: "saved",
+          projectedDigest: "a".repeat(64),
+          faultMessage: "Projection pending",
+          ownsJournalFault: false,
+        };
+      if (kind === "preflight-repair")
+        currentRuntime().preflightRepair = {
+          sessionId: "test-session",
+          controlEntryId: "saved",
+          projectedDigest: "a".repeat(64),
+          faultMessage: "Projection pending",
+          ownsJournalFault: false,
+        };
+      if (kind === "pending") supervisorState()!.pending = true;
+      if (kind === "execution") {
+        const board = getBoard();
+        board.tasks[0]!.executionRef = { source: "workflow", runId: "existing" };
+        setBoard(board);
+      }
+      if (kind === "decision") {
+        const board = getBoard();
+        board.decision = {
+          id: "decision-existing",
+          taskId: "active",
+          question: "Choose",
+          whyUserOwned: "Business choice",
+          createdAt: "now",
+          options: ["A", "B"],
+          spec: { version: 1, kind: "choice" },
+        };
+        setBoard(board);
+      }
+      if (kind === "foreign") supervisorState()!.sessionId = "foreign";
+      vi.mocked(h.ctx.ui.setStatus).mockClear();
+      vi.mocked(h.ctx.ui.setWidget).mockClear();
+      updateUI(h.ctx, getBoard());
+      const bar = vi
+        .mocked(h.ctx.ui.setStatus)
+        .mock.calls.filter(([key]) => key === "til-done")
+        .at(-1)?.[1];
+      expect(bar).toBeDefined();
+      expect(vi.mocked(h.ctx.ui.setWidget).mock.calls.at(-1)?.[1]).toEqual(expect.any(Function));
+    },
+  );
+  it("shows explicit board-only work again after a stopped history is resumed without restarting supervision", async () => {
+    const h = lifecycle();
+    setSessionScopeEnabled(true);
+    setBoard(activeBoard());
+    startSupervisor(h.mock.api, h.ctx, "Historical goal");
+    await h.command("stop");
+    await h.command("resume");
+    expect(supervisorState()?.status).toBe("stopped");
+    expect(getBoard().workflowStatus).toBe("active");
+    expect(
+      vi
+        .mocked(h.ctx.ui.setStatus)
+        .mock.calls.filter(([key]) => key === "til-done")
+        .at(-1)?.[1],
+    ).toBeDefined();
+    expect(h.mock.sendMessage.mock.calls.some(([, options]) => options?.triggerTurn)).toBe(false);
+  });
   it("reuses one receipt-issue capture for the TUI widget and bar, while RPC keeps old keys/text", () => {
     const ctx = createMockContext();
     const board = activeBoard();
