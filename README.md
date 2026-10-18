@@ -107,6 +107,16 @@ Use ↑↓ to scroll full details in both terminal modes. Pi fullscreen reserves
 
 The status bar is text-only through the existing Pi status API; this extension does not replace the footer. Opening its own board or native question suppresses only its own resident widget. A native question preempts and actually joins its own reader; the final valid release resnapshots through the original publisher. Session/tree/shutdown cleanup invalidates stale displays. This coordinates only this extension's A/C views, not arbitrary third-party chrome or a cross-extension atomic lease. RPC/print have no custom widget and keep the original text/select behavior.
 
+## Human decision materials
+
+This isolated interaction-layout candidate changes presentation only. Its flow is **formatted browsing → complete original-source review → original native choice/input**. Formatted browsing is neither proof of full review nor an answer. It cannot grant permission, accept a task, or start work. Pressing `r` moves to the original review; it does not skip that review.
+
+The first stage uses existing native Markdown with captured owner fields: sections, lists, readable code fences, indentation and native syntax styles. Section titles stay with content and repeat on continuation pages. A short fenced code block stays together when it fits the page body; oversized blocks continue under the repeated section context. Preview tabs are expanded for readability; invisible/control material is escaped. The exact-source stage retains its original whitespace/control representation, all material, render-before-advance requirements, resize reset and cancel behavior. Native keys and current keybindings drive both stages; no global input listener or overlay is added.
+
+The final native selector/input retains the original bounded request identity/purpose/format header and adds one bounded, escaped question-context line. Business choices show a unique ordinal plus a short safe excerpt; complete original values remain in exact-source review and are mapped by original index, never by translated meaning or a trimmed value. Input retries keep the question context without prefilling or echoing rejected input. Approval and first-start remain separate operations.
+
+All material is captured before asynchronous interaction. Deferred layout uses captured materials and prepared native syntax output, with the supplied native theme for text styling; it does not read owner state, journals, history, files, network or wall clock. The resident card, board navigation, machine content, canonical values, permission/readback/receipt/recovery/budget checks and original native answer registry are not replaced. This candidate is not automatically merged, installed or reloaded; runtime, browser and human acceptance limits are recorded with its validation artifacts.
+
 ## Closed loop and evidence
 
 1. Main prepares a phased board, claims one ready batch, implements work, and enters review. The execution guidance asks it to finish the run normally after verifying that batch, before claiming another; this is not a host-enforced phase gate.

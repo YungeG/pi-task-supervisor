@@ -8,6 +8,7 @@ import {
   type Keybinding,
 } from "@earendil-works/pi-tui";
 import type { UiViewEnvironment } from "./ui-environment";
+import { MaterialReading, type HumanMaterial } from "./human-material-view";
 
 type ReviewResult = "reviewed" | "cancelled";
 type Layout = { width: number; rows: number; lines: string[]; pageSize: number; pages: number };
@@ -161,6 +162,8 @@ export function createScopeReview(
   text: string,
   env: UiViewEnvironment,
   done: (result: ReviewResult) => void,
+  material?: HumanMaterial,
 ): Component & { dispose(): void } {
-  return new ScopeReview(text, env, done);
+  const raw = new ScopeReview(text, env, done);
+  return material ? new MaterialReading(material, raw, env) : raw;
 }

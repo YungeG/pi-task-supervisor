@@ -57,7 +57,8 @@ export function installCustomUI(ctx: ExtensionContext, script?: (driver: Driver)
       for (let page = 0; page < 10000; page++) {
         const lines = driver.render().split("\n");
         if (!lines[1]?.startsWith("第 ")) throw new Error("Expected a real scope review page");
-        reviewedMaterial.push(...lines.slice(3, -2));
+        // Formatted browsing is not exact-source review evidence.
+        if (lines[0] === "只读核对（非作答）") reviewedMaterial.push(...lines.slice(3, -2));
         driver.press(ENTER);
         if (doneCount !== before) return;
       }

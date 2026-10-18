@@ -1,5 +1,12 @@
 # Changelog
 
+## Isolated interactive material-layout candidate — acceptance pending
+
+- Add display-only structured materials for human decisions: native Markdown/code styling, section-aware pages and continuation context. The original exact-source reader remains a mandatory, separate step; formatted browsing cannot count as a decision or original review.
+- Keep native request identity/purpose/format headers and add one bounded safe question-context line to final selection/input. Business options show ordinal plus excerpt while returning the exact original canonical value. Rejected input is still neither echoed nor prefilled.
+- Keep original owner-readable body bytes, native trust/opaque-answer checks, cancellation/epoch/branch rules, approval/first-start separation and all machine/proof/receipt/recovery behavior. No new dependency, answer provider, overlay, footer or global key hook.
+- Candidate-only source changes in an isolated branch; no automatic merge, installation, reload or business operation. Validation and remaining acceptance gaps are recorded separately.
+
 ## Isolated compact resident-card candidate — acceptance pending
 
 - Replace the flat eight-line resident log with a bounded native-theme card: owner state, factual progress, primary blocker and next guidance, grouped phase/task record, and the original readonly route.

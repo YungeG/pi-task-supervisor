@@ -6,7 +6,7 @@ import type {
 import type { DecisionRecord, TaskBoardSnapshot } from "./types";
 import { CUSTOM_SNAPSHOT_TYPE } from "./types";
 import { cloneBoard, isValidSnapshotV2, isSafeBoundedText } from "./validation";
-import { readableBoardRequest } from "./human-presentation";
+import { readableBoardRequest, boardMaterial } from "./human-presentation";
 import { validDecisionSpec, validDecisionInformation } from "./decision-spec";
 import { getBoardRef, setBoard, updateUI, reconstructState } from "./state";
 import { currentRuntime, type ProjectionRepairHint } from "./runtime";
@@ -119,6 +119,7 @@ function questionFor(decision: DecisionRecord, frame: NativeQuestion["frame"]): 
     frame,
     kind: spec.kind,
     ...readableBoardRequest(decision),
+    material: boardMaterial(decision),
     purpose: spec.kind === "choice" ? "business-choice" : spec.kind,
     ...(spec.kind === "information" ? { informationFormat: spec.format } : {}),
     options: decision.options,

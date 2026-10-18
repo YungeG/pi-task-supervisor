@@ -11,6 +11,8 @@ export function createMockTheme(): Theme {
   return {
     fg: vi.fn((color: string, text: string) => `[${color}]${text}`),
     bold: vi.fn((text: string) => `**${text}**`),
+    italic: vi.fn((text: string) => text),
+    underline: vi.fn((text: string) => text),
     strikethrough: vi.fn((text: string) => `~~${text}~~`),
   } as unknown as Theme;
 }

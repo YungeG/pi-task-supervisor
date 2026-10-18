@@ -44,7 +44,7 @@ import { startSupervisor, supervisorNotice, supervisorState } from "./supervisor
 import { formatFlowStatus, flowFacts } from "./flow";
 import { getBoardRef } from "./state";
 import { enableSessionScope, updateActiveTools } from "./scope";
-import { readablePreflight } from "./human-presentation";
+import { readablePreflight, preflightMaterial } from "./human-presentation";
 
 type ConfirmedProof = Extract<ReadbackProof, { status: "confirmed" }>;
 export interface PreflightHumanResult {
@@ -206,6 +206,7 @@ async function present(
         kind: start ? "choice" : "authorization",
         purpose: start ? "first-start" : "authorization",
         ...presentation,
+        material: preflightMaterial(base, ids, start),
         ...(start
           ? { options: ["Later", "Start execution"], displayOptions: ["稍后启动", "开始执行"] }
           : {}),

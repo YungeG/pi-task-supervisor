@@ -173,11 +173,36 @@ async function pendingBoardCache() {
 }
 
 describe("board owner live publisher and carrier", () => {
+  it("shows the original board question with formatted browsing while defer saves no control", async () => {
+    const test = fixture(waitingBoard("authorization"));
+    vi.mocked(test.ctx.ui.select).mockResolvedValueOnce("稍后决定");
+    const result = await answerBoardDecision(test.api, test.ctx);
+    test.ui.assertNoScriptErrors();
+    expect(result.status).toBe("deferred");
+    expect(test.ui.rendered.join("\n")).toContain("格式化浏览");
+    expect(test.ui.rendered.join("\n")).toContain("只读核对");
+    expect(test.ui.reviewedMaterial.join("\n")).toContain("Only·local·tests");
+    const title = vi.mocked(test.ctx.ui.select).mock.calls[0]?.[0] ?? "missing";
+    expect(title.split("\n")[1]).toBe("问题：Provide value");
+    expect(getBoard().workflowStatus).toBe("waiting_for_decision");
+    expect(getBoard().decision?.question).toBe("Provide value");
+    expect(
+      test.appendEntry.mock.calls.some(
+        ([kind, data]) =>
+          kind === "continuous-tasks:event" &&
+          data !== null &&
+          typeof data === "object" &&
+          "type" in data &&
+          data.type === "resolve_decision",
+      ),
+    ).toBe(false);
+    expect(test.sendMessage).not.toHaveBeenCalled();
+  });
   it.each(["information", "choice"] as const)(
     "delivers the saved %s value in the one tool result",
     async (kind) => {
       const test = fixture(baseBoard());
-      if (kind === "choice") vi.mocked(test.ctx.ui.select).mockResolvedValue("选项 2");
+      if (kind === "choice") vi.mocked(test.ctx.ui.select).mockResolvedValue("选项 2 · Option B");
       const decision = waitingBoard(kind).decision!;
       const result = await createWorkflowGateTool(test.api).execute(
         "gate",
@@ -191,7 +216,7 @@ describe("board owner live publisher and carrier", () => {
       expect(result.content).toHaveLength(1);
       expect(test.ui.reviewedMaterial.join("")).toContain("User-owned·information");
       if (kind === "choice")
-        expect(vi.mocked(test.ctx.ui.select).mock.calls.at(-1)?.[1]).toContain("选项 2");
+        expect(vi.mocked(test.ctx.ui.select).mock.calls.at(-1)?.[1]).toContain("选项 2 · Option B");
       const text = JSON.stringify(result.content);
       expect(text).toContain(kind === "choice" ? "Option B" : "42");
       expect(text).toContain("controlEntryId");
@@ -548,7 +573,9 @@ it.each(["Later", "稍后决定", "重新核对全文"])(
   async (value) => {
     const test = fixture(baseBoard());
     const decision = { ...waitingBoard("choice").decision!, options: [value, "Other value"] };
-    vi.mocked(test.ctx.ui.select).mockResolvedValueOnce("选项 1");
+    vi.mocked(test.ctx.ui.select).mockImplementationOnce(async (_title, labels) =>
+      labels.find((label) => label.startsWith("选项 1 · ")),
+    );
     const result = await createWorkflowGateTool(test.api).execute(
       "gate",
       {
@@ -561,7 +588,7 @@ it.each(["Later", "稍后决定", "重新核对全文"])(
       test.ctx,
     );
     test.ui.assertNoScriptErrors();
-    expect(vi.mocked(test.ctx.ui.select).mock.calls.at(-1)?.[1]).toContain("选项 1");
+    expect(vi.mocked(test.ctx.ui.select).mock.calls.at(-1)?.[1]).toContain(`选项 1 · ${value}`);
     expect(result.isError).not.toBe(true);
     expect(
       result.content.map((part) => (part.type === "text" ? part.text : "")).join(""),

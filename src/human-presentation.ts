@@ -4,6 +4,7 @@ import { stripTerminalSequences } from "@earendil-works/pi-tui";
 import type { PreflightHumanResult } from "./preflight-human";
 import type { BoardHumanResult } from "./board-human";
 import type { DecisionRecord } from "./types";
+import type { HumanMaterial } from "./human-material-view";
 
 export interface HumanNotice {
   message: string;
@@ -142,6 +143,97 @@ export function readableBoardRequest(decision: Readonly<DecisionRecord>): {
     details.push(list("旧请求原选项（不代表授权）：", decision.options));
   if (decision.response) details.push(`原回应标记：${displayText(decision.response)}`);
   return { title: displayText(decision.question), body: details.join("\n\n") };
+}
+
+function materialList(values: readonly string[]): string {
+  return values.length ? values.map((value) => `- ${value}`).join("\n") : "无";
+}
+
+/** Formatted browsing from original owner fields, never a replacement for exact-source review. */
+export function boardMaterial(decision: Readonly<DecisionRecord>): HumanMaterial {
+  const sections = [
+    { title: "需要你决定", markdown: `${decision.question}\n\n${decision.whyUserOwned}` },
+  ];
+  const spec = decision.spec;
+  if (spec?.kind === "authorization")
+    sections.push(
+      { title: "本次请求的范围", markdown: spec.scope },
+      { title: "禁止事项", markdown: materialList(spec.prohibitions) },
+      { title: "回应含义", markdown: "只确认所示范围，不代表任务验收通过；其他门槛仍有效。" },
+    );
+  else if (spec?.kind === "choice")
+    sections.push({
+      title: "业务选项（原值仍须核对）",
+      markdown: (decision.options ?? [])
+        .map((option, index) => `### 选项 ${index + 1}\n\n${option}`)
+        .join("\n\n"),
+    });
+  else if (spec?.kind === "information")
+    sections.push({
+      title: "填写要求（不新增业务权限）",
+      markdown:
+        spec.format === "date"
+          ? "日期：YYYY-MM-DD"
+          : spec.format === "integer"
+            ? "整数，原值保存"
+            : "文本，不超过1000字；原值保存",
+    });
+  else
+    sections.push({
+      title: "缺少结构化范围",
+      markdown: "权限未知，需要完整替代请求；浏览不能取得权限。",
+    });
+  return { context: decision.question, sections };
+}
+
+function permissionMaterial(
+  permission: PreflightProposal["permissions"][number],
+  selected: boolean,
+): HumanMaterial["sections"][number] {
+  return {
+    title: `${selected ? "请求允许" : "本次不授权"} · ${permission.id} · ${permission.required ? "必需" : "可选"}`,
+    markdown: [
+      permission.action,
+      `**对象**\n\n${permission.target}`,
+      `**环境**\n\n${permission.environment}`,
+      `**限制**\n\n${permission.limits}`,
+      `**风险**\n\n${permission.risks}`,
+      `**替代方案**\n\n${permission.fallback}`,
+      `**重新确认条件**\n\n${permission.reconfirm}`,
+    ].join("\n\n"),
+  };
+}
+
+export function preflightMaterial(
+  state: PreflightState,
+  selectedIds: readonly string[],
+  start: boolean,
+): HumanMaterial {
+  const proposal = state.proposal;
+  if (!proposal)
+    return { context: state.goal, sections: [{ title: "尚无完整方案", markdown: state.goal }] };
+  return {
+    context: state.goal,
+    sections: [
+      { title: "目标与方案", markdown: `${state.goal}\n\n${proposal.summary}` },
+      ...proposal.permissions.map((permission) =>
+        permissionMaterial(permission, selectedIds.includes(permission.id)),
+      ),
+      {
+        title: "执行计划",
+        markdown: proposal.steps.map((step, index) => `${index + 1}. ${step}`).join("\n"),
+      },
+      { title: "验收要求", markdown: materialList(proposal.acceptance) },
+      { title: "禁止事项", markdown: materialList(proposal.prohibitions) },
+      { title: "需要重新确认的变化", markdown: materialList(proposal.reconfirm) },
+      {
+        title: "本次操作的含义",
+        markdown: start
+          ? "本次仅确认首次启动，不扩大已有权限；回执、证据、预算和其他门槛仍有效。"
+          : "本次仅保存权限决定，不会启动执行。启动仍需另一次独立确认；聊天文本不能批准。",
+      },
+    ],
+  };
 }
 
 export function preflightDetailText(result: Partial<PreflightHumanResult>): string {

@@ -497,6 +497,7 @@ try {
       return new Promise((resolveCustom, rejectCustom) => {
         try {
           let completed = false;
+          let originalRendered = false;
           const component = factory(
             { terminal: { rows: 40 }, requestRender() {} }, widgetThemes[0],
             new KeybindingsManager(TUI_KEYBINDINGS),
@@ -504,16 +505,24 @@ try {
           );
           const render = (width = 120) => {
             const lines = component.render(width).map(stripTerminalSequences);
-            (customMode === "scope" ? scopeMaterial : boardMaterial).push(lines.join("\n"));
+            if (customMode === "scope") {
+              if (lines[0] === "只读核对（非作答）") {
+                originalRendered = true;
+                scopeMaterial.push(lines.join("\n"));
+              }
+            } else boardMaterial.push(lines.join("\n"));
             return lines.join("\n");
           };
           const press = (key) => { component.handleInput(key); return render(); };
           render();
           if (customMode === "scope") {
             for (let page = 0; page < 10000 && !completed; page++) {
-              if (!render().includes("只读核对（非作答）")) throw new Error("Expected actual scope-review page");
+              const header = render().split("\n")[0];
+              if (header !== "只读核对（非作答）" && header !== "格式化浏览（非核对、非作答）")
+                throw new Error("Expected actual formatted/original scope-review page");
               press("\r");
             }
+            if (!originalRendered) throw new Error("Formatted browsing cannot replace original review");
           } else {
             const detail = () => {
               press("\r");

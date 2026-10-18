@@ -1312,3 +1312,168 @@ describe("original admission and opaque answer validation remain closed", () => 
     expect(hasActiveNativeQuestion(first.ctx)).toBe(false);
   });
 });
+
+describe("display-only context for formatted questions", () => {
+  it("captures display material before asynchronous UI work and binds the original opaque answer", async () => {
+    const h = harness();
+    const material = {
+      context: "ORIGINAL_CONTEXT",
+      sections: [{ title: "原始栏目", markdown: "ORIGINAL_MATERIAL" }],
+    };
+    const q = question({ material });
+    vi.mocked(h.ctx.ui.select).mockResolvedValueOnce("允许上述范围");
+    const pending = requestNativeAnswer(h.ctx, q, () => true);
+    material.context = "MUTATED_CONTEXT";
+    material.sections[0]!.markdown = "MUTATED_MATERIAL";
+    const answer = await pending;
+    expect(requireNativeAnswer(h.ctx, answer, q.frame)).toBe(answer);
+    expect(vi.mocked(h.ctx.ui.select).mock.calls[0]?.[0]).toContain("ORIGINAL_CONTEXT");
+    expect(vi.mocked(h.ctx.ui.select).mock.calls[0]?.[0]).not.toContain("MUTATED_CONTEXT");
+    expect(h.rendered.flat().join("\n")).toContain("ORIGINAL_MATERIAL");
+    expect(h.rendered.flat().join("\n")).not.toContain("MUTATED_MATERIAL");
+    expect(() => requireNativeAnswer(h.ctx, structuredClone(answer), q.frame)).toThrow(
+      "Unrecognized native answer",
+    );
+  });
+
+  it("cannot advance from formatted browsing directly to a native decision without rendered original pages", async () => {
+    const h = harness();
+    h.setAction("hold");
+    const q = question({
+      material: { context: "原始问题", sections: [{ title: "简介", markdown: "一句话" }] },
+    });
+    const pending = requestNativeAnswer(h.ctx, q, () => true);
+    await vi.waitFor(() => {
+      expect(h.custom).toHaveBeenCalledOnce();
+    });
+    const view = h.components[0];
+    view?.handleInput?.("\r");
+    for (let i = 0; i < 100; i++) view?.handleInput?.("\r");
+    expect(h.ctx.ui.select).not.toHaveBeenCalled();
+    expect(h.ctx.ui.input).not.toHaveBeenCalled();
+    h.drive("cancel");
+    expect(await pending).toBeUndefined();
+    expect(hasActiveNativeQuestion(h.ctx)).toBe(false);
+  });
+
+  it("retains question context during input retry without echoing rejected text or prefilling", async () => {
+    const h = harness();
+    const rejected = "SENSITIVE_BAD_DATE";
+    const q = question({
+      kind: "information",
+      informationFormat: "date",
+      informationValidator: (value) => value === "2024-02-29",
+      material: {
+        context: "文档标签日期",
+        sections: [{ title: "信息要求", markdown: "日期 YYYY-MM-DD" }],
+      },
+    });
+    vi.mocked(h.ctx.ui.input).mockResolvedValueOnce(rejected).mockResolvedValueOnce("2024-02-29");
+    vi.mocked(h.ctx.ui.select).mockResolvedValueOnce("重新输入");
+    const answer = await requestNativeAnswer(h.ctx, q, () => true);
+    expect(answer?.value).toBe("2024-02-29");
+    expect(requireNativeAnswer(h.ctx, answer, q.frame)).toBe(answer);
+    for (const [title, placeholder] of vi.mocked(h.ctx.ui.input).mock.calls) {
+      expect(title).toContain("问题：文档标签日期");
+      expect(placeholder).toBeUndefined();
+    }
+    const allUi = JSON.stringify([
+      h.rendered,
+      vi.mocked(h.ctx.ui.select).mock.calls,
+      vi.mocked(h.ctx.ui.input).mock.calls,
+    ]);
+    expect(allUi).not.toContain(rejected);
+    expect(h.custom).toHaveBeenCalledOnce();
+  });
+
+  it.each(["ctx", "foreign"] as const)(
+    "cancels formatted reading on the %s abort signal with no native control",
+    async (source) => {
+      const h = harness();
+      h.setAction("hold");
+      const controller = new AbortController();
+      if (source === "ctx") Object.assign(h.ctx, { signal: controller.signal });
+      const q = question({
+        material: { context: "只读材料", sections: [{ title: "范围", markdown: "完整内容" }] },
+      });
+      const pending = requestNativeAnswer(
+        h.ctx,
+        q,
+        () => true,
+        source === "foreign" ? controller.signal : undefined,
+      );
+      await vi.waitFor(() => {
+        expect(h.custom).toHaveBeenCalledOnce();
+      });
+      controller.abort();
+      expect(await pending).toBeUndefined();
+      expect(h.ctx.ui.select).not.toHaveBeenCalled();
+      expect(h.ctx.ui.input).not.toHaveBeenCalled();
+      expect(hasActiveNativeQuestion(h.ctx)).toBe(false);
+      expect(h.components[0]?.render(80)).toEqual([]);
+    },
+  );
+
+  it("bounds and escapes rich option excerpts without accepting an unoffered ordinal alias", async () => {
+    const { visibleWidth } = await import("@earendil-works/pi-tui");
+    const h = harness();
+    const q = question({
+      kind: "choice",
+      options: ["同一前缀".repeat(100), "同一前缀".repeat(99) + "尾部", "code\n\u001b[31m\u202e"],
+      material: {
+        context: "\u202e很长的具体问题".repeat(30),
+        sections: [{ title: "原始选项", markdown: "保留全文" }],
+      },
+    });
+    vi.mocked(h.ctx.ui.select).mockResolvedValueOnce("选项 2");
+    expect(await requestNativeAnswer(h.ctx, q, () => true)).toBeUndefined();
+    const [title, labels] = vi.mocked(h.ctx.ui.select).mock.calls[0] ?? ["", []];
+    expect(title.split("\n")).toHaveLength(2);
+    expect(title.split("\n").every((line) => visibleWidth(line) <= 64)).toBe(true);
+    expect(title).not.toContain("\u202e");
+    expect(new Set(labels).size).toBe(labels.length);
+    expect(labels.every((label) => visibleWidth(label) <= 32)).toBe(true);
+    expect(labels.join("")).not.toContain("\u001b");
+    expect(labels.join("")).not.toContain("\u202e");
+  });
+
+  it("shows ordinal plus option meaning but returns the exact original colliding value", async () => {
+    const h = harness();
+    const q = question({
+      kind: "choice",
+      options: ["Later", " 稍后决定 ", "重新核对全文"],
+      material: {
+        context: "选择原始业务项",
+        sections: [{ title: "选项", markdown: "只读选项说明" }],
+      },
+    });
+    vi.mocked(h.ctx.ui.select).mockImplementationOnce(async (_title, labels) => labels[2]);
+    const answer = await requestNativeAnswer(h.ctx, q, () => true);
+    const labels = vi.mocked(h.ctx.ui.select).mock.calls[0]?.[1] ?? [];
+    expect(labels[2]).toBe('选项 2 · " 稍后决定 "');
+    expect(new Set(labels).size).toBe(labels.length);
+    expect(answer?.value).toBe(" 稍后决定 ");
+    expect(requireNativeAnswer(h.ctx, answer, q.frame)).toBe(answer);
+  });
+  it("keeps the original identity header and adds only one safe bounded question line", async () => {
+    const { visibleWidth } = await import("@earendil-works/pi-tui");
+    const h = harness();
+    const q = question({
+      material: {
+        context: "核对本地代码范围\n不得伪造新标题\u001b[31m",
+        sections: [{ title: "用途", markdown: "这是只读预览，仍需核对原文。" }],
+      },
+    });
+    vi.mocked(h.ctx.ui.select).mockResolvedValueOnce("稍后决定");
+    expect(await requestNativeAnswer(h.ctx, q, () => true)).toBeUndefined();
+    const title = vi.mocked(h.ctx.ui.select).mock.calls[0]?.[0] ?? "missing";
+    const lines = title.split("\n");
+    expect(lines).toHaveLength(2);
+    expect(lines[0]).toBe("范围确认（全文已核对） — 请求 request");
+    expect(lines[1]).toContain("核对本地代码范围");
+    expect(visibleWidth(lines[1] ?? "")).toBeLessThanOrEqual(64);
+    expect(lines[1]).not.toContain("\u001b");
+    expect(h.rendered.flat().join("\n")).toContain("Full·original·body");
+    expect(h.rendered.flat().join("\n")).toContain("格式化浏览");
+  });
+});

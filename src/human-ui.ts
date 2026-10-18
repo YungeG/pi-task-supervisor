@@ -5,6 +5,7 @@ import { fileURLToPath } from "node:url";
 import type { ReadbackFrame } from "./human-journal";
 import { isSafeBoundedText } from "./validation";
 import { createScopeReview } from "./human-scope-view";
+import { materialLine, type HumanMaterial } from "./human-material-view";
 import { suspendTaskWidget } from "./board-ui";
 import { closeReadOnlyView } from "./ui-view-lifecycle";
 import { visibleWidth, truncateToWidth, stripTerminalSequences } from "@earendil-works/pi-tui";
@@ -122,6 +123,8 @@ export interface NativeQuestion {
   readonly kind: "authorization" | "choice" | "information";
   readonly title: string;
   readonly body: string;
+  /** Optional formatted browsing/context only; exact original review remains mandatory. */
+  readonly material?: HumanMaterial;
   readonly options?: readonly string[];
   /** Display-only labels aligned with canonical options; never persisted as answers. */
   readonly displayOptions?: readonly string[];
@@ -229,6 +232,7 @@ function cloneQuestion(question: NativeQuestion): NativeQuestion {
     kind: question.kind,
     title: question.title,
     body: question.body,
+    material: question.material ? structuredClone(question.material) : undefined,
     options: question.options ? [...question.options] : undefined,
     displayOptions: question.displayOptions ? [...question.displayOptions] : undefined,
     informationValidator: question.informationValidator,
@@ -363,6 +367,13 @@ function finalTitle(base: string, question: NativeQuestion): string {
   return stripTerminalSequences(truncateToWidth(full, 64, "…"));
 }
 
+function promptTitle(base: string, question: NativeQuestion): string {
+  const identity = finalTitle(base, question);
+  if (!question.material) return identity;
+  const context = question.material.context || question.title;
+  return `${identity}\n${materialLine(`问题：${context}`, 64)}`;
+}
+
 function reviewText(question: NativeQuestion, purpose: Purpose): string {
   const contents = [question.title, question.body];
   if (question.kind === "choice") {
@@ -377,6 +388,7 @@ async function reviewScope(
   text: string,
   current: () => boolean,
   signal?: AbortSignal,
+  material?: HumanMaterial,
 ): Promise<boolean> {
   if (!current()) return false;
   let component: ReturnType<typeof createScopeReview> | undefined;
@@ -402,6 +414,7 @@ async function reviewScope(
             rows: () => Math.max(0, tui.terminal.rows - HOST_CHROME_ROWS),
           },
           finish,
+          material,
         );
         abort = () => {
           component?.dispose();
@@ -435,7 +448,7 @@ async function invokeUI(
     while (current()) {
       if (needsReview) {
         if (!current()) return undefined;
-        const reviewed = await reviewScope(ctx, text, current, signal);
+        const reviewed = await reviewScope(ctx, text, current, signal, question.material);
         if (!current() || !reviewed) return undefined;
       }
       if (!current()) return undefined;
@@ -477,7 +490,7 @@ async function invokeFinalUI(
   if (purpose === "authorization") {
     const index = await selectOffered(
       ctx,
-      finalTitle("范围确认（全文已核对）", question),
+      promptTitle("范围确认（全文已核对）", question),
       ["稍后决定", "允许上述范围", "不允许", REVIEW_LABEL],
       current,
       signal,
@@ -488,7 +501,7 @@ async function invokeFinalUI(
   if (purpose === "first-start") {
     const index = await selectOffered(
       ctx,
-      finalTitle("首次启动（全文已核对）", question),
+      promptTitle("首次启动（全文已核对）", question),
       ["稍后启动", "开始执行", REVIEW_LABEL],
       current,
       signal,
@@ -500,6 +513,13 @@ async function invokeFinalUI(
   return invokeBusinessChoice(ctx, question, current, signal);
 }
 
+function choiceLabel(question: NativeQuestion, value: string, index: number): string {
+  const ordinal = `选项 ${index + 1}`;
+  if (!question.material) return ordinal;
+  const text = /[\r\n\t]|^\s|\s$| {2}/u.test(value) ? JSON.stringify(value) : value;
+  return materialLine(`${ordinal} · ${text}`, 32);
+}
+
 async function invokeBusinessChoice(
   ctx: ExtensionContext,
   question: NativeQuestion,
@@ -508,12 +528,12 @@ async function invokeBusinessChoice(
 ): Promise<string | typeof REVIEW_AGAIN | undefined> {
   const labels = [
     "稍后决定（不提交）",
-    ...(question.options ?? []).map((_, i) => `选项 ${i + 1}`),
+    ...(question.options ?? []).map((value, i) => choiceLabel(question, value, i)),
     REVIEW_LABEL,
   ];
   const index = await selectOffered(
     ctx,
-    finalTitle("业务选择（全文已核对）", question),
+    promptTitle("业务选择（全文已核对）", question),
     labels,
     current,
     signal,
@@ -531,7 +551,7 @@ async function invokeInformation(
 ): Promise<string | typeof REVIEW_AGAIN | typeof RETRY_INPUT | undefined> {
   if (!current()) return undefined;
   const result = await ctx.ui.input(
-    finalTitle(`补充信息：${formatHint(question)}`, question),
+    promptTitle(`补充信息：${formatHint(question)}`, question),
     undefined,
     { signal },
   );
@@ -543,7 +563,7 @@ async function invokeInformation(
   if (safe && (!question.informationValidator || question.informationValidator(result)))
     return result;
   if (!current()) return undefined;
-  const title = finalTitle(
+  const title = promptTitle(
     safe ? `未保存：需要${formatHint(question)}` : "未保存：需要安全且不超过1000字的信息",
     question,
   );
