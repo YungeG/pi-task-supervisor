@@ -86,11 +86,11 @@ describe("visible task board", () => {
     updateUI(ctx, snapshot);
     const lines = widget(ctx).render(200);
     expect(lines).toHaveLength(8);
-    expect(lines[3]).toContain("已完成 1/7 · 未结束 5 · 放弃 1");
-    expect(lines[3]).toContain("█");
-    expect(lines[4]).toContain("阶段：Implement");
-    expect(lines[5]).toContain("核验中 · review Task review");
-    expect(lines[6]).toBe("/task-supervisor tasks · 另 4 项未结束");
+    expect(lines[1]).toContain("已完成 1/7 · 未结束 5 · 放弃 1");
+    expect(lines[1]).toContain("█");
+    expect(lines[5]).toContain("阶段：Implement");
+    expect(lines[6]).toContain("核验记录 · review Task review");
+    expect(lines[7]).toContain("/task-supervisor tasks");
     const summary = captureUiSummary(ctx, snapshot);
     expect(summary.tasks.map((item) => item.status)).toEqual(
       snapshot.tasks.map((item) => item.status),
@@ -228,13 +228,15 @@ describe("visible task board", () => {
       const output = widget(ctx).render(200).join("\n");
       expect(output).toContain("需检查");
       expect(output).toContain("Inspect journal");
-      if (kind === "repair") expect(output).toContain("其他 2 项");
+      if (kind === "repair") expect(output).toContain("另 2 项");
       expect(output).not.toContain("权限已确认，尚未启动");
-      expect(output).toContain("下一步未一致确认，请查看状态");
+      expect(output).toContain("处理指引尚未一致，请查看完整状态");
       vi.mocked(ctx.hasPendingMessages).mockReturnValue(true);
       updateTaskWidget(ctx, createEmptyBoard());
       expect(widget(ctx).render(200).join("\n")).toContain("需检查");
-      expect(widget(ctx).render(200).join("\n")).not.toContain("下一步：/task-supervisor start");
+      expect(widget(ctx).render(200).join("\n")).not.toMatch(
+        /(?:下一步|待办)：\/task-supervisor start/,
+      );
     },
   );
 
@@ -244,7 +246,7 @@ describe("visible task board", () => {
       const snapshot = board(Array.from({ length: 100 }, (_, i) => task(`t-${i}`, "ready")));
       const ctx = createMockContext();
       updateTaskWidget(ctx, snapshot);
-      expect(widget(ctx).render(120).join("\n")).toContain("另 99 项未结束");
+      expect(widget(ctx).render(120).join("\n")).toContain("未结束 100");
       Object.assign(ctx, { mode });
       const ui =
         mode === "tui"
@@ -358,7 +360,7 @@ describe("visible task board", () => {
       const ctx = createMockContext();
       const snapshot = createEmptyBoard();
       updateTaskWidget(ctx, snapshot);
-      expect(widget(ctx).render(120).join("\n")).toContain("注意：Invalid journal");
+      expect(widget(ctx).render(120).join("\n")).toContain("阻塞：Invalid journal");
       Object.assign(ctx, { mode });
       const ui =
         mode === "tui"
@@ -444,18 +446,21 @@ describe("visible task board", () => {
     ]);
     updateTaskWidget(ctx, snapshot);
     const plain = widget(ctx).render(150);
-    expect(plain[5]).toContain("处理中（任务记录） · 短 Implement login");
-    expect(plain[6]).toContain("另 1 项未结束");
-    expect(plain[6]).not.toContain("0 more");
-    expect(plain[6]).not.toContain("0 folded");
+    expect(plain[6]).toContain("实施记录 · 短 Implement login");
+    expect(plain[1]).toContain("未结束 2");
+    expect(plain[1]).not.toContain("0 more");
+    expect(plain[1]).not.toContain("0 folded");
     const theme = createMockTheme();
     widget(ctx, theme).render(200);
-    expect(theme.fg).toHaveBeenCalledWith("muted", expect.stringContaining("已完成"));
-    expect(theme.fg).toHaveBeenCalledWith("warning", expect.stringContaining("注意："));
+    expect(theme.fg).toHaveBeenCalledWith("text", expect.stringContaining("已完成"));
+    expect(theme.fg).toHaveBeenCalledWith("warning", expect.stringContaining("不是执行许可"));
     currentRuntime().journalFault = "Invalid journal";
     updateTaskWidget(ctx, snapshot);
     widget(ctx, theme).render(200);
-    expect(theme.fg).toHaveBeenCalledWith("warning", "注意：Invalid journal");
+    expect(theme.fg).toHaveBeenCalledWith(
+      "warning",
+      expect.stringContaining("阻塞：Invalid journal"),
+    );
   });
 
   it.each(["tui", "rpc"] as const)(
@@ -464,10 +469,10 @@ describe("visible task board", () => {
       const ctx = createMockContext();
       const snapshot = board([task("编号".repeat(30), "ready", { title: "Readable title" })]);
       updateTaskWidget(ctx, snapshot);
-      const row = stripTerminalSequences(widget(ctx).render(72)[5]!);
+      const row = stripTerminalSequences(widget(ctx).render(72)[6]!);
       expect(row).toContain("待开始（已就绪）");
       expect(visibleWidth(row)).toBeLessThanOrEqual(72);
-      expect(widget(ctx).render(72)[6]).toBe("/task-supervisor tasks");
+      expect(widget(ctx).render(72)[7]).toContain("/task-supervisor tasks");
       Object.assign(ctx, { mode });
       const ui =
         mode === "tui"
@@ -552,8 +557,8 @@ describe("visible task board", () => {
       ]),
     );
     const lines = widget(ctx).render(120);
-    expect(lines[5]).toContain("first");
-    expect(lines[6]).toContain("另 2 项未结束");
+    expect(lines[6]).toContain("first");
+    expect(lines[1]).toContain("未结束 3");
     expect(
       captureUiSummary(ctx, board([task("configured", "configured")])).tasks[0]?.notes,
     ).not.toContain("所在阶段待处理");

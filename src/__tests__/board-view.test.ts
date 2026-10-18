@@ -248,14 +248,18 @@ describe("renderCompactBoard", () => {
       "已完成 1/3",
       "未结束 1",
       "放弃 1",
-      "其他 2 项",
+      "另 2 项",
       "RECEIPT",
       "/task-supervisor tasks",
       "doing",
-      "owner-goal",
-      "different-goal",
     ])
       expect(text).toContain(expected);
+    const full = harness({ ...view, summary: s });
+    full.render(80);
+    full.key("\r");
+    const all = readAll(full, 160);
+    expect(all).toContain("owner-goal");
+    expect(all).toContain("different-goal");
     expect(text).not.toContain("title-done");
     expect(lines.every((line) => visibleWidth(line) <= 80)).toBe(true);
   });
@@ -947,8 +951,8 @@ describe("parent board acceptance", () => {
       const before = JSON.stringify(view);
       for (const width of [40, 80]) {
         const lines = renderCompactBoard(summary, width, theme);
-        expect(lines[5]).toContain(status === "implementing" ? "处理中（任务记录）" : "核验中");
-        expect(lines[5]).toContain("t1");
+        expect(lines[6]).toContain(status === "implementing" ? "实施记录" : "核验记录");
+        expect(lines[6]).toContain("t1");
         expect(lines.every((line) => visibleWidth(line) <= width)).toBe(true);
       }
       expect(JSON.stringify(view)).toBe(before);
@@ -962,7 +966,7 @@ describe("parent board acceptance", () => {
       headline: { source: "receipt" as const, level: "error" as const, text: "需检查" },
     };
     const lines = renderCompactBoard(summary, 40, theme);
-    expect(lines[0]?.startsWith("状态：需检查")).toBe(true);
+    expect(lines[0]).toContain("需检查");
     expect(lines.every((line) => visibleWidth(line) <= 40)).toBe(true);
   });
 

@@ -82,7 +82,7 @@ describe("resident UI publication", () => {
     expect(ctx.ui.setStatus).toHaveBeenCalledWith("til-done", status.formatStatusbar(summary));
     expect(ctx.ui.setStatus).toHaveBeenCalledWith("til-done-active", undefined);
     expect(ctx.ui.setStatus).toHaveBeenCalledWith("continuous-supervisor", undefined);
-    expect(output).not.toContain("下一步：/task-supervisor continue");
+    expect(output).not.toMatch(/(?:下一步|待办)：\/task-supervisor continue/);
     const reads = facts.mock.calls.length;
     render(ctx);
     expect(facts).toHaveBeenCalledTimes(reads);
@@ -384,8 +384,8 @@ describe("resident UI publication", () => {
     updateUI(ctx, activeBoard());
     const output = render(ctx);
     expect(output).toContain("需检查");
-    expect(output).toContain("其他 2 项");
-    expect(output).not.toContain("下一步：/task-supervisor continue");
+    expect(output).toContain("另 2 项");
+    expect(output).not.toMatch(/(?:下一步|待办)：\/task-supervisor continue/);
     expect(ctx.ui.setStatus).toHaveBeenLastCalledWith("til-done", "需检查 · 已完成 0/1");
   });
 

@@ -79,32 +79,94 @@ function progressLine(summary: UiSummary): string {
   return `${counts(summary)}  ${"█".repeat(cells)}${"░".repeat(12 - cells)}`;
 }
 
-/** State, blocker and next action precede secondary task records; never infer a grant. */
+const CARD_COPY = new Map([
+  [
+    "Legacy receipt format requires explicit recover/migration for unfinished goals",
+    "旧版执行记录需显式恢复／迁移",
+  ],
+  ["下一步未一致确认，请查看状态", "处理指引尚未一致，请查看完整状态"],
+]);
+
+/** Display aliases only. Original owner values stay in full details and never become actions. */
+function cardText(text: string): string {
+  return CARD_COPY.get(text) ?? text;
+}
+
+function cardAcceptance(text: string): string {
+  if (text === "尚未记录目标验收") return "验收未记录";
+  const match =
+    /^验收任务 .+: (draft|configured|ready|implementing|reviewing|done|abandoned)$/.exec(text);
+  if (!match) return "验收记录见详情";
+  if (match[1] === "done") return "验收任务已完成（非目标验收）";
+  if (match[1] === "abandoned") return "验收任务已放弃";
+  return "验收任务未完成";
+}
+
+function cardGoal(summary: UiSummary): string {
+  if (!summary.goals.length) return "未提供/未知";
+  if (summary.goals.length === 1) return summary.goals[0]?.text ?? "未提供/未知";
+  return summary.goals
+    .map((goal) => `${goal.source === "supervisor" ? "监督" : "方案"}：${goal.text}`)
+    .join("；");
+}
+
+function cardRecord(task: UiSummary["tasks"][number]): string {
+  const label =
+    task.status === "implementing"
+      ? "实施记录"
+      : task.status === "reviewing"
+        ? "核验记录"
+        : `${STATUS_LABEL[task.status]}记录`;
+  return `${label} · ${task.id} ${task.title}`;
+}
+
+function cardBorder(text: string, width: number, index: number): string {
+  const label = truncateToWidth(` ${singleLine(text)} `, width - 2, "…");
+  const edges = index === 0 ? ["┌", "┐"] : index === 4 ? ["├", "┤"] : ["└", "┘"];
+  return `${edges[0]}${label}${"─".repeat(Math.max(0, width - 2 - visibleWidth(label)))}${edges[1]}`;
+}
+
+function cardRow(text: string, width: number): string {
+  const content = truncateToWidth(singleLine(text), width - 4, "…");
+  return `│ ${content}${" ".repeat(Math.max(0, width - 4 - visibleWidth(content)))} │`;
+}
+
+/** A compact read-only card, not a log dump or an authorization/recovery controller. */
 export function renderCompactBoard(summary: UiSummary, width: number, theme: Theme): string[] {
   if (!summary.visible) return [];
-  const w = dimension(width);
+  const w = Math.min(96, dimension(width));
   const task = [...summary.tasks]
     .sort((a, b) => STATUS_ORDER[a.status] - STATUS_ORDER[b.status] || a.phase - b.phase)
     .find((item) => item.status !== "done" && item.status !== "abandoned");
-  const attention = summary.blockers[0]?.text ?? summary.headline.text;
+  const attention = summary.blockers[0]?.text;
   const other = Math.max(0, summary.blockers.length - 1);
-  const lines = [
-    `状态：${summary.headline.text}`,
-    `注意：${other ? `其他 ${other} 项 · ` : ""}${attention}`,
-    `下一步：${summary.next.text}`,
-    `─ ${progressLine(summary)}`,
-    `目标：${goals(summary)} · 阶段：${summary.phase ?? "未提供/未知"}`,
-    ...(task ? [`${STATUS_LABEL[task.status]} · ${task.id} ${task.title}`] : []),
-    `${ENTRY}${summary.counts.unfinished > 1 ? ` · 另 ${summary.counts.unfinished - 1} 项未结束` : ""}`,
-    `最终验收：${summary.acceptance}`,
+  const acceptance = cardAcceptance(summary.acceptance);
+  const rows = [
+    `任务监督 · ${cardText(summary.headline.text)}${other ? ` · 另 ${other} 项` : ""}`,
+    summary.counts.total ? progressLine(summary) : `目标：${cardGoal(summary)}`,
+    attention ? `阻塞：${cardText(attention)}` : "未记录额外阻塞（不是执行许可）",
+    `待办：${cardText(summary.next.text)}`,
+    task ? "当前任务记录" : "任务与权限记录",
+    task ? `阶段：${summary.phase ?? "未提供/未知"}` : "暂无未结束任务记录（不代表目标完成）",
+    task
+      ? cardRecord(task)
+      : summary.counts.total
+        ? `目标：${cardGoal(summary)}`
+        : progressLine(summary),
+    `${ENTRY} · ${acceptance}`,
   ];
-  return lines.map((line, index) =>
-    truncateToWidth(
-      theme.fg(index === 1 ? "warning" : index === 2 ? "accent" : "muted", singleLine(line)),
-      w,
-      "…",
-    ),
-  );
+  return rows.map((text, index) => {
+    const line =
+      w < 32
+        ? truncateToWidth(singleLine(text), w, "…")
+        : [0, 4, 7].includes(index)
+          ? cardBorder(text, w, index)
+          : cardRow(text, w);
+    return theme.fg(
+      index === 0 ? "accent" : index === 2 ? "warning" : index === 3 ? "accent" : "text",
+      line,
+    );
+  });
 }
 
 function documentText(view: UiBoardView, id: UiDocument["id"], title: string): string {

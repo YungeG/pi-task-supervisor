@@ -1,5 +1,12 @@
 # Changelog
 
+## Isolated compact resident-card candidate — acceptance pending
+
+- Replace the flat eight-line resident log with a bounded native-theme card: owner state, factual progress, primary blocker and next guidance, grouped phase/task record, and the original readonly route.
+- Use Chinese display aliases for the known legacy-receipt hold and conflicting-next-step text. Keep unknown text, all original values and full goal/acceptance metadata in readonly details; no message creates an approval or recovery action.
+- Keep zero-task preflight goal/permission state visible; distinguish recorded implementation from liveness and task/acceptance-task completion from goal acceptance. Cap width at 96 cells with a plain narrow fallback; add no dependency, footer/input hook or renderer engine.
+- No main/installed-source/configuration change, reload or business operation is part of this isolated iteration. Validation is recorded separately; SDK1.2 remains MISSING.
+
 ## Isolated structural UI candidate — acceptance pending
 
 - Present owner state, blockers and next-step guidance before a factual task-completion bar; keep done, abandoned and final acceptance distinct.

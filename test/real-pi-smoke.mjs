@@ -748,10 +748,10 @@ try {
 
   assertNoUiScriptErrors();
   if (
-    !widgetHistory.some((lines) => lines.some((line) => line.includes("处理中（任务记录）"))) ||
-    !widgetHistory.some((lines) => lines.some((line) => line.includes("核验中"))) ||
+    !widgetHistory.some((lines) => lines.some((line) => line.includes("实施记录 ·"))) ||
+    !widgetHistory.some((lines) => lines.some((line) => line.includes("核验记录 ·"))) ||
     !widgetLines.some((line) => line.includes("已完成 2/2 · 未结束 0 · 放弃 0")) ||
-    widgetLines.some((line) => line.includes("任务已完成 ·"))
+    widgetLines.some((line) => line.includes("任务已完成记录 ·") || line.includes("已放弃记录 ·"))
   )
     throw new Error("Widget missed lifecycle progress or failed to fold completed tasks");
   if (

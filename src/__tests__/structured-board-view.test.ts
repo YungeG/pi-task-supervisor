@@ -133,18 +133,28 @@ describe("structured board presentation contract", () => {
     expect(all.join("\n")).toContain("capturedAt：123");
   });
   it("keeps compact state/blocker/next first, bounded progress and original factual distinctions", () => {
-    const s = data().summary;
+    const v = data();
+    const s = v.summary;
     const before = JSON.stringify(s);
     const lines = renderCompactBoard(s, 80, theme);
-    expect(lines[0]).toContain("状态：会话检查未通过");
-    expect(lines[1]).toContain("其他 1 项");
-    expect(lines[2]).toContain("下一步：先查看只读状态");
-    expect(lines[3]).toContain("已完成 0/3");
-    expect(lines[3]).toContain("░");
-    expect(lines.join("\n")).toContain("owner-goal");
-    expect(lines.join("\n")).toContain("尚未确认最终验收");
-    expect(lines[5]).toContain("任务记录");
+    expect(lines[0]).toContain("会话检查未通过");
+    expect(lines[0]).toContain("另 1 项");
+    expect(lines[3]).toContain("待办：先查看只读状态");
+    expect(lines[1]).toContain("已完成 0/3");
+    expect(lines[1]).toContain("░");
+    expect(lines.join("\n")).not.toContain("owner-goal");
+    expect(lines[7]).toContain("验收记录见详情");
+    expect(lines[6]).toContain("实施记录");
     expect(lines).toHaveLength(8);
+    const full = harness(v);
+    full.render();
+    full.key(enter);
+    expect(full.render()).toContain("owner-goal");
+    full.key(esc);
+    full.key(down);
+    full.key(down);
+    full.key(enter);
+    expect(full.render()).toContain("尚未确认最终验收");
     expect(JSON.stringify(s)).toBe(before);
   });
   it("groups tasks under phases, initially expands only the captured current phase, and toggles locally", () => {
