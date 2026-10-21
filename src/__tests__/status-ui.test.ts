@@ -121,6 +121,32 @@ describe("formatStatusbar", () => {
     });
   });
 
+  describe("VF4 journal view uncertainty", () => {
+    it("does not turn a journal-fault empty view into known zero tasks", () => {
+      const summary = makeSummary({
+        headline: makeLine("需检查", "error", "journal"),
+        blockers: [
+          makeLine("JOURNAL_LIMIT metric=fileBytes observed=101 limit=100", "error", "journal"),
+        ],
+        counts: makeCounts({ total: 0, done: 0, unfinished: 0, abandoned: 0 }),
+      });
+      const before = JSON.stringify(summary);
+      const result = formatStatusbar(summary);
+      expect(result).toContain("任务视图未恢复");
+      expect(result).toContain("数量未知");
+      expect(result).not.toContain("0/0");
+      expect(JSON.stringify(summary)).toBe(before);
+    });
+
+    it("retains known nonempty counts even with a journal blocker", () => {
+      const summary = makeSummary({
+        blockers: [makeLine("JOURNAL_INVALID", "error", "journal")],
+        counts: makeCounts({ total: 3, done: 1, unfinished: 2 }),
+      });
+      expect(formatStatusbar(summary)).toContain("已完成 1/3");
+    });
+  });
+
   describe("all abandoned", () => {
     it("shows done=0 and abandoned count", () => {
       const summary = makeSummary({

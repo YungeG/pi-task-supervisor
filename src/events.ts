@@ -7,6 +7,7 @@ import type {
 import type { ContinuousTasksConfig } from "./config";
 import { createEmptyBoard } from "./engine";
 import { inspectRestorableSession } from "./human-control";
+import { formatJournalReadError } from "./human-journal";
 import { restoreBoardHuman, boardHumanContext, canReplaceBoardDecision } from "./board-human";
 import { claimedExecutionRefs, executionWaitTimer, waitForExecutions } from "./async-execution";
 import { currentRuntime } from "./runtime";
@@ -323,22 +324,27 @@ function registerSessionHandlers(pi: ExtensionAPI, control: Control): void {
       updateActiveTools(pi, isSessionScopeEnabled());
     } catch (error) {
       // Do not reinterpret malformed durable state as an inactive, safe-to-continue supervisor.
-      currentRuntime().journalFault =
-        error instanceof Error && /preflight/i.test(error.message)
+      const diagnostic = formatJournalReadError(error);
+      const reason = diagnostic
+        ? `Journal restore blocked: ${diagnostic}; inspect session state before recovery`
+        : error instanceof Error && /preflight/i.test(error.message)
           ? "Invalid preflight journal; inspect session state before recovery"
           : "Invalid supervisor journal; inspect session state before recovery";
+      currentRuntime().journalFault =
+        board.tasks.length === 0
+          ? `${reason}; task view not restored, counts unknown (saved records are not deleted)`
+          : reason;
       // Restore only a held view after another owner's failure; no writes or replay.
       restoreFaultedSupervisor(pi, ctx);
       setSessionScopeEnabled(false);
       updateActiveTools(pi, false);
       updateUI(ctx, board);
-      if (ctx.hasUI && ctx.mode !== "tui")
-        ctx.ui.setStatus("continuous-supervisor", "Supervisor: fault (invalid journal)");
+      const faultStatus = `Supervisor: fault (${diagnostic ?? "journal restore"})`;
+      if (ctx.hasUI && ctx.mode !== "tui") ctx.ui.setStatus("continuous-supervisor", faultStatus);
       pi.sendMessage(
         {
           customType: "continuous-tasks:notice",
-          content:
-            "Invalid supervisor journal; task continuation disabled. Inspect session state before recovery.",
+          content: `${currentRuntime().journalFault}; task continuation disabled.`,
           display: true,
         },
         { triggerTurn: false },

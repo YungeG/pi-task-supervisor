@@ -1,8 +1,9 @@
-import { afterEach, describe, expect, it } from "vitest";
+import { afterEach, describe, expect, it, vi } from "vitest";
 import { createHash } from "node:crypto";
 import {
   mkdtempSync,
   readFileSync,
+  readSync,
   rmSync,
   statSync,
   symlinkSync,
@@ -15,10 +16,17 @@ import { loadEntriesFromFile } from "../../node_modules/@earendil-works/pi-codin
 import {
   findReadbackProof,
   inspectSessionJournal,
+  JournalReadError,
+  formatJournalReadError,
   type JournalLimits,
   type ReadbackFrame,
   type SessionJournalView,
 } from "../human-journal";
+
+vi.mock("node:fs", async (importOriginal) => {
+  const actual = await importOriginal<typeof import("node:fs")>();
+  return { ...actual, readSync: vi.fn(actual.readSync) };
+});
 
 const dirs: string[] = [];
 afterEach(() => {
@@ -252,6 +260,109 @@ describe("journal content validation", () => {
     // Write header + base + dup(base) — dup should trigger JOURNAL_INVALID
     writeJournal(f.path, [f.header, f.base, dup]);
     expectCode(() => inspectSessionJournal({ ...f.view, leafId: null }), "JOURNAL_INVALID");
+  });
+});
+
+describe("VF4 safe journal diagnostics", () => {
+  it("VF4 sentinel retains numeric file limit without source text", () => {
+    const f = fixture();
+    writeJournal(f.path, [f.header, f.base, f.control]);
+    const limits: JournalLimits = { maxBytes: 64, maxLineBytes: 1024, maxEntries: 100 };
+    expect(() => inspectSessionJournal(f.view, limits)).toThrow(
+      expect.objectContaining({
+        code: "JOURNAL_LIMIT",
+        message: "JOURNAL_LIMIT",
+        limitDetail: { metric: "fileBytes", observed: statSync(f.path).size, limit: 64 },
+      }),
+    );
+  });
+
+  it.each(["lineBytes", "entries", "configuration"] as const)(
+    "keeps typed %s limits distinct and formats unknowns safely",
+    (metric) => {
+      const f = fixture();
+      writeJournal(f.path, [f.header, f.base, f.control]);
+      const limits: JournalLimits = { maxBytes: 4096, maxLineBytes: 2048, maxEntries: 100 };
+      if (metric === "lineBytes") limits.maxLineBytes = 10;
+      if (metric === "entries") limits.maxEntries = 1;
+      if (metric === "configuration") limits.maxBytes = Number.NaN;
+      let failure: unknown;
+      try {
+        inspectSessionJournal(f.view, limits);
+      } catch (error) {
+        failure = error;
+      }
+      expect(failure).toMatchObject({ code: "JOURNAL_LIMIT", limitDetail: { metric } });
+      expect(formatJournalReadError(failure)).toContain(`metric=${metric}`);
+      if (!(failure instanceof JournalReadError)) throw new Error("missing typed diagnostic");
+      expect(Object.isFrozen(failure.limitDetail)).toBe(true);
+      if (metric === "lineBytes")
+        expect(failure.limitDetail).toEqual({
+          metric,
+          observed: Buffer.byteLength(JSON.stringify(f.header)),
+          limit: 10,
+        });
+      if (metric === "entries")
+        expect(failure.limitDetail).toEqual({ metric, observed: 2, limit: 1 });
+      if (metric === "configuration")
+        expect(formatJournalReadError(failure)).toContain("observed=UNKNOWN limit=UNKNOWN");
+    },
+  );
+
+  it("formats only safe typed codes and numbers, never arbitrary error text", () => {
+    expect(formatJournalReadError(new Error("api_key=DO_NOT_ECHO"))).toBeUndefined();
+    for (const code of [
+      "JOURNAL_INVALID",
+      "JOURNAL_BRANCH_INVALID",
+      "JOURNAL_UNAVAILABLE",
+      "READBACK_INVALID",
+      "READBACK_CONFLICT",
+    ] as const)
+      expect(formatJournalReadError(new JournalReadError(code))).toBe(code);
+    const error = new JournalReadError("JOURNAL_LIMIT", {
+      metric: "entries",
+      observed: Number.NaN,
+      limit: -1,
+    });
+    expect(error.message).toBe("JOURNAL_LIMIT");
+    expect(formatJournalReadError(error)).toBe(
+      "JOURNAL_LIMIT metric=entries observed=UNKNOWN limit=UNKNOWN",
+    );
+    expect(formatJournalReadError(new JournalReadError("JOURNAL_LIMIT"))).toContain(
+      "metric=UNKNOWN",
+    );
+  });
+
+  it("measures one complete bounded synthetic inspect, not a large-history performance claim", () => {
+    const f = fixture();
+    const nodes = Array.from({ length: 100 }, (_, i) => ({
+      type: "custom",
+      id: `node${i}`,
+      parentId: i ? `node${i - 1}` : null,
+      customType: "fixture",
+      data: { synthetic: true },
+    }));
+    writeJournal(f.path, [f.header, ...nodes]);
+    const bytes = statSync(f.path).size;
+    expect(bytes).toBeLessThanOrEqual(64 * 1024);
+    vi.mocked(readSync).mockClear();
+    const started = performance.now();
+    const journal = inspectSessionJournal({ ...f.view, leafId: "node99" });
+    const ms = performance.now() - started;
+    const results = vi.mocked(readSync).mock.results;
+    const readBytes = results.reduce(
+      (sum, row) => sum + (row.type === "return" ? Number(row.value) : 0),
+      0,
+    );
+    const completeScans = results.filter((row) => row.type === "return" && row.value === 0).length;
+    expect(journal.branch).toHaveLength(100);
+    expect(readBytes).toBe(bytes);
+    expect(completeScans).toBe(1);
+    expect(results).toHaveLength(2);
+    console.info(
+      "VF4_SYNTHETIC_INSPECT " +
+        JSON.stringify({ bytes, readBytes, readCalls: results.length, completeScans, ms }),
+    );
   });
 });
 

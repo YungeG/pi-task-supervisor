@@ -360,7 +360,11 @@ describe("visible task board", () => {
       const ctx = createMockContext();
       const snapshot = createEmptyBoard();
       updateTaskWidget(ctx, snapshot);
-      expect(widget(ctx).render(120).join("\n")).toContain("阻塞：Invalid journal");
+      const compact = widget(ctx).render(120).join("\n");
+      expect(compact).toContain("阻塞：Invalid journal");
+      expect(compact).toContain("任务视图未恢复");
+      expect(compact).not.toContain("0/0");
+      expect(compact).not.toContain("░");
       Object.assign(ctx, { mode });
       const ui =
         mode === "tui"
@@ -374,6 +378,8 @@ describe("visible task board", () => {
       await showTaskList(ctx, snapshot);
       if (ui) {
         expect(ui.rendered.join("\n")).toContain("Invalid journal");
+        expect(ui.rendered.join("\n")).toContain("任务视图未恢复");
+        expect(ui.rendered.join("\n")).not.toContain("0/0");
         ui.assertNoScriptErrors();
       } else
         expect(ctx.ui.notify).toHaveBeenCalledWith(

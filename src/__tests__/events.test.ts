@@ -1,5 +1,10 @@
 import { beforeEach, describe, expect, it, vi } from "vitest";
 import { DEFAULT_CONFIG } from "../config";
+import { mkdtempSync, openSync, readSync, rmSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
+import { JournalReadError } from "../human-journal";
+import { currentRuntime } from "../runtime";
 import { registerEventHandlers } from "../events";
 import { isSessionScopeEnabled, setSessionScopeEnabled } from "../scope";
 import { getBoard, resetState, setBoard } from "../state";
@@ -13,11 +18,77 @@ import {
 } from "./helpers/lifecycle";
 import { createMockAPI, createMockContext } from "./helpers/mocks";
 
+vi.mock("node:fs", async (importOriginal) => {
+  const actual = await importOriginal<typeof import("node:fs")>();
+  return { ...actual, openSync: vi.fn(actual.openSync), readSync: vi.fn(actual.readSync) };
+});
+
 // These tests exercise Pi 1.1's actionable boundary; agent_settled is notification-only.
 describe("continuous task lifecycle events", () => {
   beforeEach(() => {
     resetState();
     setSessionScopeEnabled(false);
+  });
+
+  it.each([
+    "JOURNAL_LIMIT",
+    "JOURNAL_INVALID",
+    "JOURNAL_BRANCH_INVALID",
+    "JOURNAL_UNAVAILABLE",
+  ] as const)("VF4 restore preserves %s while continuing to deny execution", async (code) => {
+    const h = lifecycle();
+    const error = new JournalReadError(code, { metric: "fileBytes", observed: 101, limit: 100 });
+    vi.mocked(h.ctx.sessionManager.getSessionFile).mockImplementation(() => {
+      throw error;
+    });
+    await h.fire("session_start");
+    expect(currentRuntime().journalFault).toContain(code);
+    expect(currentRuntime().journalFault).toContain("task view not restored");
+    if (code === "JOURNAL_LIMIT")
+      expect(currentRuntime().journalFault).toContain("metric=fileBytes observed=101 limit=100");
+    expect(isSessionScopeEnabled()).toBe(false);
+    expect(getBoard().tasks).toEqual([]);
+    expect(h.mock.appendEntry).not.toHaveBeenCalled();
+    expect(h.mock.sendUserMessage).not.toHaveBeenCalled();
+    expect(h.mock.sendMessage).toHaveBeenCalledWith(
+      expect.objectContaining({ content: expect.stringContaining(code), display: true }),
+      { triggerTurn: false },
+    );
+  });
+
+  it("VF4 profiles the complete small malformed-journal restore without replay", async () => {
+    const dir = mkdtempSync(join(tmpdir(), "vf4-restore-"));
+    const path = join(dir, "synthetic.jsonl");
+    const body = "{synthetic-invalid-no-secret}\n";
+    writeFileSync(path, body);
+    try {
+      const h = lifecycle();
+      vi.mocked(h.ctx.sessionManager.getSessionFile).mockReturnValue(path);
+      vi.mocked(openSync).mockClear();
+      vi.mocked(readSync).mockClear();
+      const started = performance.now();
+      await h.fire("session_start");
+      const ms = performance.now() - started;
+      const journalOpens = vi.mocked(openSync).mock.calls.filter((call) => call[0] === path).length;
+      const results = vi.mocked(readSync).mock.results;
+      const readBytes = results.reduce(
+        (sum, row) => sum + (row.type === "return" ? Number(row.value) : 0),
+        0,
+      );
+      const bytes = Buffer.byteLength(body);
+      expect(bytes).toBeLessThanOrEqual(64 * 1024);
+      expect(journalOpens).toBeGreaterThan(0);
+      expect(readBytes).toBe(bytes * journalOpens);
+      expect(currentRuntime().journalFault).toContain("JOURNAL_INVALID");
+      expect(h.mock.appendEntry).not.toHaveBeenCalled();
+      expect(h.mock.sendUserMessage).not.toHaveBeenCalled();
+      console.info(
+        "VF4_SYNTHETIC_RESTORE " +
+          JSON.stringify({ bytes, readBytes, readCalls: results.length, journalOpens, ms }),
+      );
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
   });
 
   it("registers native settlement and compaction hooks, not delayed settled wakeups", () => {

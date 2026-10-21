@@ -143,6 +143,14 @@ function computeCounts(tasks: readonly TaskRecord[]): UiCounts {
   return { total, done, abandoned, unfinished: total - done - abandoned };
 }
 
+/** Display-only uncertainty; never changes the board, authority, or recovery state. */
+export function taskViewCountsUnknown(summary: Pick<UiSummary, "counts" | "blockers">): boolean {
+  return (
+    summary.counts.total === 0 &&
+    summary.blockers.some((blocker) => blocker.source === "journal" && blocker.level === "error")
+  );
+}
+
 // ── Goals ──
 
 function computeGoals(input: UiSummaryInput): UiGoal[] {

@@ -1,4 +1,4 @@
-import type { UiSummary } from "./ui-view";
+import { taskViewCountsUnknown, type UiSummary } from "./ui-view";
 import { stripTerminalSequences, truncateToWidth } from "@earendil-works/pi-tui";
 
 const MAX_STATUSBAR_WIDTH = 64;
@@ -24,7 +24,9 @@ export function formatStatusbar(summary: UiSummary): string | undefined {
   const { counts } = summary;
   const segments = [
     sanitizeText(summary.headline.text),
-    `已完成 ${counts.done}/${counts.total}`,
+    taskViewCountsUnknown(summary)
+      ? "任务视图未恢复（数量未知）"
+      : `已完成 ${counts.done}/${counts.total}`,
     ...(counts.abandoned > 0 ? [`放弃 ${counts.abandoned}`] : []),
   ].filter(Boolean);
   // Native truncation preserves the left-hand state before secondary progress.

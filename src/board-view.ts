@@ -11,7 +11,13 @@ import {
   truncateToWidth,
   visibleWidth,
 } from "@earendil-works/pi-tui";
-import type { UiBoardView, UiDocument, UiSummary, UiViewEnvironment } from "./ui-view";
+import {
+  taskViewCountsUnknown,
+  type UiBoardView,
+  type UiDocument,
+  type UiSummary,
+  type UiViewEnvironment,
+} from "./ui-view";
 import type { TaskRecord, TaskStatus } from "./types";
 
 const ENTRY = "/task-supervisor tasks";
@@ -63,6 +69,7 @@ function singleLine(value: string): string {
   return safeText(value).replace(/\n/g, "\\n");
 }
 function counts(summary: UiSummary): string {
+  if (taskViewCountsUnknown(summary)) return "任务视图未恢复（数量未知，记录未删除）";
   const c = summary.counts;
   return `已完成 ${c.done}/${c.total} · 未结束 ${c.unfinished} · 放弃 ${c.abandoned}`;
 }
@@ -73,6 +80,7 @@ function goals(summary: UiSummary): string {
 }
 
 function progressLine(summary: UiSummary): string {
+  if (taskViewCountsUnknown(summary)) return counts(summary);
   const { done, total } = summary.counts;
   const filled = total > 0 ? Math.floor((12 * done) / total) : 0;
   const cells = Math.max(0, Math.min(12, filled));
@@ -147,7 +155,11 @@ export function renderCompactBoard(summary: UiSummary, width: number, theme: The
     attention ? `阻塞：${cardText(attention)}` : "未记录额外阻塞（不是执行许可）",
     `待办：${cardText(summary.next.text)}`,
     task ? "当前任务记录" : "任务与权限记录",
-    task ? `阶段：${summary.phase ?? "未提供/未知"}` : "暂无未结束任务记录（不代表目标完成）",
+    task
+      ? `阶段：${summary.phase ?? "未提供/未知"}`
+      : taskViewCountsUnknown(summary)
+        ? "任务视图未恢复（记录未删除）"
+        : "暂无未结束任务记录（不代表目标完成）",
     task
       ? cardRecord(task)
       : summary.counts.total
@@ -424,7 +436,9 @@ class ReadOnlyBoard implements Component {
       lines.push(
         this.view.board.tasks.length
           ? "没有匹配任务（不代表目标完成）"
-          : "暂无任务；确认与回应、总览和验收仍可查看",
+          : taskViewCountsUnknown(this.view.summary)
+            ? "任务视图未恢复；确认与回应、总览和验收仍可查看"
+            : "暂无任务；确认与回应、总览和验收仍可查看",
       );
     return lines;
   }

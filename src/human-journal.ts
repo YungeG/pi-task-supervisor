@@ -61,11 +61,57 @@ export type JournalErrorCode =
   | "JOURNAL_BRANCH_INVALID"
   | "READBACK_INVALID"
   | "READBACK_CONFLICT";
+export type JournalLimitMetric = "fileBytes" | "lineBytes" | "entries" | "configuration";
+export interface JournalLimitDetail {
+  readonly metric: JournalLimitMetric;
+  readonly observed?: number;
+  readonly limit?: number;
+}
+const LIMIT_METRICS = new Set<JournalLimitMetric>([
+  "fileBytes",
+  "lineBytes",
+  "entries",
+  "configuration",
+]);
 export class JournalReadError extends Error {
-  constructor(readonly code: JournalErrorCode) {
+  readonly limitDetail?: Readonly<JournalLimitDetail>;
+  constructor(
+    readonly code: JournalErrorCode,
+    detail?: JournalLimitDetail,
+  ) {
     super(code);
     this.name = "JournalReadError";
+    if (code === "JOURNAL_LIMIT" && detail && LIMIT_METRICS.has(detail.metric)) {
+      this.limitDetail = Object.freeze({
+        metric: detail.metric,
+        ...(Number.isSafeInteger(detail.observed) && (detail.observed ?? -1) >= 0
+          ? { observed: detail.observed }
+          : {}),
+        ...(Number.isSafeInteger(detail.limit) && (detail.limit ?? -1) >= 0
+          ? { limit: detail.limit }
+          : {}),
+      });
+    }
   }
+}
+
+/** Display diagnostics only: no source text, path, ID, or arbitrary exception message. */
+export function formatJournalReadError(error: unknown): string | undefined {
+  if (!(error instanceof JournalReadError)) return undefined;
+  if (
+    ![
+      "JOURNAL_UNAVAILABLE",
+      "JOURNAL_LIMIT",
+      "JOURNAL_INVALID",
+      "JOURNAL_BRANCH_INVALID",
+      "READBACK_INVALID",
+      "READBACK_CONFLICT",
+    ].includes(error.code)
+  )
+    return undefined;
+  if (error.code !== "JOURNAL_LIMIT") return error.code;
+  const detail = error.limitDetail;
+  return `${error.code} metric=${detail?.metric ?? "UNKNOWN"} observed=${detail?.observed ?? "UNKNOWN"} limit=${detail?.limit ?? "UNKNOWN"}`;
 }
 export function journalDigest(value: unknown): string {
   return createHash("sha256").update(JSON.stringify(value)).digest("hex");
@@ -76,8 +122,8 @@ function record(value: unknown): value is Record<string, unknown> {
 function identifier(value: unknown): value is string {
   return typeof value === "string" && value.length > 0 && value.length <= 200;
 }
-function fail(code: JournalErrorCode): never {
-  throw new JournalReadError(code);
+function fail(code: JournalErrorCode, detail?: JournalLimitDetail): never {
+  throw new JournalReadError(code, detail);
 }
 const RETAINED = new Set([
   "continuous-tasks:event",
@@ -99,7 +145,7 @@ const LIMITS: JournalLimits = {
 
 function validateLimits(limits: JournalLimits): void {
   if (Object.values(limits).some((value) => !Number.isSafeInteger(value) || value < 1))
-    fail("JOURNAL_LIMIT");
+    fail("JOURNAL_LIMIT", { metric: "configuration" });
 }
 
 function parseEntry(
@@ -108,7 +154,8 @@ function parseEntry(
   entries: number,
   maxEntries: number,
 ): JournalNode | null {
-  if (entries > maxEntries) fail("JOURNAL_LIMIT");
+  if (entries > maxEntries)
+    fail("JOURNAL_LIMIT", { metric: "entries", observed: entries, limit: maxEntries });
   if (
     !identifier(value.id) ||
     (value.parentId !== null && !identifier(value.parentId)) ||
@@ -142,7 +189,8 @@ function readAllLines(
 ): void {
   const stat = fstatSync(fd);
   if (!stat.isFile()) fail("JOURNAL_UNAVAILABLE");
-  if (stat.size > limits.maxBytes) fail("JOURNAL_LIMIT");
+  if (stat.size > limits.maxBytes)
+    fail("JOURNAL_LIMIT", { metric: "fileBytes", observed: stat.size, limit: limits.maxBytes });
   const decoder = new TextDecoder("utf-8", { fatal: true, ignoreBOM: true });
   let line = "";
   let bytes = 0;
@@ -150,16 +198,27 @@ function readAllLines(
   let count: number;
   while ((count = readSync(fd, buffer, 0, buffer.length, null)) > 0) {
     bytes += count;
-    if (bytes > limits.maxBytes) fail("JOURNAL_LIMIT");
+    if (bytes > limits.maxBytes)
+      fail("JOURNAL_LIMIT", { metric: "fileBytes", observed: bytes, limit: limits.maxBytes });
     line += decoder.decode(buffer.subarray(0, count), { stream: true });
     let end: number;
     while ((end = line.indexOf("\n")) !== -1) {
       const physicalLine = line.slice(0, end);
-      if (Buffer.byteLength(physicalLine) > limits.maxLineBytes) fail("JOURNAL_LIMIT");
+      if (Buffer.byteLength(physicalLine) > limits.maxLineBytes)
+        fail("JOURNAL_LIMIT", {
+          metric: "lineBytes",
+          observed: Buffer.byteLength(physicalLine),
+          limit: limits.maxLineBytes,
+        });
       consume(physicalLine.endsWith("\r") ? physicalLine.slice(0, -1) : physicalLine);
       line = line.slice(end + 1);
     }
-    if (Buffer.byteLength(line) > limits.maxLineBytes) fail("JOURNAL_LIMIT");
+    if (Buffer.byteLength(line) > limits.maxLineBytes)
+      fail("JOURNAL_LIMIT", {
+        metric: "lineBytes",
+        observed: Buffer.byteLength(line),
+        limit: limits.maxLineBytes,
+      });
   }
   line += decoder.decode();
   checkComplete(line, fd, stat.size, getHeaderSeen());
