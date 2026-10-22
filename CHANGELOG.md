@@ -1,5 +1,11 @@
 # Changelog
 
+## Isolated stale Supervisor footer fix — candidate
+
+- Synchronize the legacy Supervisor status on every RPC/print refresh, clearing absent, foreign-session and stopped/non-pending owner indicators instead of leaving a cached footer value.
+- Use the existing UI publisher for supervisor status updates and review progress; preserve current valid owner text/counts and genuine journal/projection/receipt-identity/goal attention.
+- Keep history, runtime owner, canonical control/readback, authorization, recovery and task/goal acceptance unchanged. No live-session stop/reload, install or automatic promotion is part of this candidate.
+
 ## Isolated interactive material-layout candidate — acceptance pending
 
 - Add display-only structured materials for human decisions: native Markdown/code styling, section-aware pages and continuation context. The original exact-source reader remains a mandatory, separate step; formatted browsing cannot count as a decision or original review.

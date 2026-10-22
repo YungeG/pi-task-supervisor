@@ -121,6 +121,8 @@ Use ↑↓ to scroll full details in both terminal modes. Pi fullscreen reserves
 
 The status bar is text-only through the existing Pi status API; this extension does not replace the footer. Opening its own board or native question suppresses only its own resident widget. A native question preempts and actually joins its own reader; the final valid release resnapshots through the original publisher. Session/tree/shutdown cleanup invalidates stale displays. This coordinates only this extension's A/C views, not arbitrary third-party chrome or a cross-extension atomic lease. RPC/print have no custom widget and keep the original text/select behavior.
 
+Supervisor footer entries are synchronized on every UI refresh, including RPC/print clients. A missing or foreign-session owner, or a stopped owner with no pending operation, clears the old Supervisor entry without deleting history or changing task/goal state. Current active/reviewing/held/completed owners and real journal, projection, receipt-identity or GoalRun attention remain visible. This is deterministic display cleanup, not stop/recover, inherited authorization, or goal acceptance. A completed task board alone does not stop a current valid Supervisor.
+
 ## Human decision materials
 
 This isolated interaction-layout candidate changes presentation only. Its flow is **formatted browsing → complete original-source review → original native choice/input**. Formatted browsing is neither proof of full review nor an answer. It cannot grant permission, accept a task, or start work. Pressing `r` moves to the original review; it does not skip that review.

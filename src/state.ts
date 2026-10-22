@@ -11,9 +11,9 @@ import {
 import { phaseLabel } from "./formatting";
 import { TASK_WIDGET_KEY, updateTaskWidget } from "./board-ui";
 import { captureUiSummary } from "./ui-capture";
-import { formatStatusbar } from "./status-ui";
+import { formatStatusbar, formatLegacySupervisorStatus } from "./status-ui";
 
-import { currentRuntime } from "./runtime";
+import { currentRuntime, type TaskRuntime } from "./runtime";
 import { appendOwnerSnapshot, ownerSnapshot, selectedGoalEntries } from "./goal-scope";
 
 // ── State Accessors ──
@@ -127,6 +127,19 @@ export function refreshUI(ctx: ExtensionContext): void {
   }
 }
 
+function legacyAttention(runtime: Readonly<TaskRuntime>, sessionId: string): string | undefined {
+  if (runtime.receiptStore && runtime.receiptStore.sessionId !== sessionId)
+    return "Receipt identity needs inspection";
+  return (
+    runtime.journalFault ??
+    runtime.boardRepair?.faultMessage ??
+    runtime.preflightRepair?.faultMessage ??
+    runtime.goal?.blocked ??
+    runtime.goal?.repair?.reason ??
+    (runtime.goal?.pending ? "Goal transition pending" : undefined)
+  );
+}
+
 /** Updates the persistent task widget and existing status bar. */
 export function updateUI(ctx: ExtensionContext, snapshot: Readonly<TaskBoardSnapshot>): void {
   if (!ctx.hasUI) return;
@@ -155,6 +168,16 @@ export function updateUI(ctx: ExtensionContext, snapshot: Readonly<TaskBoardSnap
     return;
   }
 
+  const runtime = currentRuntime();
+  const sessionId = ctx.sessionManager.getSessionId();
+  ctx.ui.setStatus(
+    "continuous-supervisor",
+    formatLegacySupervisorStatus(
+      runtime.supervisor,
+      sessionId,
+      legacyAttention(runtime, sessionId),
+    ),
+  );
   if (snapshot.tasks.length === 0) {
     ctx.ui.setStatus("til-done", undefined);
     ctx.ui.setStatus("til-done-active", undefined);

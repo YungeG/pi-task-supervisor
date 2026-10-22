@@ -202,12 +202,6 @@ export function saveSupervisor(pi: ExtensionAPI, state = supervisorState()): voi
 
 function updateSupervisorUI(ctx: ExtensionContext): void {
   updateUI(ctx, getBoardRef());
-  const state = supervisorState();
-  if (ctx.hasUI && ctx.mode !== "tui")
-    ctx.ui.setStatus(
-      "continuous-supervisor",
-      state ? `Supervisor: ${state.status} (${state.continuations}/20 resumes)` : undefined,
-    );
 }
 
 export function supervisorNotice(pi: ExtensionAPI, ctx: ExtensionContext, reason: string): void {
@@ -1125,8 +1119,6 @@ function prepareReview(
   state.reviews++;
   saveSupervisor(pi);
   updateUI(ctx, board);
-  if (ctx.hasUI && ctx.mode !== "tui")
-    ctx.ui.setStatus("continuous-supervisor", `Supervisor: checking ${state.reviews}/40`);
   return true;
 }
 

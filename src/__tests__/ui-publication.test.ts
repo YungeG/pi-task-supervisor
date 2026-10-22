@@ -1,5 +1,5 @@
 import { beforeEach, describe, expect, it, vi } from "vitest";
-import type { TUI } from "@earendil-works/pi-tui";
+import { visibleWidth, type TUI } from "@earendil-works/pi-tui";
 import type { TaskBoardSnapshot } from "../types";
 import { setSessionScopeEnabled } from "../scope";
 import * as capture from "../ui-capture";
@@ -60,6 +60,246 @@ describe("resident UI publication", () => {
   beforeEach(() => {
     vi.restoreAllMocks();
     resetState();
+  });
+
+  it.each(["rpc", "print"])(
+    "clears a seeded parent-only Supervisor footer on an ordinary %s refresh",
+    (mode) => {
+      const ctx = createMockContext();
+      Object.assign(ctx, { mode });
+      const footer = new Map<string, string | undefined>([
+        ["continuous-supervisor", "Supervisor: stopped (1/20 resumes)"],
+        ["other-extension", "keep"],
+      ]);
+      vi.mocked(ctx.ui.setStatus).mockImplementation((key, value) => {
+        footer.set(key, value);
+      });
+      const branch = vi.spyOn(ctx.sessionManager, "getBranch");
+      const entries = vi.spyOn(ctx.sessionManager, "getEntries");
+      const board = createEmptyBoard();
+      const before = JSON.stringify(board);
+      updateUI(ctx, board);
+      expect(footer.get("continuous-supervisor")).toBeUndefined();
+      expect(footer.get("other-extension")).toBe("keep");
+      expect(currentRuntime().supervisor).toBeUndefined();
+      expect(JSON.stringify(board)).toBe(before);
+      expect(branch).not.toHaveBeenCalled();
+      expect(entries).not.toHaveBeenCalled();
+      expect(ctx.ui.setWidget).not.toHaveBeenCalled();
+    },
+  );
+
+  it.each(["rpc", "print"])(
+    "keeps owner identity and stopped/pending rules on every %s refresh",
+    (mode) => {
+      const ctx = createMockContext();
+      Object.assign(ctx, { mode, model: { provider: "faux", id: "test" } });
+      const mock = createMockAPI();
+      attachMockJournal(mock, ctx);
+      setBoard(activeBoard());
+      startSupervisor(mock.api, ctx, "UI-only fixture");
+      const state = supervisorState();
+      if (!state) throw new Error("Missing fixture supervisor");
+      const footer = new Map<string, string | undefined>([["other-extension", "keep"]]);
+      vi.mocked(ctx.ui.setStatus).mockImplementation((key, value) => {
+        footer.set(key, value);
+      });
+      const dispatches = mock.sendMessage.mock.calls.length;
+      for (const sample of [
+        { sessionId: "parent-session", status: "active", pending: false, expected: undefined },
+        { sessionId: "parent-session", status: "stopped", pending: false, expected: undefined },
+        { sessionId: "test-session", status: "stopped", pending: false, expected: undefined },
+        {
+          sessionId: "test-session",
+          status: "stopped",
+          pending: true,
+          expected: "Supervisor: stopped (0/20 resumes)",
+        },
+        {
+          sessionId: "test-session",
+          status: "active",
+          pending: false,
+          expected: "Supervisor: active (0/20 resumes)",
+        },
+        {
+          sessionId: "test-session",
+          status: "reviewing",
+          pending: false,
+          expected: "Supervisor: checking 0/40",
+        },
+        {
+          sessionId: "test-session",
+          status: "paused",
+          pending: false,
+          expected: "Supervisor: paused (0/20 resumes)",
+        },
+        {
+          sessionId: "test-session",
+          status: "fault",
+          pending: false,
+          expected: "Supervisor: fault (0/20 resumes)",
+        },
+        {
+          sessionId: "test-session",
+          status: "completed",
+          pending: false,
+          expected: "Supervisor: completed (0/20 resumes)",
+        },
+      ] as const) {
+        Object.assign(state, {
+          sessionId: sample.sessionId,
+          status: sample.status,
+          pending: sample.pending,
+        });
+        const before = JSON.stringify({ state, board: getBoard() });
+        const writes = mock.appendEntry.mock.calls.length;
+        footer.set("continuous-supervisor", "Supervisor: stale");
+        updateUI(ctx, getBoard());
+        expect(footer.get("continuous-supervisor")).toBe(sample.expected);
+        expect(footer.get("other-extension")).toBe("keep");
+        expect(JSON.stringify({ state, board: getBoard() })).toBe(before);
+        expect(mock.appendEntry).toHaveBeenCalledTimes(writes);
+        expect(mock.sendMessage).toHaveBeenCalledTimes(dispatches);
+      }
+    },
+  );
+
+  it.each(["journal", "board-repair", "preflight-repair", "goal-blocked"])(
+    "keeps real %s attention when no current Supervisor exists",
+    (kind) => {
+      const ctx = createMockContext();
+      Object.assign(ctx, { mode: "rpc" });
+      const runtime = currentRuntime();
+      const hint = {
+        sessionId: "test-session",
+        controlEntryId: "fixture",
+        projectedDigest: "a".repeat(64),
+        faultMessage: "MUST_KEEP_DIAGNOSTIC",
+        ownsJournalFault: false,
+      };
+      if (kind === "journal") runtime.journalFault = hint.faultMessage;
+      if (kind === "board-repair") runtime.boardRepair = hint;
+      if (kind === "preflight-repair") runtime.preflightRepair = hint;
+      if (kind === "goal-blocked")
+        runtime.goal = { sessionId: "test-session", archives: [], blocked: hint.faultMessage };
+      const before = JSON.stringify(runtime);
+      updateUI(ctx, createEmptyBoard());
+      expect(ctx.ui.setStatus).toHaveBeenCalledWith(
+        "continuous-supervisor",
+        expect.stringContaining("MUST_KEEP_DIAGNOSTIC"),
+      );
+      expect(JSON.stringify(runtime)).toBe(before);
+    },
+  );
+
+  it.each(["rpc", "print"])(
+    "does not republish stopped history after the original %s stop command",
+    async (mode) => {
+      const h = lifecycle();
+      Object.assign(h.ctx, { mode });
+      setSessionScopeEnabled(true);
+      setBoard(activeBoard());
+      startSupervisor(h.mock.api, h.ctx, "UI-only stop fixture");
+      const footer = new Map<string, string | undefined>([["other-extension", "keep"]]);
+      vi.mocked(h.ctx.ui.setStatus).mockImplementation((key, value) => {
+        footer.set(key, value);
+      });
+      await h.command("stop");
+      expect(supervisorState()).toMatchObject({ status: "stopped", pending: false });
+      expect(footer.get("continuous-supervisor")).toBeUndefined();
+      expect(footer.get("other-extension")).toBe("keep");
+      const snapshot = JSON.stringify({ board: getBoard(), state: supervisorState() });
+      const writes = h.mock.appendEntry.mock.calls.length;
+      updateUI(h.ctx, getBoard());
+      expect(footer.get("continuous-supervisor")).toBeUndefined();
+      expect(JSON.stringify({ board: getBoard(), state: supervisorState() })).toBe(snapshot);
+      expect(h.mock.appendEntry).toHaveBeenCalledTimes(writes);
+      expect(h.mock.sendMessage.mock.calls.some(([, options]) => options?.triggerTurn)).toBe(false);
+    },
+  );
+
+  it.each(["session_start", "session_tree"])(
+    "ignores parent-only stopped history on %s and clears its seeded footer without writing history",
+    async (event) => {
+      const h = lifecycle();
+      Object.assign(h.ctx, { mode: "rpc" });
+      vi.mocked(h.ctx.sessionManager.getSessionId).mockReturnValue("parent-session");
+      const parentBoard = { ...activeBoard(), generation: 1, finalAcceptanceTaskId: "active" };
+      const { isValidSnapshotV2 } = await import("../validation");
+      expect(isValidSnapshotV2(parentBoard)).toBe(true);
+      setBoard(parentBoard);
+      h.mock.api.appendEntry("continuous-tasks:snapshot", parentBoard);
+      startSupervisor(h.mock.api, h.ctx, "Parent fixture");
+      await h.command("stop");
+      expect(supervisorState()).toMatchObject({ status: "stopped", pending: false });
+      vi.mocked(h.ctx.sessionManager.getSessionId).mockReturnValue("child-session");
+      const footer = new Map<string, string | undefined>([
+        ["continuous-supervisor", "Supervisor: stopped (1/20 resumes)"],
+      ]);
+      vi.mocked(h.ctx.ui.setStatus).mockImplementation((key, value) => {
+        footer.set(key, value);
+      });
+      const branch = JSON.stringify(h.ctx.sessionManager.getBranch());
+      const writes = h.mock.appendEntry.mock.calls.length;
+      await h.fire(event);
+      expect(supervisorState()).toBeUndefined();
+      expect(footer.get("continuous-supervisor")).toBeUndefined();
+      expect(JSON.stringify(h.ctx.sessionManager.getBranch())).toBe(branch);
+      expect(h.mock.appendEntry).toHaveBeenCalledTimes(writes);
+      expect(h.mock.sendMessage.mock.calls.some(([, options]) => options?.triggerTurn)).toBe(false);
+    },
+  );
+
+  it.each(["tui", "rpc", "print"])(
+    "clears only the stale Supervisor key for a 13-done recorded board in %s",
+    (mode) => {
+      const ctx = createMockContext();
+      Object.assign(ctx, { mode });
+      // Status-shape fixture, not evidence of real task or goal acceptance.
+      const board: TaskBoardSnapshot = {
+        ...activeBoard(),
+        workflowStatus: "completed",
+        tasks: Array.from({ length: 13 }, (_, i) =>
+          activeBoard().tasks.map((task) => ({
+            ...task,
+            id: `done-${i}`,
+            status: "done" as const,
+          })),
+        ).flat(),
+      };
+      const footer = new Map<string, string | undefined>([
+        ["continuous-supervisor", "Supervisor: stopped (1/20 resumes)"],
+        ["other-extension", "keep"],
+      ]);
+      vi.mocked(ctx.ui.setStatus).mockImplementation((key, value) => {
+        footer.set(key, value);
+      });
+      const before = JSON.stringify(board);
+      updateUI(ctx, board);
+      updateUI(ctx, board);
+      expect(footer.get("continuous-supervisor")).toBeUndefined();
+      expect(footer.get("til-done")).toContain("13/13");
+      expect(footer.get("other-extension")).toBe("keep");
+      expect(JSON.stringify(board)).toBe(before);
+      expect(supervisorState()).toBeUndefined();
+    },
+  );
+
+  it("keeps legacy diagnostics printable and bounded without changing the saved fault", () => {
+    const ctx = createMockContext();
+    Object.assign(ctx, { mode: "rpc" });
+    const fault = "IMPORTANT\u001b[31m\n\u202e".repeat(50);
+    currentRuntime().journalFault = fault;
+    updateUI(ctx, createEmptyBoard());
+    const value = vi
+      .mocked(ctx.ui.setStatus)
+      .mock.calls.find(([key]) => key === "continuous-supervisor")?.[1];
+    expect(typeof value).toBe("string");
+    if (typeof value !== "string") throw new Error("Missing diagnostic");
+    expect(value).toContain("Supervisor: fault");
+    expect(visibleWidth(value)).toBeLessThanOrEqual(64);
+    expect(value).not.toMatch(/[\p{Cc}\p{Bidi_Control}]/u);
+    expect(currentRuntime().journalFault).toBe(fault);
   });
 
   it("clears resident status and card after stop while retaining the paused 4-done/1-doing/7-queued history", async () => {
@@ -276,6 +516,7 @@ describe("resident UI publication", () => {
     expect(branch).not.toHaveBeenCalled();
     expect(rpc.ui.setWidget).not.toHaveBeenCalled();
     expect(vi.mocked(rpc.ui.setStatus).mock.calls).toEqual([
+      ["continuous-supervisor", "Supervisor: fault — Receipt identity needs inspection"],
       ["til-done", "0/1 - Phase 1"],
       ["til-done-active", "[active] Approved work"],
     ]);
@@ -379,8 +620,10 @@ describe("resident UI publication", () => {
       Object.assign(board.tasks[0]!, { status: "abandoned" });
       updateUI(ctx, board);
       expect(vi.mocked(ctx.ui.setStatus).mock.calls).toEqual([
+        ["continuous-supervisor", undefined],
         ["til-done", undefined],
         ["til-done-active", undefined],
+        ["continuous-supervisor", undefined],
         ["til-done", "1/1 - Phase 1"],
         ["til-done-active", undefined],
       ]);

@@ -1,4 +1,5 @@
 import { taskViewCountsUnknown, type UiSummary } from "./ui-view";
+import type { SupervisorState } from "./supervisor";
 import { stripTerminalSequences, truncateToWidth } from "@earendil-works/pi-tui";
 
 const MAX_STATUSBAR_WIDTH = 64;
@@ -16,6 +17,23 @@ function sanitizeText(text: string): string {
     .replace(/\p{Cc}/gu, " ")
     .replace(/\s+/g, " ")
     .trim();
+}
+
+/** Legacy clients share the same owner/attention rules on every refresh. Display only. */
+export function formatLegacySupervisorStatus(
+  state: Readonly<SupervisorState> | undefined,
+  sessionId: string,
+  attention?: string,
+): string | undefined {
+  if (attention)
+    return stripTerminalSequences(
+      truncateToWidth(`Supervisor: fault — ${sanitizeText(attention)}`, MAX_STATUSBAR_WIDTH, "…"),
+    );
+  if (!state || state.sessionId !== sessionId || (state.status === "stopped" && !state.pending))
+    return undefined;
+  return state.status === "reviewing"
+    ? `Supervisor: checking ${state.reviews}/40`
+    : `Supervisor: ${state.status} (${state.continuations}/20 resumes)`;
 }
 
 /** One plain entry: current state first, secondary task counts when space permits. */
