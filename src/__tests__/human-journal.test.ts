@@ -1,5 +1,6 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { createHash } from "node:crypto";
+import type * as NodeFs from "node:fs";
 import {
   mkdtempSync,
   readFileSync,
@@ -24,7 +25,7 @@ import {
 } from "../human-journal";
 
 vi.mock("node:fs", async (importOriginal) => {
-  const actual = await importOriginal<typeof import("node:fs")>();
+  const actual = await importOriginal<typeof NodeFs>();
   return { ...actual, readSync: vi.fn(actual.readSync) };
 });
 
@@ -351,7 +352,7 @@ describe("VF4 safe journal diagnostics", () => {
     const ms = performance.now() - started;
     const results = vi.mocked(readSync).mock.results;
     const readBytes = results.reduce(
-      (sum, row) => sum + (row.type === "return" ? Number(row.value) : 0),
+      (sum, row) => sum + (row.type === "return" ? row.value : 0),
       0,
     );
     const completeScans = results.filter((row) => row.type === "return" && row.value === 0).length;
@@ -359,9 +360,10 @@ describe("VF4 safe journal diagnostics", () => {
     expect(readBytes).toBe(bytes);
     expect(completeScans).toBe(1);
     expect(results).toHaveLength(2);
-    console.info(
+    process.stdout.write(
       "VF4_SYNTHETIC_INSPECT " +
-        JSON.stringify({ bytes, readBytes, readCalls: results.length, completeScans, ms }),
+        JSON.stringify({ bytes, readBytes, readCalls: results.length, completeScans, ms }) +
+        "\n",
     );
   });
 });

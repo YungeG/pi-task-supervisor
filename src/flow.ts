@@ -1,6 +1,7 @@
 import type { ExtensionContext } from "@earendil-works/pi-coding-agent";
 import { stripTerminalSequences } from "@earendil-works/pi-tui";
 import { currentRuntime } from "./runtime";
+import { goalControlIssue } from "./goal-scope";
 import { preflightTaskIssue } from "./preflight";
 import type { SupervisorState } from "./supervisor";
 import type { TaskBoardSnapshot } from "./types";
@@ -15,6 +16,17 @@ export const SUPERVISOR_LIMITS = {
 export interface FlowFacts {
   enabled: boolean;
   journalFault?: string;
+  goalIssue?: string;
+  goal?: Readonly<{
+    sessionId: string;
+    goalRunId: string;
+    phase: string;
+    preflightId: string;
+    hasSupervisor: boolean;
+    closedUnstarted: boolean;
+    hasProposal: boolean;
+    preflightPhase?: string;
+  }>;
   preflightIssue?: string;
   receiptIssue?: string;
   sessionId: string;
@@ -22,11 +34,29 @@ export interface FlowFacts {
   pending: boolean;
 }
 
+function currentGoalFacts(): FlowFacts["goal"] {
+  const runtime = currentRuntime();
+  const goal = runtime.goal;
+  if (!goal?.current) return undefined;
+  const current = goal.current;
+  return {
+    sessionId: goal.sessionId,
+    goalRunId: current.scope.goalRunId,
+    phase: current.phase,
+    preflightId: current.planning.preflightId,
+    hasSupervisor: current.supervisor !== null,
+    closedUnstarted: current.disposition === "closed-unstarted",
+    hasProposal: Boolean(runtime.preflight?.proposal),
+    preflightPhase: runtime.preflight?.phase,
+  };
+}
 export function flowFacts(ctx: ExtensionContext): FlowFacts {
   const runtime = currentRuntime();
   return {
     enabled: runtime.enabled,
     journalFault: runtime.journalFault,
+    goalIssue: goalControlIssue(ctx),
+    goal: currentGoalFacts(),
     receiptIssue: runtime.receiptStore?.pendingCount
       ? "Unknown host capture requires explicit recover and fresh validation"
       : runtime.supervisor &&
@@ -51,6 +81,7 @@ export function resumeControlIssue(
   facts: FlowFacts,
 ): string | undefined {
   if (facts.journalFault) return "Inspect the journal before recovery";
+  if (facts.goalIssue) return facts.goalIssue;
   if (facts.preflightIssue) return facts.preflightIssue;
   if (!facts.idle || facts.pending || board.decision)
     return "Wait for Main and pending messages; resolve any decision before resuming";
@@ -66,7 +97,7 @@ export function resumeControlIssue(
 
 function controlFault(facts: FlowFacts): string | undefined {
   if (facts.journalFault) return "Inspect the journal before recovery";
-  return facts.preflightIssue ?? facts.receiptIssue;
+  return facts.goalIssue ?? facts.preflightIssue ?? facts.receiptIssue;
 }
 
 /** Pure qualification shared by command control and read-only status projection. */
@@ -121,24 +152,34 @@ function decisionNextStep(board: Readonly<TaskBoardSnapshot>, after: string): st
   return `/task-supervisor decide (native response; no ID or chat approval)${after}`;
 }
 
+function decisionGateStep(
+  board: Readonly<TaskBoardSnapshot>,
+  state: Readonly<SupervisorState> | undefined,
+): string {
+  if (!board.decision || board.workflowStatus !== "waiting_for_decision")
+    return "inspect inconsistent decision gate";
+  const after =
+    state && ["paused", "fault"].includes(state.status)
+      ? `; then ${heldNextStep(board, state)}`
+      : "; remaining gates still apply";
+  return decisionNextStep(board, after);
+}
+
 function flowBlocker(
   board: Readonly<TaskBoardSnapshot>,
   state: Readonly<SupervisorState> | undefined,
   facts: FlowFacts,
 ): string | undefined {
+  const planning = unstartedGoalNext(board, facts);
+  if (planning) return planning;
   if (facts.journalFault) return "inspect journal; control recovery is disabled";
+  if (facts.goalIssue) return `inspect goal lifecycle: ${facts.goalIssue}`;
   if (!facts.enabled) return "/task-supervisor enable (tools only), then recheck status";
   if (state && state.sessionId !== facts.sessionId) return "inspect foreign supervisor identity";
   const preflight = preflightControlBlocker(facts);
   if (preflight) return preflight;
   if (board.decision || board.workflowStatus === "waiting_for_decision") {
-    if (!board.decision || board.workflowStatus !== "waiting_for_decision")
-      return "inspect inconsistent decision gate";
-    const after =
-      state && ["paused", "fault"].includes(state.status)
-        ? `; then ${heldNextStep(board, state)}`
-        : "; remaining gates still apply";
-    return decisionNextStep(board, after);
+    return decisionGateStep(board, state);
   }
   if (!facts.idle || facts.pending)
     return "wait for the current host run/check and pending messages";
@@ -151,6 +192,32 @@ export function externalWaitText(state: Readonly<SupervisorState> | undefined): 
   if (!wait) return "none confirmed";
   const phase = wait.phase === "active" ? "execution pending" : "results pending Main review";
   return `${phase}; last owner report ${new Date(wait.observedAt).toISOString()}; deadline ${new Date(wait.deadlineAt).toISOString()}`;
+}
+
+function unstartedGoalNext(
+  board: Readonly<TaskBoardSnapshot>,
+  facts: FlowFacts,
+): string | undefined {
+  const goal = facts.goal;
+  if (
+    !goal ||
+    goal.hasSupervisor ||
+    board.decision ||
+    facts.journalFault ||
+    facts.goalIssue ||
+    facts.receiptIssue
+  )
+    return undefined;
+  if (!facts.idle || facts.pending)
+    return "wait for the current host run and pending messages; no automatic planning replay";
+  if (goal.phase === "stopped" && goal.closedUnstarted)
+    return "/task-supervisor supervise <new goal> (archive stopped history; independent new permissions/start)";
+  if (!["planning", "planning-interrupted"].includes(goal.phase)) return undefined;
+  if (goal.preflightPhase === "approved")
+    return "/task-supervisor start (separate native first-start; approval alone does not execute)";
+  if (goal.hasProposal)
+    return "/task-supervisor approve (current native permission request; not chat approval)";
+  return "/task-supervisor preflight (explicit same-GoalRun read-only replan), or /task-supervisor stop (end this unstarted goal)";
 }
 
 /** Only recommends actions; an opaque execution reference never establishes liveness. */

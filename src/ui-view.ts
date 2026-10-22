@@ -13,7 +13,8 @@ export type UiSource =
   | "host"
   | "journal"
   | "receipt"
-  | "repair";
+  | "repair"
+  | "goal";
 
 export type UiLine = Readonly<{
   text: string;
@@ -29,7 +30,13 @@ export type UiScope = Readonly<{
 }>;
 
 export type UiDocument = Readonly<{
-  id: "overview" | "acceptance" | "current-board-request" | "latest-board-response" | "preflight";
+  id:
+    | "overview"
+    | "acceptance"
+    | "current-board-request"
+    | "latest-board-response"
+    | "preflight"
+    | "goal-history";
   title: string;
   availability: "available" | "unknown" | "absent";
   text: string;
@@ -121,9 +128,19 @@ function isForeignSupervisor(input: UiSummaryInput): boolean {
   return supervisor !== undefined && supervisor.sessionId !== scope.sessionId;
 }
 
+function hasGoalIdentityIssue(input: UiSummaryInput): boolean {
+  const goal = input.facts.goal;
+  if (!goal) return false;
+  if (goal.sessionId !== input.scope.sessionId) return true;
+  if (input.preflight?.preflightId !== goal.preflightId) return true;
+  return goal.hasSupervisor
+    ? input.supervisor?.goalRunId !== goal.goalRunId || input.supervisor.status !== goal.phase
+    : Boolean(input.supervisor);
+}
 function hasIdentityIssue(input: UiSummaryInput): boolean {
   return (
     isForeignSupervisor(input) ||
+    hasGoalIdentityIssue(input) ||
     (input.preflight !== undefined && input.preflight.sessionId !== input.scope.sessionId) ||
     input.facts.sessionId !== input.scope.sessionId
   );
@@ -241,22 +258,34 @@ function hasOnlyHistoricalPreflight(input: UiSummaryInput): boolean {
 }
 
 /** Explicit stop leaves history, not a resident work indicator. Independent attention stays visible. */
+function hasQuietBoard(input: UiSummaryInput): boolean {
+  const { board, facts, repairs } = input;
+  return (
+    !["active", "waiting_for_decision"].includes(board.workflowStatus) &&
+    !board.tasks.some((task) => task.executionRef) &&
+    ![
+      board.decision,
+      repairs?.board,
+      repairs?.preflight,
+      facts.journalFault,
+      facts.goalIssue,
+      facts.receiptIssue,
+      facts.preflightIssue,
+    ].some(Boolean)
+  );
+}
 function isQuietStoppedHistory(input: UiSummaryInput): boolean {
-  const { board, supervisor, facts, repairs } = input;
-  if (supervisor?.sessionId !== input.scope.sessionId || supervisor.status !== "stopped")
-    return false;
-  if (supervisor.pending || ["active", "waiting_for_decision"].includes(board.workflowStatus))
-    return false;
-  if (board.tasks.some((task) => task.executionRef)) return false;
-  if (!hasOnlyHistoricalPreflight(input)) return false;
-  return ![
-    board.decision,
-    repairs?.board,
-    repairs?.preflight,
-    facts.journalFault,
-    facts.receiptIssue,
-    facts.preflightIssue,
-  ].some(Boolean);
+  if (!hasQuietBoard(input)) return false;
+  const goal = input.facts.goal;
+  if (goal?.phase === "stopped" && goal.closedUnstarted && !goal.hasSupervisor)
+    return input.board.tasks.length === 0;
+  const { supervisor } = input;
+  return (
+    supervisor?.sessionId === input.scope.sessionId &&
+    supervisor.status === "stopped" &&
+    !supervisor.pending &&
+    hasOnlyHistoricalPreflight(input)
+  );
 }
 
 function computeVisible(
@@ -272,7 +301,8 @@ function computeVisible(
   if (board.workflowStatus !== "inactive") return true;
   if (board.decision) return true;
   if (repairs?.board || repairs?.preflight) return true;
-  if (facts.journalFault || facts.receiptIssue || facts.preflightIssue) return true;
+  if (facts.journalFault || facts.goalIssue || facts.receiptIssue || facts.preflightIssue)
+    return true;
   return false;
 }
 
@@ -280,6 +310,7 @@ function computeVisible(
 
 function collectFaultBlockers(facts: Readonly<FlowFacts>): UiLine[] {
   const blockers: UiLine[] = [];
+  if (facts.goalIssue) blockers.push(line(facts.goalIssue, "goal", "error"));
   if (facts.journalFault) {
     blockers.push(line(facts.journalFault, "journal", "error"));
   }
@@ -410,7 +441,12 @@ function isPreflightGateException(input: UiSummaryInput): boolean {
     "awaiting_authorization",
     "approved",
   ]);
-  if (!gatePhases.has(preflight.phase)) return false;
+  const interruptedPlanning =
+    input.facts.goal?.phase === "planning-interrupted" &&
+    !input.facts.goal.hasSupervisor &&
+    !input.facts.goal.hasProposal &&
+    preflight.phase === "interrupted";
+  if (!gatePhases.has(preflight.phase) && !interruptedPlanning) return false;
   if (preflight.started) return false;
   if (hasEffectivePreflightBinding(input)) return false;
   if (facts.journalFault || facts.receiptIssue) return false;
@@ -707,10 +743,29 @@ function headlineNextFallback(input: UiSummaryInput): HeadlineResult {
   };
 }
 
+function headlineGoal(input: UiSummaryInput): HeadlineResult | undefined {
+  if (input.facts.goalIssue)
+    return {
+      headline: line("目标交接/状态待检查", "goal", "error"),
+      next: line(input.facts.goalIssue, "goal", "error"),
+    };
+  const goal = input.facts.goal;
+  if (!goal || goal.hasSupervisor || input.board.decision) return undefined;
+  const next = line(input.ownerNext ?? "查看当前目标状态，不重放已有执行", "goal", "info");
+  if (goal.phase === "stopped" && goal.closedUnstarted)
+    return { headline: line("目标已停止（未启动执行）", "goal", "info"), next };
+  if (goal.hasProposal) return undefined;
+  if (goal.phase === "planning-interrupted")
+    return { headline: line("只读规划已中断，未启动执行", "goal", "warning"), next };
+  if (goal.phase === "planning")
+    return { headline: line("新目标只读规划，未启动执行", "goal", "info"), next };
+  return undefined;
+}
 function computeHeadlineAndNext(input: UiSummaryInput, gateException: boolean): HeadlineResult {
   return (
     headlineNextLevel1(input, gateException) ??
     headlineNextLevel2(input) ??
+    headlineGoal(input) ??
     headlineNextLevel3(input) ??
     headlineNextLevel4(input) ??
     headlineNextLevel5(input) ??

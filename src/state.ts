@@ -14,6 +14,7 @@ import { captureUiSummary } from "./ui-capture";
 import { formatStatusbar } from "./status-ui";
 
 import { currentRuntime } from "./runtime";
+import { appendOwnerSnapshot, ownerSnapshot, selectedGoalEntries } from "./goal-scope";
 
 // ── State Accessors ──
 
@@ -35,6 +36,9 @@ export function getBoardRef(): Readonly<TaskBoardSnapshot> {
 /** Resets all mutable state. For testing only. */
 export function resetState(): void {
   currentRuntime().board = createEmptyBoard();
+  currentRuntime().goal = undefined;
+  currentRuntime().goalEpoch++;
+  currentRuntime().planningLease = undefined;
   currentRuntime().supervisor = undefined;
   currentRuntime().receiptStore = undefined;
   currentRuntime().receiptIdentity = undefined;
@@ -51,7 +55,7 @@ export function resetState(): void {
 
 // ── State Reconstruction ──
 
-function migrateLegacySnapshot(snapshot: LegacyTaskBoardSnapshot): TaskBoardSnapshot {
+export function migrateLegacySnapshot(snapshot: LegacyTaskBoardSnapshot): TaskBoardSnapshot {
   return {
     version: 2,
     generation: 1,
@@ -72,13 +76,17 @@ function migrateLegacySnapshot(snapshot: LegacyTaskBoardSnapshot): TaskBoardSnap
  */
 export function reconstructState(ctx: ExtensionContext): TaskBoardSnapshot {
   const branch = ctx.sessionManager.getBranch();
-  let latestV2: TaskBoardSnapshot | undefined;
+  const currentGoal = currentRuntime().goal?.current;
+  let latestV2: TaskBoardSnapshot | undefined = currentGoal
+    ? cloneBoard(currentGoal.seed.board)
+    : undefined;
   let latestLegacy: LegacyTaskBoardSnapshot | undefined;
 
-  for (const entry of branch) {
+  for (const entry of selectedGoalEntries(branch)) {
     if (entry.type !== "custom") continue;
     const customType = (entry as { customType?: string }).customType;
-    const data = (entry as { data?: unknown }).data;
+    const stored = (entry as { data?: unknown }).data;
+    const data = customType === CUSTOM_SNAPSHOT_TYPE ? ownerSnapshot(stored) : stored;
     if (customType === LEGACY_CUSTOM_SNAPSHOT_TYPE) {
       if (latestV2 || !isValidLegacySnapshot(data))
         throw new Error("Invalid or downgraded board snapshot");
@@ -105,7 +113,7 @@ export function persistEntries(
   snapshot: TaskBoardSnapshot,
 ): void {
   pi.appendEntry(CUSTOM_EVENT_TYPE, event);
-  pi.appendEntry(CUSTOM_SNAPSHOT_TYPE, snapshot);
+  appendOwnerSnapshot(pi, CUSTOM_SNAPSHOT_TYPE, snapshot);
 }
 
 // ── UI Sync ──

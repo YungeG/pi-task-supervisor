@@ -177,28 +177,40 @@ describe("structured board presentation contract", () => {
     expect(JSON.stringify(view)).toBe(before);
     expect(h.done).not.toHaveBeenCalled();
   });
-  it("keeps fixed history/acceptance routes before phase navigation, including zero tasks", () => {
-    const v = data();
-    const h = harness({
-      ...v,
-      board: { ...v.board, tasks: [], phases: [] },
-      summary: {
-        ...v.summary,
-        tasks: [],
-        counts: { done: 0, total: 0, unfinished: 0, abandoned: 0 },
-      },
-    });
-    const text = h.render();
-    for (const label of ["总览", "确认与回应", "最终验收", "暂无任务"])
-      expect(text).toContain(label);
-    expect(text).toContain("0/0");
-    expect(text).not.toContain("100%");
-    h.select("确认与回应");
-    expect(h.render()).toContain("原请求/历史回应");
-    h.key(esc);
-    h.key(esc);
-    expect(h.done).toHaveBeenCalledOnce();
-  });
+  it.each([false, true])(
+    "keeps fixed history/acceptance routes with zero tasks (countsUnknown=%s)",
+    (countsUnknown) => {
+      const v = data();
+      const h = harness({
+        ...v,
+        board: { ...v.board, tasks: [], phases: [] },
+        summary: {
+          ...v.summary,
+          blockers: countsUnknown
+            ? v.summary.blockers
+            : v.summary.blockers.filter((b) => b.source !== "journal"),
+          tasks: [],
+          counts: { done: 0, total: 0, unfinished: 0, abandoned: 0 },
+        },
+      });
+      const text = h.render();
+      for (const label of ["总览", "确认与回应", "最终验收"]) expect(text).toContain(label);
+      if (countsUnknown) {
+        expect(text).toContain("任务视图未恢复");
+        expect(text).toContain("数量未知");
+        expect(text).not.toContain("0/0");
+      } else {
+        expect(text).toContain("暂无任务");
+        expect(text).toContain("0/0");
+      }
+      expect(text).not.toContain("100%");
+      h.select("确认与回应");
+      expect(h.render()).toContain("原请求/历史回应");
+      h.key(esc);
+      h.key(esc);
+      expect(h.done).toHaveBeenCalledOnce();
+    },
+  );
   it("renders wide native master/detail without turning preview into an answer or full-material review", () => {
     const h = harness();
     const narrow = h.render(80);

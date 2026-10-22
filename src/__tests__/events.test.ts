@@ -1,5 +1,6 @@
 import { beforeEach, describe, expect, it, vi } from "vitest";
 import { DEFAULT_CONFIG } from "../config";
+import type * as NodeFs from "node:fs";
 import { mkdtempSync, openSync, readSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -19,7 +20,7 @@ import {
 import { createMockAPI, createMockContext } from "./helpers/mocks";
 
 vi.mock("node:fs", async (importOriginal) => {
-  const actual = await importOriginal<typeof import("node:fs")>();
+  const actual = await importOriginal<typeof NodeFs>();
   return { ...actual, openSync: vi.fn(actual.openSync), readSync: vi.fn(actual.readSync) };
 });
 
@@ -72,7 +73,7 @@ describe("continuous task lifecycle events", () => {
       const journalOpens = vi.mocked(openSync).mock.calls.filter((call) => call[0] === path).length;
       const results = vi.mocked(readSync).mock.results;
       const readBytes = results.reduce(
-        (sum, row) => sum + (row.type === "return" ? Number(row.value) : 0),
+        (sum, row) => sum + (row.type === "return" ? row.value : 0),
         0,
       );
       const bytes = Buffer.byteLength(body);
@@ -82,9 +83,10 @@ describe("continuous task lifecycle events", () => {
       expect(currentRuntime().journalFault).toContain("JOURNAL_INVALID");
       expect(h.mock.appendEntry).not.toHaveBeenCalled();
       expect(h.mock.sendUserMessage).not.toHaveBeenCalled();
-      console.info(
+      process.stdout.write(
         "VF4_SYNTHETIC_RESTORE " +
-          JSON.stringify({ bytes, readBytes, readCalls: results.length, journalOpens, ms }),
+          JSON.stringify({ bytes, readBytes, readCalls: results.length, journalOpens, ms }) +
+          "\n",
       );
     } finally {
       rmSync(dir, { recursive: true, force: true });
@@ -99,6 +101,7 @@ describe("continuous task lifecycle events", () => {
       "session_shutdown",
       "session_before_compact",
       "input",
+      "agent_start",
       "before_agent_start",
       "agent_before_settle",
       "agent_settled",

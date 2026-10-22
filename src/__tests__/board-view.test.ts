@@ -790,7 +790,8 @@ function isolatedDetail(prompt: string, resize: boolean): Promise<IsolatedDetail
   ]);
   const code = `
     const { parentPort, workerData } = await import("node:worker_threads");
-    const { createReadOnlyBoard } = await import(workerData.module);
+    const { createJiti } = await import(workerData.loader);
+    const { createReadOnlyBoard } = await createJiti(workerData.module, { moduleCache: false }).import(workerData.module);
     const { KeybindingsManager, TUI_KEYBINDINGS, visibleWidth, stripTerminalSequences } =
       await import("@earendil-works/pi-tui");
     let closed = false;
@@ -841,7 +842,15 @@ function isolatedDetail(prompt: string, resize: boolean): Promise<IsolatedDetail
     const worker = new Worker(code, {
       eval: true,
       execArgv: [...process.execArgv, "--experimental-transform-types"],
-      workerData: { module: new URL("../board-view.ts", import.meta.url).href, view, resize },
+      workerData: {
+        module: new URL("../board-view.ts", import.meta.url).href,
+        loader: new URL(
+          "../../node_modules/@earendil-works/pi-coding-agent/dist/core/extensions/jiti-loader.js",
+          import.meta.url,
+        ).href,
+        view,
+        resize,
+      },
       resourceLimits: { maxOldGenerationSizeMb: 64, maxYoungGenerationSizeMb: 8, stackSizeMb: 4 },
     });
     let settled = false;

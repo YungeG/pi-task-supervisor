@@ -31,6 +31,17 @@ import { currentRuntime } from "./runtime";
 import { getBoardRef } from "./state";
 import { isSafeBoundedText } from "./validation";
 
+import {
+  appendOwnerSnapshot,
+  ownerSnapshot,
+  selectedGoalEntries,
+  goalLogicalScope,
+  goalStartIdentityIssue,
+  goalPreflightControlIssue,
+} from "./goal-scope";
+import { supervisorPayload, isGoalRecord, scopeEqual, type GoalCurrent } from "./goal-records";
+import { readGoalJournal } from "./goal-journal";
+
 export const PREFLIGHT_ENTRY = "continuous-tasks:preflight";
 export const PREFLIGHT_CONTROL_ENTRY = "continuous-tasks:preflight-control";
 const MAX_PROPOSAL_BYTES = 16_000;
@@ -231,7 +242,7 @@ function failPersistence(message: string): never {
 }
 function savePreflight(pi: ExtensionAPI, state: PreflightState): PreflightState {
   try {
-    pi.appendEntry(PREFLIGHT_ENTRY, structuredClone(state));
+    appendOwnerSnapshot(pi, PREFLIGHT_ENTRY, structuredClone(state));
     currentRuntime().preflight = structuredClone(state);
     return structuredClone(state);
   } catch {
@@ -305,6 +316,10 @@ export function beginPreflight(
   ctx: ExtensionCommandContext,
   goal: string,
 ): PreflightState {
+  if (currentRuntime().goal)
+    throw new Error(
+      "Use the current GoalRun lifecycle owner; preflight cannot replace its identity",
+    );
   const issue = controlIssue(ctx);
   if (issue) throw new Error(issue);
   const supervisor = currentRuntime().supervisor;
@@ -338,7 +353,12 @@ export function submitPreflight(
   proposal: PreflightProposal,
 ): PreflightState {
   if (currentRuntime().journalFault) throw new Error(currentRuntime().journalFault);
+  const issue = goalPreflightControlIssue(ctx);
+  if (issue) throw new Error(issue);
   const state = requireOwn(ctx);
+  const current = currentRuntime().goal?.current;
+  if (current && (current.phase !== "planning" || current.planning.preflightId !== preflightId))
+    throw new Error("Proposal is outside the live current GoalRun planning attempt");
   if (
     preflightId !== state.preflightId ||
     state.started ||
@@ -420,21 +440,22 @@ export function preflightRequestPredecessor(
   kind: "permission" | "start",
 ): Static<typeof PreflightSupersedesSchema> | undefined {
   const journal = inspectSessionJournal(sessionJournalView(ctx));
-  const previous = [...journal.branch]
-    .reverse()
-    .find(
-      (n) =>
-        n.customType === PREFLIGHT_ENTRY &&
-        Check(NativePreflightStateSchema, n.data) &&
-        n.data.preflightId === state.preflightId &&
-        (kind === "permission" ? n.data.permissionRequest : n.data.startRequest),
+  const previous = [...selectedGoalEntries(journal.branch, "preflight")].reverse().find((n) => {
+    if (n.customType !== PREFLIGHT_ENTRY) return false;
+    const data = ownerSnapshot(n.data);
+    return (
+      Check(NativePreflightStateSchema, data) &&
+      data.preflightId === state.preflightId &&
+      Boolean(kind === "permission" ? data.permissionRequest : data.startRequest)
     );
-  const data = previous?.data;
+  });
+  const data = previous ? ownerSnapshot(previous.data) : undefined;
   const request = Check(NativePreflightStateSchema, data)
     ? kind === "permission"
       ? data.permissionRequest
       : data.startRequest
     : undefined;
+
   if (request) {
     const proof = findReadbackProof(journal, "preflight", request.id);
     if (proof.status === "unconfirmed")
@@ -451,7 +472,7 @@ export function preflightRequestPredecessor(
   return legacy ? { legacyControlEntryId: legacy.id } : undefined;
 }
 export function preflightPermissionScope(base: PreflightState, ids: string[]): object {
-  return {
+  return goalLogicalScope({
     action: "permissions",
     sessionId: base.sessionId,
     goal: base.goal,
@@ -462,10 +483,10 @@ export function preflightPermissionScope(base: PreflightState, ids: string[]): o
     proposal: base.proposal,
     request: base.version === 2 ? base.permissionRequest : undefined,
     permissionIds: ids,
-  };
+  });
 }
 export function preflightStartScope(base: PreflightState, approvalEntryDigest: string): object {
-  return {
+  return goalLogicalScope({
     action: "start",
     sessionId: base.sessionId,
     goal: base.goal,
@@ -478,13 +499,14 @@ export function preflightStartScope(base: PreflightState, approvalEntryDigest: s
     permissionIds: base.approval?.permissionIds,
     approvalControlEntryId: base.approval?.controlEntryId,
     approvalControlDigest: approvalEntryDigest,
-  };
+  });
 }
 function nativeRequest(base: PreflightState, start: boolean) {
   if (base.version !== 2) return undefined;
   return start ? base.startRequest : base.permissionRequest;
 }
 function nativeSnapshot(data: unknown): boolean {
+  data = ownerSnapshot(data);
   return Boolean(data && typeof data === "object" && "version" in data && data.version === 2);
 }
 function nativeIdentity(base: PreflightState, control: NativePreflightControl): void {
@@ -630,7 +652,7 @@ function currentControls(
 ): Array<{ id: string; data: PreflightControl }> {
   const controls: Array<{ id: string; data: PreflightControl }> = [];
   let nativeSeen = false;
-  for (const entry of ctx.sessionManager.getBranch()) {
+  for (const entry of selectedGoalEntries(ctx.sessionManager.getBranch(), "preflight")) {
     if (entry.id === beforeEntryId) break;
     if (
       entry.type === "custom" &&
@@ -736,6 +758,8 @@ export function inspectPreflightStart(
   goal: string,
   planId?: string,
 ): PreflightBinding | undefined {
+  const goalIssue = goalStartIdentityIssue(ctx, normalizeGoal(goal));
+  if (goalIssue) throw new Error(goalIssue);
   const state = currentRuntime().preflight;
   if (state) {
     const issue = controlIssue(ctx);
@@ -848,6 +872,7 @@ export function revokePreflight(
 }
 
 function restoredSnapshot(data: unknown): PreflightState {
+  data = ownerSnapshot(data);
   if (!Check(PreflightStateSchema, data) || !safeStrings(data))
     throw new Error("Invalid persisted preflight state");
   if (data.proposal) {
@@ -898,7 +923,11 @@ function readPreflightStartup(
   const witnessIndex = journal.branch.findIndex((n) => n.id === proof.witness.id);
   const first = journal.branch
     .slice(witnessIndex + 1)
-    .find((n) => n.customType === SUPERVISOR_ENTRY);
+    .find(
+      (n) =>
+        n.customType === SUPERVISOR_ENTRY &&
+        (n.wireVersion !== 5 || supervisorPayload(n.data) !== undefined),
+    );
   if (!first) return undefined;
   const entry = ctx.sessionManager.getBranch().find((e) => e.id === first.id);
   if (!entry || entry.type !== "custom" || journalDigest(entry) !== first.digest)
@@ -937,6 +966,81 @@ function verifiedPreflightProjection(
     );
   return next;
 }
+function startupGoalIdentity(current: Readonly<GoalCurrent>): unknown {
+  return [
+    current.scope,
+    current.planning.attemptNo,
+    current.planning.attemptId,
+    current.planning.preflightId,
+    current.preflightSeed.sessionId,
+    current.seed.goal,
+    current.seed.model,
+  ];
+}
+function requireStartupGoal(ctx: ExtensionContext, current: Readonly<GoalCurrent>): void {
+  const runtime = currentRuntime();
+  const physical = readGoalJournal(ctx);
+  if (
+    !runtime.goal?.current ||
+    !physical?.current ||
+    physical.pending ||
+    physical.blocked ||
+    runtime.goal.sessionId !== ctx.sessionManager.getSessionId() ||
+    !same(startupGoalIdentity(current), startupGoalIdentity(runtime.goal.current)) ||
+    !same(startupGoalIdentity(current), startupGoalIdentity(physical.current))
+  )
+    throw new Error("First-start GoalRun identity is not the selected physical/runtime goal");
+}
+function requireGoalStartupCheckpoint(
+  ctx: ExtensionContext,
+  current: Readonly<GoalCurrent>,
+  startup: SupervisorStartRecord,
+): void {
+  const entry = ctx.sessionManager.getEntry(startup.entryId);
+  const data = entry?.type === "custom" ? entry.data : undefined;
+  if (
+    !isGoalRecord(data) ||
+    data.kind !== "goal-state" ||
+    data.action !== "supervisor" ||
+    !scopeEqual(data.scope, current.scope) ||
+    data.planning.attemptId !== current.planning.attemptId ||
+    data.planning.preflightId !== current.planning.preflightId ||
+    data.planning.attemptNo !== current.planning.attemptNo
+  )
+    throw new Error("First-start checkpoint left the selected GoalRun attempt");
+  if (
+    startup.state.goalRunId !== current.scope.goalRunId ||
+    startup.state.goal !== current.seed.goal ||
+    !same(startup.state.model, current.seed.model)
+  )
+    throw new Error("First-start checkpoint changed the pinned goal identity");
+}
+/** Pure original first-start observation; never grants authority or installs a history view. */
+export function readGoalFirstStartEntry(
+  ctx: ExtensionContext,
+  current: Readonly<GoalCurrent>,
+): string | undefined {
+  requireStartupGoal(ctx, current);
+  const state = currentRuntime().preflight;
+  if (state?.version !== 2 || !state.startRequest || !state.started) return undefined;
+  if (
+    state.preflightId !== current.planning.preflightId ||
+    state.sessionId !== ctx.sessionManager.getSessionId()
+  )
+    throw new Error("First-start preflight is not the current planning identity");
+  const proof = confirmedPreflightProof(ctx, state.startRequest.id);
+  const control = proof.control.data;
+  if (!Check(NativePreflightControlSchema, control) || control.kind !== "start")
+    throw new Error("First-start request does not name its original start control");
+  const projected = verifiedPreflightProjection(ctx, proof, false);
+  if (!same(projected.started, state.started))
+    throw new Error("First-start marker differs from the current retained startup");
+  const startup = readPreflightStartup(ctx, proof);
+  if (!startup) return undefined;
+  requireGoalStartupCheckpoint(ctx, current, startup);
+  return startup.entryId;
+}
+
 export function inspectConfirmedPreflightProjection(
   ctx: ExtensionContext,
   requestId: string,
@@ -1000,6 +1104,8 @@ interface SeenRequest {
   planDigest?: string;
   request: PreflightRequest;
   controlEntryId?: string;
+  revokedByControlEntryId?: string;
+  legacyStartBridge: boolean;
   retired: boolean;
 }
 interface PreflightFold {
@@ -1043,6 +1149,15 @@ function validateFreshRequest(
   )
     throw new Error("Preflight start request requires an unused approved plan");
 }
+function legacyBridgeOrigin(
+  fold: PreflightFold,
+  state: PreflightState,
+  kind: RequestKind,
+): boolean {
+  if (kind !== "permission" || fold.state?.version !== 1 || !fold.state.approval) return false;
+  // A possible bridge shape only: avoid reusing its id, never infer request closure from it.
+  return Boolean(fold.state.started || (state.version === 2 && state.startRequest));
+}
 function trackRequest(fold: PreflightFold, state: PreflightState, kind: RequestKind): void {
   const request = nativeRequest(state, kind === "start");
   const key = requestKey(state.preflightId, kind);
@@ -1070,6 +1185,7 @@ function trackRequest(fold: PreflightFold, state: PreflightState, kind: RequestK
     kind,
     planDigest: state.planDigest,
     request: structuredClone(request),
+    legacyStartBridge: legacyBridgeOrigin(fold, state, kind),
     retired: false,
   };
   fold.requests.set(request.id, record);
@@ -1169,6 +1285,20 @@ function legacyProjection(
   if (!missingRequired(next).length) next.phase = next.started ? "started" : "approved";
   return next;
 }
+function trackRevocation(fold: PreflightFold, control: PreflightControl, id: string): void {
+  if (control.kind !== "revoke" || !fold.state) return;
+  for (const request of [nativeRequest(fold.state, false), nativeRequest(fold.state, true)]) {
+    const seen = request && fold.requests.get(request.id);
+    if (
+      seen &&
+      !seen.retired &&
+      !seen.controlEntryId &&
+      seen.owner === control.preflightId &&
+      seen.planDigest === control.planDigest
+    )
+      seen.revokedByControlEntryId = id;
+  }
+}
 function foldPreflightControl(
   ctx: ExtensionContext,
   fold: PreflightFold,
@@ -1180,7 +1310,7 @@ function foldPreflightControl(
   if (fold.legacyPending) throw new Error("Incomplete legacy preflight control cache");
   if ("version" in value) {
     const proof = confirmedPreflightProof(ctx, value.humanInteraction.requestId);
-    if (proof.control.id !== id || !same(fold.state, proof.base.data))
+    if (proof.control.id !== id || !same(fold.state, ownerSnapshot(proof.base.data)))
       throw new Error("Preflight control base is stale");
     const request = fold.requests.get(value.humanInteraction.requestId);
     if (!request || request.retired || request.controlEntryId)
@@ -1194,6 +1324,7 @@ function foldPreflightControl(
     if (fold.nativeSeen && value.kind !== "revoke")
       throw new Error("Preflight legacy approval downgrade");
     const projected = legacyProjection(fold.state, value, id);
+    trackRevocation(fold, value, id);
     fold.legacyControls.set(value.preflightId, id);
     if (value.kind === "approve") fold.legacyPending = { id, control: value };
     fold.state = projected;
@@ -1229,19 +1360,15 @@ function foldPreflightSnapshot(
   fold.pending = undefined;
   fold.state = next;
 }
-export function restorePreflight(ctx: ExtensionContext): void {
-  const runtime = currentRuntime();
-  runtime.preflight = undefined;
-  runtime.preflightRepair = undefined;
+function readPreflightFold(ctx: ExtensionContext): PreflightFold | undefined {
   const persisted = inspectRestorableSession(ctx);
-  const hasOwnerRecord = ctx.sessionManager
-    .getBranch()
-    .some(
-      (entry) =>
-        entry.type === "custom" &&
-        [PREFLIGHT_ENTRY, PREFLIGHT_CONTROL_ENTRY].includes(entry.customType),
-    );
-  if (!hasOwnerRecord) return; // No authority to restore; persisted ancestry was checked first.
+  const currentGoal = currentRuntime().goal?.current;
+  const hasOwnerRecord = selectedGoalEntries(ctx.sessionManager.getBranch(), "preflight").some(
+    (entry) =>
+      entry.type === "custom" &&
+      [PREFLIGHT_ENTRY, PREFLIGHT_CONTROL_ENTRY].includes(entry.customType),
+  );
+  if (!hasOwnerRecord && !currentGoal) return; // Native ancestry was checked first.
   const journal = persisted ?? inspectSessionJournal(sessionJournalView(ctx));
   const fold: PreflightFold = {
     nativeSeen: false,
@@ -1251,12 +1378,25 @@ export function restorePreflight(ctx: ExtensionContext): void {
     legacyControls: new Map(),
     legacyStarted: new Map(),
   };
-  for (const node of journal.branch) {
+  if (currentGoal) {
+    beginFoldOwner(fold, currentGoal.preflightSeed);
+    fold.state = structuredClone(currentGoal.preflightSeed);
+    fold.nativeSeen = true;
+  }
+  for (const node of selectedGoalEntries(journal.branch, "preflight")) {
     if (node.customType === PREFLIGHT_ENTRY) foldPreflightSnapshot(ctx, fold, node.data, node.id);
     else if (node.customType === PREFLIGHT_CONTROL_ENTRY)
       foldPreflightControl(ctx, fold, node.data, node.id);
   }
   if (fold.legacyPending) throw new Error("Incomplete legacy preflight control persistence");
+  return fold;
+}
+export function restorePreflight(ctx: ExtensionContext): void {
+  const runtime = currentRuntime();
+  runtime.preflight = undefined;
+  runtime.preflightRepair = undefined;
+  const fold = readPreflightFold(ctx);
+  if (!fold) return;
   if (fold.pending) projectionPending(ctx, fold.pending.proof, fold.pending.projected);
   runtime.preflight =
     fold.state?.phase === "planning" ? { ...fold.state, phase: "interrupted" } : fold.state;
@@ -1280,6 +1420,77 @@ export function preflightEvidence(
   };
 }
 
+function requestClosed(fold: PreflightFold, state: PreflightState, kind: RequestKind): boolean {
+  const request = nativeRequest(state, kind === "start");
+  if (!request) return true;
+  const seen = fold.requests.get(request.id);
+  return (
+    seen !== undefined &&
+    !seen.retired &&
+    seen.owner === state.preflightId &&
+    seen.kind === kind &&
+    same(seen.request, request) &&
+    Boolean(seen.controlEntryId)
+  );
+}
+/** Reuse only the exact still-open owner request; finalized/revoked identity is never a new question. */
+export function canReusePreflightRequest(
+  ctx: ExtensionContext,
+  state: PreflightState,
+  kind: RequestKind,
+): boolean {
+  const request = nativeRequest(state, kind === "start");
+  if (!request) return false;
+  const fold = readPreflightFold(ctx);
+  const seen = fold?.requests.get(request.id);
+  if (!fold?.state || fold.pending || !same(fold.state, state) || !seen)
+    throw new Error(
+      "Current preflight request cannot be reused before its owner projection is verified",
+    );
+  return (
+    !seen.legacyStartBridge && !seen.revokedByControlEntryId && !requestClosed(fold, state, kind)
+  );
+}
+/** Read-only owner observation; old approval is not a response to the current request. */
+export function currentPreflightRequestIssue(
+  ctx: ExtensionContext,
+  state: PreflightState,
+): string | undefined {
+  if (state.version !== 2 || (!state.permissionRequest && !state.startRequest)) return undefined;
+  try {
+    const fold = readPreflightFold(ctx);
+    if (!fold?.state || !same(fold.state, state))
+      return "Current preflight request projection is inconsistent; inspect its original owner";
+    if (fold.pending) return "Confirmed preflight response awaits its original owner projection";
+    return requestClosed(fold, state, "permission") && requestClosed(fold, state, "start")
+      ? undefined
+      : "Current preflight request is unanswered or lacks a proven final response; permission revocation does not answer it. Resolve it with its original owner before stop/archive";
+  } catch {
+    return "Current preflight request journal cannot be verified; inspect before stop/archive";
+  }
+}
+
+/** Ending an unstarted goal preserves closed grants; it never dismisses a live request. */
+export function unstartedPreflightStopIssue(
+  ctx: ExtensionContext,
+  state: PreflightState,
+): string | undefined {
+  if (state.started || (state.version === 2 && state.startRequest && state.phase !== "revoked"))
+    return "A real first-start request/outcome remains with its original owner";
+  const requestIssue = currentPreflightRequestIssue(ctx, state);
+  if (requestIssue) return requestIssue;
+  if (state.phase === "approved") return approvalIssue(ctx, state);
+  if (state.phase === "revoked") return undefined;
+  const authority = [
+    state.proposal,
+    state.approval,
+    state.version === 2 && state.permissionRequest,
+  ];
+  return authority.some(Boolean)
+    ? "Real preflight proposal/authorization work remains with its original owner"
+    : undefined;
+}
+
 export function preflightTaskIssue(
   ctx: ExtensionContext,
   binding?: PreflightBinding,
@@ -1287,6 +1498,15 @@ export function preflightTaskIssue(
   if (binding) return preflightAuthorizationIssue(ctx, binding);
   const state = currentRuntime().preflight;
   if (!state || state.sessionId !== ctx.sessionManager.getSessionId()) return undefined;
+  const current = currentRuntime().goal?.current;
+  if (
+    current?.phase === "stopped" &&
+    current.disposition === "closed-unstarted" &&
+    current.supervisor === null
+  )
+    return state.preflightId === current.planning.preflightId && !state.started
+      ? undefined
+      : "Stopped unstarted GoalRun has an inconsistent preflight projection";
   // Stopping supervision does not detach the retained execution board from its grant.
   if (state.started) {
     if (!state.planId || !state.planDigest) return "Preflight startup association is incomplete";

@@ -8,6 +8,7 @@ import type {
 import { Type, type Static } from "typebox";
 import { Check } from "typebox/value";
 import type { V2Archive, V2Cursor } from "./receipt-v2";
+import { supervisorPayload } from "./goal-records";
 
 const text = (maxLength: number) => Type.String({ minLength: 1, maxLength });
 const natural = Type.Integer({ minimum: 0, maximum: Number.MAX_SAFE_INTEGER });
@@ -229,13 +230,14 @@ export class ReceiptStore {
     }
     this.verifiedLeaf = leaf;
   }
-  appendCheckpoint(customType: string, value: unknown): void {
+  appendCheckpoint(customType: string, value: unknown): string {
     this.syncBranch();
     const id = this.appendVisible(customType, value);
     if (this.legacyView && this.v2Base) {
       this.v2Base = { ...this.v2Base, entryId: id, digest: digest(value) };
       this.meta.legacyBase = { entryId: id, digest: digest(value), version: 2 };
     }
+    return id;
   }
   private appendVisible(customType: string, value: unknown): string {
     if (!this.pi) return this.fail("Read-only receipt inspection cannot append");
@@ -664,6 +666,24 @@ export class ReceiptStore {
     if (digest(this.checkpoint()) !== digest(meta) || data.epoch !== this.epoch)
       this.fail("Receipt checkpoint does not match its ledger head/epoch/pending captures");
   }
+  private goalCheckpoint(
+    value: unknown,
+    goalId: string,
+  ): { epoch?: number; receiptLedger?: ReceiptLedger } | undefined {
+    const payload = supervisorPayload(value);
+    if (!payload || typeof payload !== "object") return undefined;
+    const data = payload as {
+      version?: number;
+      sessionId?: string;
+      epoch?: number;
+      receiptLedger?: ReceiptLedger;
+    };
+    return data.version === 3 &&
+      data.sessionId === this.sessionId &&
+      data.receiptLedger?.goalId === goalId
+      ? data
+      : undefined;
+  }
   static restore(
     pi: ExtensionAPI | undefined,
     ctx: ExtensionContext,
@@ -685,20 +705,11 @@ export class ReceiptStore {
         if (!started) store.fail("Receipt ledger has no goal checkpoint");
         store.apply(record, entry.id);
       } else if (entry.customType === supervisorEntry) {
-        const data = entry.data as {
-          version?: number;
-          sessionId?: string;
-          epoch?: number;
-          receiptLedger?: ReceiptLedger;
-        };
-        if (
-          data.version !== 3 ||
-          data.sessionId !== store.sessionId ||
-          data.receiptLedger?.goalId !== metadata.goalId
-        )
-          continue;
-        store.restoreCheckpoint(data, available, started);
-        started = true;
+        const data = store.goalCheckpoint(entry.data, metadata.goalId);
+        if (data) {
+          store.restoreCheckpoint(data, available, started);
+          started = true;
+        }
       }
     }
     if (!started) store.fail("Missing receipt goal checkpoint");

@@ -6,6 +6,7 @@ import type { UiSummary } from "./ui-view";
 import { refreshUI } from "./state";
 import { hasActiveNativeQuestion } from "./human-ui";
 import { beginReadOnlyView } from "./ui-view-lifecycle";
+import { showGoalHistory } from "./goal-history-ui";
 import { phaseLabel } from "./formatting";
 import { flowFacts, nextFlowStep } from "./flow";
 import { currentRuntime } from "./runtime";
@@ -311,6 +312,9 @@ export async function showTaskList(
   let component: ReturnType<typeof createReadOnlyBoard> | undefined;
   let abort: (() => void) | undefined;
   let completed = false;
+  const navigation = { history: false };
+  const originalManager = ctx.sessionManager;
+  const originalSession = originalManager.getSessionId();
   try {
     if (!token) return;
     const manager = ctx.sessionManager;
@@ -334,6 +338,9 @@ export async function showTaskList(
             tui.requestRender();
           },
           rows: () => Math.max(0, tui.terminal.rows - 10),
+          openHistory: () => {
+            navigation.history = true;
+          },
         },
         finish,
       );
@@ -358,6 +365,12 @@ export async function showTaskList(
     lease.finish();
     token?.release();
   }
+  if (
+    navigation.history &&
+    ctx.sessionManager === originalManager &&
+    originalManager.getSessionId() === originalSession
+  )
+    await showGoalHistory(ctx);
 }
 
 async function showLegacyTaskList(

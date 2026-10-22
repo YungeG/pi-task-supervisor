@@ -41,6 +41,17 @@ import {
   type SupervisorHoldCause,
 } from "./supervisor";
 
+import { restoreGoalLifecycle, settleGoalPlanning } from "./goal-lifecycle";
+import { GoalToolLeases } from "./goal-tool-leases";
+import {
+  appendOwnerSnapshot,
+  invalidateGoalCallbacks,
+  goalExecutionIssue,
+  goalControlIssue,
+  goalScopeContext,
+  goalLease,
+} from "./goal-scope";
+
 type ConfigLoader = () => Promise<ContinuousTasksConfig>;
 type Control = {
   cancel: () => void;
@@ -108,7 +119,7 @@ function consumePhasePrompt(pi: ExtensionAPI): string {
   updated.pendingPhasePrompt = undefined;
   updated.generation++;
   setBoard(updated);
-  pi.appendEntry("continuous-tasks:snapshot", updated);
+  appendOwnerSnapshot(pi, "continuous-tasks:snapshot", updated);
   return prompt;
 }
 
@@ -246,11 +257,13 @@ function makeController(pi: ExtensionAPI, configLoader: ConfigLoader, advisor?: 
     event: AgentBeforeSettleEvent,
     ctx: ExtensionContext,
   ): Promise<BoundaryResult | undefined> => {
-    if (!isSessionScopeEnabled() || inFlight) return undefined;
+    if (!isSessionScopeEnabled() || inFlight || goalExecutionIssue(ctx)) return undefined;
     if (!boundaryAllowed(pi, event, ctx)) return undefined;
     const controller = new AbortController();
     inFlight = controller;
     const ticket = serial;
+    const lease = goalLease();
+    const current = () => ticket === serial && goalLease() === lease && !goalExecutionIssue(ctx);
     const signal = reviewSignal(controller, ctx);
     try {
       const state = supervisorState();
@@ -258,17 +271,17 @@ function makeController(pi: ExtensionAPI, configLoader: ConfigLoader, advisor?: 
       if (state && state.status !== "stopped") {
         if (
           claimedExecutionRefs(getBoardRef()).length &&
-          (await waitForExecutions(pi, ctx, signal, () => ticket === serial))
+          (await waitForExecutions(pi, ctx, signal, current))
         ) {
           clearTimeout(waitTimer);
           waitTimer = executionWaitTimer(pi, ctx);
           return undefined;
         }
-        return await supervisedBoundary(pi, ctx, signal, () => ticket === serial, advisor);
+        return await supervisedBoundary(pi, ctx, signal, current, advisor);
       }
       return await baseBoundary(ticket, ctx);
     } catch (error) {
-      if (ticket === serial) holdBoundaryError(pi, ctx, error);
+      if (current()) holdBoundaryError(pi, ctx, error);
       return undefined;
     } finally {
       if (inFlight === controller) inFlight = undefined;
@@ -301,58 +314,77 @@ function clearOwnedUI(ctx: ExtensionContext): void {
   }
 }
 
-function registerSessionHandlers(pi: ExtensionAPI, control: Control): void {
-  const restore = async (ctx: ExtensionContext) => {
-    control.cancel();
-    invalidateTaskWidget(ctx);
-    await closeReadOnlyView(ctx);
-    let board = createEmptyBoard();
+async function restoreSession(
+  pi: ExtensionAPI,
+  control: Control,
+  ctx: ExtensionContext,
+): Promise<void> {
+  control.cancel();
+  invalidateGoalCallbacks();
+  const runtime = currentRuntime();
+  const epoch = runtime.goalEpoch;
+  const manager = ctx.sessionManager;
+  const sessionId = manager.getSessionId();
+  invalidateTaskWidget(ctx);
+  await closeReadOnlyView(ctx);
+  if (
+    currentRuntime() !== runtime ||
+    runtime.goalEpoch !== epoch ||
+    ctx.sessionManager !== manager ||
+    manager.getSessionId() !== sessionId
+  )
+    return;
+  runtime.goal = undefined;
+  let board = createEmptyBoard();
+  setBoard(board);
+  currentRuntime().journalFault = undefined;
+  currentRuntime().preflightRepair = undefined;
+  currentRuntime().preflight = undefined;
+  currentRuntime().boardRepair = undefined;
+  currentRuntime().boardHumanContext = undefined;
+  try {
+    inspectRestorableSession(ctx);
+    restoreGoalLifecycle(pi, ctx);
+    board = restoreBoardHuman(ctx, reconstructState(ctx));
+    restoreSessionScope(pi, ctx);
     setBoard(board);
-    currentRuntime().journalFault = undefined;
-    currentRuntime().preflightRepair = undefined;
-    currentRuntime().preflight = undefined;
-    currentRuntime().boardRepair = undefined;
-    currentRuntime().boardHumanContext = undefined;
-    try {
-      inspectRestorableSession(ctx);
-      board = restoreBoardHuman(ctx, reconstructState(ctx));
-      restoreSessionScope(pi, ctx);
-      setBoard(board);
-      restorePreflight(ctx);
-      restoreSupervisor(pi, ctx);
-      updateUI(ctx, board);
-      updateActiveTools(pi, isSessionScopeEnabled());
-    } catch (error) {
-      // Do not reinterpret malformed durable state as an inactive, safe-to-continue supervisor.
-      const diagnostic = formatJournalReadError(error);
-      const reason = diagnostic
-        ? `Journal restore blocked: ${diagnostic}; inspect session state before recovery`
-        : error instanceof Error && /preflight/i.test(error.message)
-          ? "Invalid preflight journal; inspect session state before recovery"
-          : "Invalid supervisor journal; inspect session state before recovery";
-      currentRuntime().journalFault =
-        board.tasks.length === 0
-          ? `${reason}; task view not restored, counts unknown (saved records are not deleted)`
-          : reason;
-      // Restore only a held view after another owner's failure; no writes or replay.
-      restoreFaultedSupervisor(pi, ctx);
-      setSessionScopeEnabled(false);
-      updateActiveTools(pi, false);
-      updateUI(ctx, board);
-      const faultStatus = `Supervisor: fault (${diagnostic ?? "journal restore"})`;
-      if (ctx.hasUI && ctx.mode !== "tui") ctx.ui.setStatus("continuous-supervisor", faultStatus);
-      pi.sendMessage(
-        {
-          customType: "continuous-tasks:notice",
-          content: `${currentRuntime().journalFault}; task continuation disabled.`,
-          display: true,
-        },
-        { triggerTurn: false },
-      );
-    }
-  };
+    restorePreflight(ctx);
+    restoreSupervisor(pi, ctx);
+    updateUI(ctx, board);
+    updateActiveTools(pi, isSessionScopeEnabled());
+  } catch (error) {
+    // Do not reinterpret malformed durable state as an inactive, safe-to-continue supervisor.
+    const diagnostic = formatJournalReadError(error);
+    const reason = diagnostic
+      ? `Journal restore blocked: ${diagnostic}; inspect session journal state before recovery`
+      : error instanceof Error && /preflight/i.test(error.message)
+        ? "Invalid preflight journal; inspect session state before recovery"
+        : "Invalid supervisor journal; inspect session state before recovery";
+    currentRuntime().journalFault =
+      board.tasks.length === 0
+        ? `${reason}; task view not restored, counts unknown (saved records are not deleted)`
+        : reason;
+    // Restore only a held view after another owner's failure; no writes or replay.
+    restoreFaultedSupervisor(pi, ctx);
+    setSessionScopeEnabled(false);
+    updateActiveTools(pi, false);
+    updateUI(ctx, board);
+    const faultStatus = `Supervisor: fault (${diagnostic ?? "journal restore"})`;
+    if (ctx.hasUI && ctx.mode !== "tui") ctx.ui.setStatus("continuous-supervisor", faultStatus);
+    pi.sendMessage(
+      {
+        customType: "continuous-tasks:notice",
+        content: `${currentRuntime().journalFault}; task continuation disabled.`,
+        display: true,
+      },
+      { triggerTurn: false },
+    );
+  }
+}
+
+function registerSessionHandlers(pi: ExtensionAPI, control: Control): void {
   const restoreCache = async (ctx: ExtensionContext) => {
-    await restore(ctx);
+    await restoreSession(pi, control, ctx);
     const store = currentRuntime().receiptStore;
     const config = await loadConfig();
     if (store && currentRuntime().receiptStore === store && config.receiptCache)
@@ -367,10 +399,12 @@ function registerSessionHandlers(pi: ExtensionAPI, control: Control): void {
   });
   pi.on("session_shutdown", async (_event, ctx) => {
     control.cancel();
+    invalidateGoalCallbacks();
+    const epoch = currentRuntime().goalEpoch;
     setSessionScopeEnabled(false);
     invalidateTaskWidget(ctx);
     await closeReadOnlyView(ctx);
-    clearOwnedUI(ctx);
+    if (currentRuntime().goalEpoch === epoch) clearOwnedUI(ctx);
   });
   pi.on("session_before_compact", (_event, ctx) => {
     control.cancel();
@@ -433,6 +467,11 @@ function supervisedWriteLimitError(
 }
 
 function submissionGate(ctx: ExtensionContext): string | undefined {
+  const goalIssue = goalControlIssue(ctx);
+  if (goalIssue) return goalIssue;
+  const current = currentRuntime().goal?.current;
+  if (current && current.phase !== "planning")
+    return "Current GoalRun needs an explicit live planning attempt before another proposal";
   const state = currentRuntime().preflight;
   return (
     currentRuntime().journalFault ??
@@ -474,14 +513,36 @@ function abandonsRequiredTasks(toolName: string, input: Record<string, unknown>)
   );
 }
 
+function scopedDecisionReplacement(
+  toolName: string,
+  input: Record<string, unknown>,
+  ctx: ExtensionContext,
+): boolean {
+  if (!decisionReplacementAllowed(toolName, input) || goalControlIssue(ctx)) return false;
+  const phase = currentRuntime().goal?.current?.phase;
+  return phase === undefined || !["stopped", "completed"].includes(phase);
+}
+function lifecycleToolRule(
+  pi: ExtensionAPI,
+  name: string,
+  input: Record<string, unknown>,
+  ctx: ExtensionContext,
+): { handled: boolean; issue?: string } {
+  if (name === "submit_preflight") return { handled: true, issue: submissionGate(ctx) };
+  const issue = goalExecutionIssue(ctx);
+  if (!TASK_TOOL_NAMES.includes(name))
+    return { handled: true, issue: issue && !goalReadOnlyTool(pi, name) ? issue : undefined };
+  if (scopedDecisionReplacement(name, input, ctx)) return { handled: true };
+  return issue ? { handled: true, issue } : { handled: false };
+}
 function taskGate(
+  pi: ExtensionAPI,
   toolName: string,
   input: Record<string, unknown>,
   ctx: ExtensionContext,
 ): string | undefined {
-  if (toolName === "submit_preflight") return submissionGate(ctx);
-  if (!TASK_TOOL_NAMES.includes(toolName)) return undefined;
-  if (decisionReplacementAllowed(toolName, input)) return undefined;
+  const rule = lifecycleToolRule(pi, toolName, input, ctx);
+  if (rule.handled) return rule.issue;
   const issue = taskControlIssue(ctx);
   if (issue) return issue;
   const state = supervisorState();
@@ -500,26 +561,77 @@ function taskGate(
   return supervisedWriteLimitError(toolName, input);
 }
 
-function planningMessage(preflight: string | undefined) {
+function goalReadOnlyTool(pi: ExtensionAPI, name: string): boolean {
+  return (
+    ["read", "grep", "find", "ls"].includes(name) ||
+    pi.getAllTools().find((tool) => tool.name === name)?.annotations?.readOnlyHint === true
+  );
+}
+function planningMessage(preflight: string | undefined, ctx: ExtensionContext) {
   if (!isSessionScopeEnabled() || !preflight || currentRuntime().preflight?.started)
     return undefined;
   return {
     message: {
       customType: "continuous-tasks:preflight-context",
-      content: preflight,
+      content: goalScopeContext(ctx) ? `${goalScopeContext(ctx)}\n${preflight}` : preflight,
       display: false,
     },
   };
 }
 
+function beforePlanningContext(
+  ctx: ExtensionContext,
+  preflight: string | undefined,
+): { handled: boolean; value?: ReturnType<typeof planningMessage> } {
+  if (currentRuntime().journalFault) return { handled: true };
+  const issue = goalExecutionIssue(ctx);
+  const current = currentRuntime().goal?.current;
+  if (goalControlIssue(ctx) || (issue && current?.phase !== "planning"))
+    return {
+      handled: true,
+      value: {
+        message: {
+          customType: "continuous-tasks:goal-hold",
+          content: `${goalScopeContext(ctx)}\n${issue}\nRead-only diagnosis only; do not mutate tasks, submit stale proposals, approve or start.`,
+          display: false,
+        },
+      },
+    };
+  const value = planningMessage(preflight, ctx);
+  return { handled: Boolean(value), value };
+}
+function decisionWait(
+  board: ReturnType<typeof getBoardRef>,
+  state: ReturnType<typeof supervisorState>,
+): boolean {
+  const decision = board.decision;
+  return (
+    board.workflowStatus === "waiting_for_decision" &&
+    decision !== undefined &&
+    board.tasks.some((task) => task.id === decision.taskId) &&
+    state?.status === "active" &&
+    !state.pending
+  );
+}
 function registerWorkHandlers(pi: ExtensionAPI, control: Control): void {
+  const runs: string[] = [];
+  const runScope = (ctx: ExtensionContext) =>
+    JSON.stringify([
+      goalLease(),
+      ctx.sessionManager.getSessionId(),
+      currentRuntime().goal?.current?.supervisor === null ? "planning" : "execution",
+    ]);
+  pi.on("agent_start", (_event, ctx) => {
+    const key = runScope(ctx);
+    if (runs.at(-1) !== key) runs.push(key);
+    if (runs.length > 128) runs.shift();
+  });
   pi.on("before_agent_start", (_event, ctx) => {
     const board = getBoardRef();
     const state = supervisorState();
     const preflight = preflightContext(ctx);
-    if (currentRuntime().journalFault) return undefined;
-    const planning = planningMessage(preflight);
-    if (planning) return planning;
+    const leading = beforePlanningContext(ctx, preflight);
+    if (leading.handled) return leading.value;
     if (
       !isSessionScopeEnabled() ||
       (state && !["active", "stopped"].includes(state.status)) ||
@@ -538,7 +650,11 @@ function registerWorkHandlers(pi: ExtensionAPI, control: Control): void {
   // Native aborts during an awaited boundary are reported only after it returns.
   // This notification reconciles state; it never schedules another turn.
   pi.on("agent_settled", (event, ctx) => {
+    const started = runs.shift();
+    if (started ? started !== runScope(ctx) : Boolean(currentRuntime().goal?.current)) return;
     if (!isSessionScopeEnabled()) return;
+    settleGoalPlanning(pi, ctx);
+    if (goalExecutionIssue(ctx)) return;
     if (event.aborted) {
       control.cancel();
       pauseBoard(
@@ -550,14 +666,8 @@ function registerWorkHandlers(pi: ExtensionAPI, control: Control): void {
     } else {
       const board = getBoardRef();
       const state = supervisorState();
-      const decision = board.decision;
       const waitingForDecision =
-        board.workflowStatus === "waiting_for_decision" &&
-        decision !== undefined &&
-        board.tasks.some((task) => task.id === decision.taskId) &&
-        state?.status === "active" &&
-        !state.pending &&
-        state.sessionId === ctx.sessionManager.getSessionId();
+        decisionWait(board, state) && state?.sessionId === ctx.sessionManager.getSessionId();
       if (
         ["active", "reviewing"].includes(state?.status ?? "") &&
         !waitingForDecision &&
@@ -575,14 +685,16 @@ function registerWorkHandlers(pi: ExtensionAPI, control: Control): void {
 }
 
 function registerReceiptHandlers(pi: ExtensionAPI): void {
-  const blockedCaptures = new Set<string>();
+  const leases = new GoalToolLeases();
   pi.on("tool_call", (event, ctx) => {
-    const reason = taskGate(event.toolName, event.input, ctx);
+    const reason =
+      leases.begin(event.toolCallId, ctx, event.toolName) ??
+      taskGate(pi, event.toolName, event.input, ctx);
     if (reason) return { block: true, reason };
     try {
       prepareToolCapture(pi, event);
+      leases.allow(event.toolCallId);
     } catch (error) {
-      blockedCaptures.add(event.toolCallId);
       const reason = error instanceof Error ? error.message : "Receipt capture unavailable";
       const store = currentRuntime().receiptStore;
       if (store && !store.healthy) currentRuntime().journalFault = reason;
@@ -597,7 +709,24 @@ function registerReceiptHandlers(pi: ExtensionAPI): void {
     return undefined;
   });
   pi.on("tool_result", (event, ctx) => {
-    if (blockedCaptures.delete(event.toolCallId) && event.isError) return undefined;
+    const scope = leases.result(event.toolCallId, ctx, event.toolName);
+    if (scope === "historical")
+      return {
+        content: [
+          ...event.content,
+          {
+            type: "text" as const,
+            text: "Historical goal/planning-attempt result: not current evidence, approval, progress or a reason to replay this tool.",
+          },
+        ],
+        ...(event.structuredContent === undefined
+          ? {}
+          : { structuredContent: event.structuredContent }),
+      };
+    if (scope === "blocked" && event.isError) return undefined;
+    if (scope === "blocked")
+      currentRuntime().journalFault ??=
+        "Successful result after tool admission was blocked; inspect actual execution before continuing";
     const previousFault = currentRuntime().journalFault;
     try {
       const receipt = observeTool(pi, event);

@@ -34,6 +34,16 @@ import {
 export { digest, redact } from "./receipt-store";
 import { V2CursorSchema, V2ReceiptHistory, V2_RECEIPTS_ENTRY, type V2Cursor } from "./receipt-v2";
 
+import {
+  currentGoalScope,
+  goalLease,
+  selectedGoalEntries,
+  scopedSupervisorCheckpoint,
+  observeScopedSupervisorCheckpoint,
+} from "./goal-scope";
+import { isGoalRecord } from "./goal-records";
+import { readGoalJournal } from "./goal-journal";
+
 export const SUPERVISOR_ENTRY = "continuous-tasks:supervisor";
 
 export function supervisorPlanError(taskCount: number): string | undefined {
@@ -119,7 +129,7 @@ function supervisorCheckpointSchema() {
     receiptLedger: ReceiptLedgerSchema,
   });
 }
-export type SupervisorState = Static<ReturnType<typeof supervisorSchema>>;
+export type SupervisorState = Static<ReturnType<typeof supervisorSchema>> & { goalRunId?: string };
 export type SupervisorHoldCause = NonNullable<SupervisorState["holdCause"]>;
 const AdviceSchema = Type.Object(
   {
@@ -154,10 +164,19 @@ function goalIdentity(state: SupervisorState): string {
     binding?.planDigest,
   ]);
 }
+export function receiptScopeIdentity(state: SupervisorState): string {
+  return state.goalRunId
+    ? digest(["goal-lifecycle-v1", state.goalRunId, goalIdentity(state)])
+    : goalIdentity(state);
+}
 export function saveSupervisor(pi: ExtensionAPI, state = supervisorState()): void {
   if (!state) return;
   const store = currentRuntime().receiptStore;
+  const scope = currentGoalScope();
+  if (scope && state.goalRunId !== scope.goalRunId)
+    throw new Error("Supervisor belongs to a different GoalRun");
   if (!store) {
+    if (scope) throw new Error("Scoped Supervisor receipt ledger is unavailable");
     pi.appendEntry(SUPERVISOR_ENTRY, structuredClone(state));
     return;
   }
@@ -166,15 +185,19 @@ export function saveSupervisor(pi: ExtensionAPI, state = supervisorState()): voi
     !owner ||
     state.sessionId !== owner.sessionId ||
     state.goal !== owner.goal ||
-    goalIdentity(state) !== currentRuntime().receiptIdentity ||
+    receiptScopeIdentity(state) !== currentRuntime().receiptIdentity ||
     state.epoch !== store.epoch
   )
     throw new Error("Supervisor checkpoint changed receipt identity/version");
-  const value =
+  const plain = structuredClone(state);
+  delete plain.goalRunId;
+  const payload =
     store.format === 2
-      ? { ...structuredClone(state), version: 2, receipts: [], receiptJournal: store.v2Cursor }
-      : { ...structuredClone(state), version: 3, receipts: [], receiptLedger: store.checkpoint() };
-  store.appendCheckpoint(SUPERVISOR_ENTRY, value);
+      ? { ...plain, version: 2, receipts: [], receiptJournal: store.v2Cursor }
+      : { ...plain, version: 3, receipts: [], receiptLedger: store.checkpoint() };
+  const value = scopedSupervisorCheckpoint(payload, state.status);
+  const id = store.appendCheckpoint(SUPERVISOR_ENTRY, value);
+  observeScopedSupervisorCheckpoint(value, id);
 }
 
 function updateSupervisorUI(ctx: ExtensionContext): void {
@@ -238,6 +261,29 @@ export interface SupervisorStartRecord {
 export function validSupervisorState(value: unknown): value is SupervisorState {
   return Check(supervisorSchema(), value);
 }
+function validateScopedStart(
+  ctx: ExtensionContext,
+  goal: string,
+  nativeStart: NativePreflightStartResponse | undefined,
+): void {
+  const runtime = currentRuntime();
+  const current = runtime.goal?.current;
+  if (!current) return;
+  if (
+    runtime.goal?.pending ||
+    runtime.goal?.blocked ||
+    current.supervisor !== null ||
+    !["planning", "planning-interrupted"].includes(current.phase)
+  )
+    throw new Error("Current GoalRun is not ready for its first execution start");
+  if (
+    !nativeStart ||
+    current.seed.goal !== goal ||
+    current.seed.model.provider !== ctx.model?.provider ||
+    current.seed.model.id !== ctx.model.id
+  )
+    throw new Error("A scoped goal requires its own exact native first-start and pinned model");
+}
 export function startSupervisor(
   pi: ExtensionAPI,
   ctx: ExtensionContext,
@@ -246,6 +292,7 @@ export function startSupervisor(
 ): SupervisorStartRecord {
   if (!isSafeBoundedText(goal, 4000) || !ctx.model)
     throw new Error("A bounded non-secret goal and active model are required");
+  validateScopedStart(ctx, goal, nativeStart);
   const planError = supervisorPlanError(getBoardRef().tasks.length);
   if (planError) throw new Error(planError);
   const existing = supervisorState();
@@ -262,6 +309,7 @@ export function startSupervisor(
   const preflightBinding = preflightStartBinding(ctx, goal, undefined, nativeStart);
   currentRuntime().supervisor = {
     ...(preflightBinding ? { preflightBinding } : {}),
+    ...(currentGoalScope() ? { goalRunId: currentGoalScope()?.goalRunId } : {}),
     version: 1,
     sessionId: ctx.sessionManager.getSessionId(),
     goal,
@@ -277,8 +325,15 @@ export function startSupervisor(
     tokens: 0,
     cost: 0,
   };
-  currentRuntime().receiptStore = new ReceiptStore(pi, ctx, ctx.sessionManager.getSessionId());
-  currentRuntime().receiptIdentity = goalIdentity(currentRuntime().supervisor as SupervisorState);
+  currentRuntime().receiptStore = new ReceiptStore(
+    pi,
+    ctx,
+    ctx.sessionManager.getSessionId(),
+    currentGoalScope()?.goalRunId,
+  );
+  currentRuntime().receiptIdentity = receiptScopeIdentity(
+    currentRuntime().supervisor as SupervisorState,
+  );
   saveSupervisor(pi);
   const entryId = ctx.sessionManager.getLeafId();
   if (!entryId) throw new Error("Supervisor startup has no entry identity");
@@ -307,11 +362,13 @@ function restoreBoundPreflight(
   holdSupervisor(pi, ctx, "paused", issue, "authorization_revoked");
 }
 
-function decodeSupervisorEntry(data: unknown): {
+export function decodeSupervisorEntry(data: unknown): {
   state: SupervisorState;
   ledger?: Static<typeof ReceiptLedgerSchema>;
   v2?: V2Cursor;
 } {
+  if (data && typeof data === "object" && Object.hasOwn(data, "goalRunId"))
+    throw new Error("Legacy Supervisor wire cannot introduce a GoalRun identity");
   if (Check(supervisorCheckpointSchema(), data)) {
     const { receiptLedger, ...metadata } = data;
     return { state: { ...metadata, version: 1 }, ledger: receiptLedger };
@@ -329,7 +386,7 @@ function registerReceiptGoal(
   state: SupervisorState,
   goalId: string,
 ): void {
-  const identity = goalIdentity(state);
+  const identity = receiptScopeIdentity(state);
   const previous = goals.get(goalId);
   if (previous !== undefined && previous !== identity)
     throw new Error("Receipt goal scope changed across checkpoints");
@@ -362,43 +419,96 @@ function validateLegacyScope(
   if (base && (scopes.get(base.entryId) !== goalIdentity(state) || base.entryId !== latest))
     throw new Error("Legacy receipt goal scope does not match its earlier checkpoint");
 }
-function readSupervisorHistory(ctx: ExtensionContext) {
-  let state: SupervisorState | undefined;
-  let ledger: Static<typeof ReceiptLedgerSchema> | undefined;
-  const goals = new Map<string, string>();
-  const legacyScopes = new Map<string, string>();
-  const v2 = new V2ReceiptHistory(ctx);
-  let legacyV2Entry: string | undefined;
-  let lastLegacyEntry: string | undefined;
-  for (const entry of ctx.sessionManager.getBranch()) {
-    if (consumeReceiptHistory(ctx, entry, goals, v2)) continue;
-    if (entry.type !== "custom" || entry.customType !== SUPERVISOR_ENTRY) continue;
-    const next = decodeSupervisorEntry(entry.data);
-    if (next.state.sessionId !== ctx.sessionManager.getSessionId()) continue;
-    if (next.ledger) {
-      ledger = next.ledger;
-      validateLegacyScope(next.state, ledger, legacyScopes, lastLegacyEntry);
-      registerReceiptGoal(goals, next.state, ledger.goalId);
-    } else {
-      if (ledger || (legacyV2Entry && !next.v2))
-        throw new Error("Receipt checkpoint cannot downgrade to an older format");
-      if (next.v2) {
-        v2.acknowledge(entry.id, next.v2, next.state.epoch, goalIdentity(next.state));
-        legacyV2Entry = entry.id;
-      }
-      legacyScopes.set(entry.id, goalIdentity(next.state));
-      lastLegacyEntry = entry.id;
+interface SupervisorHistoryFold {
+  state?: SupervisorState;
+  ledger?: Static<typeof ReceiptLedgerSchema>;
+  goals: Map<string, string>;
+  legacyScopes: Map<string, string>;
+  v2: V2ReceiptHistory;
+  legacyV2Entry?: string;
+  lastLegacyEntry?: string;
+  lifecycleSeen: boolean;
+}
+function historyPayload(
+  fold: SupervisorHistoryFold,
+  raw: unknown,
+): ReturnType<typeof decodeSupervisorEntry> | undefined {
+  if (raw && typeof raw === "object" && "version" in raw && raw.version === 5) {
+    fold.lifecycleSeen = true;
+    if (!isGoalRecord(raw)) throw new Error("Invalid lifecycle Supervisor record");
+    if (raw.kind === "transition-control") return undefined;
+    if (raw.kind === "transition-committed" || raw.supervisor === null) {
+      fold.state = undefined;
+      fold.ledger = undefined;
+      return undefined;
     }
-    state = next.state;
+    const next = decodeSupervisorEntry(raw.supervisor);
+    next.state.goalRunId = raw.scope.goalRunId;
+    return next;
   }
-  v2.finish();
+  if (fold.lifecycleSeen)
+    throw new Error("Supervisor checkpoint cannot downgrade after lifecycle fence");
+  return decodeSupervisorEntry(raw);
+}
+function observeSupervisorCheckpoint(
+  fold: SupervisorHistoryFold,
+  entry: SessionEntry,
+  sessionId: string,
+): void {
+  if (entry.type !== "custom") return;
+  const next = historyPayload(fold, entry.data);
+  if (!next || next.state.sessionId !== sessionId) return;
+  if (next.ledger) {
+    fold.ledger = next.ledger;
+    validateLegacyScope(next.state, next.ledger, fold.legacyScopes, fold.lastLegacyEntry);
+    registerReceiptGoal(fold.goals, next.state, next.ledger.goalId);
+  } else {
+    if (fold.ledger || (fold.legacyV2Entry && !next.v2))
+      throw new Error("Receipt checkpoint cannot downgrade to an older format");
+    if (next.v2) {
+      fold.v2.acknowledge(entry.id, next.v2, next.state.epoch, goalIdentity(next.state));
+      fold.legacyV2Entry = entry.id;
+    }
+    fold.legacyScopes.set(entry.id, goalIdentity(next.state));
+    fold.lastLegacyEntry = entry.id;
+  }
+  fold.state = next.state;
+}
+function readSupervisorHistory(ctx: ExtensionContext) {
+  const fold: SupervisorHistoryFold = {
+    goals: new Map(),
+    legacyScopes: new Map(),
+    v2: new V2ReceiptHistory(ctx),
+    lifecycleSeen: false,
+  };
+  const branch = ctx.sessionManager.getBranch();
+  if (
+    branch.some(
+      (e) =>
+        e.type === "custom" &&
+        e.customType === SUPERVISOR_ENTRY &&
+        e.data &&
+        typeof e.data === "object" &&
+        "version" in e.data &&
+        e.data.version === 5,
+    )
+  )
+    readGoalJournal(ctx);
+  for (const entry of branch) {
+    if (consumeReceiptHistory(ctx, entry, fold.goals, fold.v2)) continue;
+    if (entry.type === "custom" && entry.customType === SUPERVISOR_ENTRY)
+      observeSupervisorCheckpoint(fold, entry, ctx.sessionManager.getSessionId());
+  }
+  fold.v2.finish();
+  const { state, ledger, legacyV2Entry, v2 } = fold;
   return {
     state: state ? structuredClone(state) : undefined,
     ledger,
-    legacyV2: !ledger && legacyV2Entry ? v2.archive(legacyV2Entry) : undefined,
+    legacyV2: state && !ledger && legacyV2Entry ? v2.archive(legacyV2Entry) : undefined,
     resolveV2: (entryId: string, expected: string) => v2.archive(entryId, expected),
   };
 }
+
 function startupContext(ctx: ExtensionContext, entryId: string): ExtensionContext {
   const branch = ctx.sessionManager.getBranch();
   const index = branch.findIndex((entry) => entry.id === entryId);
@@ -509,7 +619,7 @@ function restoreReceiptViews(
       retainLegacyGap(pi, ctx, state);
     return;
   }
-  currentRuntime().receiptIdentity = goalIdentity(state);
+  currentRuntime().receiptIdentity = receiptScopeIdentity(state);
   syncReceiptState(state);
 }
 function restoreJournalHold(ctx: ExtensionContext, state: SupervisorState | undefined): boolean {
@@ -578,7 +688,7 @@ function receiptRecoveryStore(
   if (!anchor) throw new Error("Legacy receipt migration needs its exact branch checkpoint");
   const store = ReceiptStore.migrate(pi, ctx, state, anchor.id);
   currentRuntime().receiptStore = store;
-  currentRuntime().receiptIdentity = goalIdentity(state);
+  currentRuntime().receiptIdentity = receiptScopeIdentity(state);
   return store;
 }
 export function recoverSupervisor(pi: ExtensionAPI, ctx?: ExtensionContext): void {
@@ -863,8 +973,7 @@ export function evidencePacket(
 ): string {
   const referenced = new Set(state.bindings.flatMap((binding) => binding.refs));
   const receipts = observedReceipts(state, [...referenced], 30);
-  const recent = ctx.sessionManager
-    .getBranch()
+  const recent = selectedGoalEntries(ctx.sessionManager.getBranch())
     .slice(-16)
     .flatMap((entry) => {
       if (entry.type !== "message") return [];
@@ -891,6 +1000,12 @@ export function evidencePacket(
   for (const limit of [2000, 1000, 500, 250, 0]) {
     const packet = redactedJSON({
       goal: state.goal,
+      ...(currentGoalScope()
+        ? {
+            goalScope: currentGoalScope(),
+            planningAttemptId: currentRuntime().goal?.current?.planning.attemptId,
+          }
+        : {}),
       ...(preflight ? { preflight } : {}),
       board,
       receipts: receipts.map((receipt) =>
@@ -1079,6 +1194,15 @@ function applyAdvice(
   return result.advice;
 }
 
+function staleGoalReview(state: SupervisorState, signal: AbortSignal, lease: string): boolean {
+  return (
+    signal.aborted ||
+    goalLease() !== lease ||
+    supervisorState() !== state ||
+    supervisorState()?.status !== "reviewing"
+  );
+}
+
 export async function reviewSupervisor(
   pi: ExtensionAPI,
   ctx: ExtensionContext,
@@ -1108,14 +1232,14 @@ export async function reviewSupervisor(
   if (!prepareReview(pi, ctx, board, state)) return undefined;
   // Capture AFTER our review journal append; any later branch entry invalidates this judgment.
   const leaf = ctx.sessionManager.getLeafId();
+  const lease = goalLease();
   const result = await advisor(
     evidencePacket(ctx, board, state),
     ctx,
     structuredClone(state),
     signal,
   );
-  if (signal.aborted || supervisorState() !== state || supervisorState()?.status !== "reviewing")
-    return undefined;
+  if (staleGoalReview(state, signal, lease)) return undefined;
   if (getBoardRef() !== board || ctx.sessionManager.getLeafId() !== leaf)
     throw new Error(
       "Session context changed during review; stale advice discarded. Recover explicitly.",
