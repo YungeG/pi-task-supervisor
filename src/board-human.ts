@@ -8,6 +8,7 @@ import { CUSTOM_SNAPSHOT_TYPE } from "./types";
 import { cloneBoard, isValidSnapshotV2, isSafeBoundedText } from "./validation";
 import { readableBoardRequest, boardMaterial } from "./human-presentation";
 import { validDecisionSpec, validDecisionInformation } from "./decision-spec";
+import { ownerSnapshot, selectedGoalEntries, goalLogicalScope } from "./goal-scope";
 import { getBoardRef, setBoard, updateUI, reconstructState } from "./state";
 import { currentRuntime, type ProjectionRepairHint } from "./runtime";
 import {
@@ -43,7 +44,7 @@ export interface BoardHumanResult {
   projectionPending?: boolean;
 }
 export function decisionScope(decision: DecisionRecord): unknown {
-  return {
+  return goalLogicalScope({
     id: decision.id,
     taskId: decision.taskId,
     question: decision.question,
@@ -51,7 +52,7 @@ export function decisionScope(decision: DecisionRecord): unknown {
     spec: decision.spec,
     options: decision.options,
     supersedes: decision.supersedes,
-  };
+  });
 }
 export function canReplaceBoardDecision(
   board: Readonly<TaskBoardSnapshot>,
@@ -220,9 +221,9 @@ function verifiedProjection(proof: ConfirmedProof): {
   projected: TaskBoardSnapshot;
   confirmed: SavedBoardAnswer;
 } {
-  if (proof.base.customType !== CUSTOM_SNAPSHOT_TYPE || !isValidSnapshotV2(proof.base.data))
+  const base = ownerSnapshot(proof.base.data);
+  if (proof.base.customType !== CUSTOM_SNAPSHOT_TYPE || !isValidSnapshotV2(base))
     throw new Error("Invalid board projection base");
-  const base = proof.base.data;
   if (!base.decision || proof.frame.scopeDigest !== journalDigest(decisionScope(base.decision)))
     throw new Error("Board decision scope mismatch");
   const control = proof.control.data as Record<string, unknown>;
@@ -245,7 +246,9 @@ export function readBoardHumanPresentation(
   | { status: "unknown"; reason: string } {
   try {
     const persisted = inspectRestorableSession(ctx);
-    const branch = persisted?.branch ?? ctx.sessionManager.getBranch();
+    const branch = persisted
+      ? selectedGoalEntries(persisted.branch)
+      : selectedGoalEntries(ctx.sessionManager.getBranch());
     const controls = branch.filter(
       (node) =>
         node.type === "custom" &&
@@ -283,20 +286,18 @@ export function restoreBoardHuman(
   currentRuntime().boardHumanContext = undefined;
   currentRuntime().boardRepair = undefined;
   const persisted = inspectRestorableSession(ctx);
-  const controls = ctx.sessionManager
-    .getBranch()
-    .filter(
-      (entry) =>
-        entry.type === "custom" &&
-        entry.customType === "continuous-tasks:event" &&
-        entry.data &&
-        typeof entry.data === "object" &&
-        "humanInteraction" in entry.data,
-    );
+  const controls = selectedGoalEntries(ctx.sessionManager.getBranch()).filter(
+    (entry) =>
+      entry.type === "custom" &&
+      entry.customType === "continuous-tasks:event" &&
+      entry.data &&
+      typeof entry.data === "object" &&
+      "humanInteraction" in entry.data,
+  );
   if (!controls.length) return board;
   const journal = persisted ?? inspectSessionJournal(sessionJournalView(ctx));
   let result = board;
-  for (const node of journal.branch) {
+  for (const node of selectedGoalEntries(journal.branch)) {
     if (
       node.customType !== "continuous-tasks:event" ||
       !node.data ||

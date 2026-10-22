@@ -1,10 +1,12 @@
 import { randomUUID } from "node:crypto";
+import { readFileSync } from "node:fs";
 import { beforeEach, expect, it, vi } from "vitest";
 import {
   PREFLIGHT_ENTRY,
   PREFLIGHT_CONTROL_ENTRY,
   preflightDigest,
   restorePreflight,
+  currentPreflightRequestIssue,
   type PreflightState,
 } from "../preflight";
 import { approvePreflight, startApprovedPreflight } from "../preflight-human";
@@ -207,7 +209,89 @@ function legacy() {
   h.mock.api.appendEntry(PREFLIGHT_ENTRY, approved);
   return { ...h, approved };
 }
-it("promotes an exact historical typed grant through the actual native first-start producer", async () => {
+it("does not close a genuine deferred legacy permission question merely because Start happened later", async () => {
+  const h = legacy();
+  restorePreflight(h.ctx);
+  vi.mocked(h.ctx.ui.select).mockResolvedValue("稍后决定");
+  await approvePreflight(h.mock.api, h.ctx, undefined, "all");
+  const question = state().permissionRequest!;
+  vi.mocked(h.ctx.ui.select).mockResolvedValue("开始执行");
+  expect((await startApprovedPreflight(h.mock.api, h.ctx)).status).toBe("started");
+  expect(currentPreflightRequestIssue(h.ctx, currentRuntime().preflight!)).toContain("unanswered");
+  expect(state().permissionRequest).toEqual(question);
+  await h.command("stop");
+  h.mock.sendMessage.mockClear();
+  restoreWithoutWrites(h);
+  expect(currentPreflightRequestIssue(h.ctx, currentRuntime().preflight!)).toContain("unanswered");
+  const writes = h.entries.length;
+  const command = h.mock.registerCommand.mock.calls[0]![1];
+  vi.mocked(h.ctx.ui.select).mockResolvedValue("选项 1");
+  await command.handler("supervise Do not hide the legacy question", h.ctx);
+  expect(h.entries).toHaveLength(writes);
+  expect(currentRuntime().goal?.current).toBeUndefined();
+});
+
+it("uses a fresh real question after a deferred legacy Start created metadata-only permission identity", async () => {
+  const h = legacy();
+  restorePreflight(h.ctx);
+  vi.mocked(h.ctx.ui.select).mockResolvedValue("稍后启动");
+  await startApprovedPreflight(h.mock.api, h.ctx);
+  const bridge = state().permissionRequest!;
+  vi.mocked(h.ctx.ui.select).mockResolvedValue("稍后决定");
+  await approvePreflight(h.mock.api, h.ctx, undefined, "all");
+  expect(state().permissionRequest!.id).not.toBe(bridge.id);
+  expect(state().permissionRequest!.supersedes).toEqual({ requestId: bridge.id });
+  vi.mocked(h.ctx.ui.select).mockResolvedValue("开始执行");
+  await startApprovedPreflight(h.mock.api, h.ctx);
+  h.mock.sendMessage.mockClear();
+  restoreWithoutWrites(h);
+  expect(currentPreflightRequestIssue(h.ctx, currentRuntime().preflight!)).toContain("unanswered");
+});
+
+it("does not disguise a real question on an already-started v1 owner as historical conversion metadata", async () => {
+  const h = legacy();
+  h.mock.api.appendEntry(PREFLIGHT_ENTRY, {
+    ...h.approved,
+    phase: "started",
+    started: { goal: h.approved.goal, startedAt: "2026-01-01T01:00:00.000Z" },
+  });
+  restorePreflight(h.ctx);
+  vi.mocked(h.ctx.ui.select).mockResolvedValue("稍后决定");
+  await approvePreflight(h.mock.api, h.ctx, undefined, "all");
+  expect(currentPreflightRequestIssue(h.ctx, currentRuntime().preflight!)).toContain("unanswered");
+  expect(currentRuntime().preflight?.approval).toEqual(h.approved.approval);
+  h.mock.sendMessage.mockClear();
+  restoreWithoutWrites(h);
+  expect(currentPreflightRequestIssue(h.ctx, currentRuntime().preflight!)).toContain("unanswered");
+});
+
+it("keeps an independent persistence hold if the real question cannot follow a legacy conversion", async () => {
+  const h = legacy();
+  h.mock.api.appendEntry(PREFLIGHT_ENTRY, {
+    ...h.approved,
+    phase: "started",
+    started: { goal: h.approved.goal, startedAt: "2026-01-01T01:00:00.000Z" },
+  });
+  restorePreflight(h.ctx);
+  const append = h.mock.appendEntry.getMockImplementation() as (
+    type: string,
+    data: unknown,
+  ) => void;
+  h.mock.appendEntry.mockImplementation((type, data: any) => {
+    if (type === PREFLIGHT_ENTRY && data.permissionRequest?.supersedes?.requestId)
+      throw new Error("Question persistence failed");
+    append(type, data);
+  });
+  vi.mocked(h.ctx.ui.select).mockClear();
+  await expect(approvePreflight(h.mock.api, h.ctx, undefined, "all")).rejects.toThrow(
+    "Question persistence failed",
+  );
+  expect(currentRuntime().journalFault).toContain("persistence/readback failed");
+  expect(h.ctx.ui.select).not.toHaveBeenCalled();
+  expect(currentRuntime().preflight?.approval).toEqual(h.approved.approval);
+});
+
+it("preserves exact historical grant and legal Native Start without assuming its permission field was answered", async () => {
   const h = legacy();
   restorePreflight(h.ctx);
   vi.mocked(h.ctx.ui.select).mockResolvedValue("开始执行");
@@ -222,9 +306,77 @@ it("promotes an exact historical typed grant through the actual native first-sta
   h.mock.sendMessage.mockClear();
   restoreWithoutWrites(h);
   expect(currentRuntime().preflight?.started).toEqual(result.state.started);
+  expect(currentRuntime().preflight?.approval).toEqual(h.approved.approval);
+  expect(currentPreflightRequestIssue(h.ctx, currentRuntime().preflight!)).toContain("unanswered");
 });
+it.each(["answer", "revoke"])(
+  "lets the original owner resolve ambiguous legacy closure by a real %s without rewriting history",
+  async (action) => {
+    const h = legacy();
+    restorePreflight(h.ctx);
+    vi.mocked(h.ctx.ui.select).mockResolvedValue("开始执行");
+    await startApprovedPreflight(h.mock.api, h.ctx);
+    await h.command("stop");
+    const before = readFileSync(h.path);
+    const old = state();
+    expect(currentPreflightRequestIssue(h.ctx, old)).toContain("unanswered");
+    if (action === "answer") {
+      vi.mocked(h.ctx.ui.select).mockResolvedValue("允许上述范围");
+      const result = await approvePreflight(h.mock.api, h.ctx, undefined, "all");
+      expect(result.confirmed?.kind).toBe("approve");
+      expect(state().permissionRequest!.id).not.toBe(old.permissionRequest!.id);
+      expect(state().permissionRequest!.supersedes).toEqual({
+        requestId: old.permissionRequest!.id,
+      });
+    } else {
+      await h.command(`revoke ${old.planId}`);
+      expect(currentRuntime().preflight?.approval).toBeUndefined();
+      expect(currentPreflightRequestIssue(h.ctx, currentRuntime().preflight!)).toContain(
+        "unanswered",
+      );
+      vi.mocked(h.ctx.ui.select).mockResolvedValue("不允许");
+      const denied = await approvePreflight(h.mock.api, h.ctx, undefined, "all");
+      expect(denied.confirmed?.kind).toBe("reject");
+      expect(currentRuntime().preflight?.approval).toBeUndefined();
+      await h.command(`revoke ${old.planId}`);
+    }
+    expect(currentPreflightRequestIssue(h.ctx, currentRuntime().preflight!)).toBeUndefined();
+    expect(currentRuntime().preflight?.started).toEqual(old.started);
+    expect(readFileSync(h.path).subarray(0, before.length).equals(before)).toBe(true);
+    h.mock.sendMessage.mockClear();
+    restoreWithoutWrites(h);
+    expect(currentPreflightRequestIssue(h.ctx, currentRuntime().preflight!)).toBeUndefined();
+    vi.mocked(h.ctx.ui.select).mockResolvedValue("选项 1");
+    const command = h.mock.registerCommand.mock.calls[0]![1];
+    await command.handler("supervise After actual owner closure", h.ctx);
+    expect(currentRuntime().goal?.current?.scope.goalRunId).toBeTruthy();
+  },
+);
+
+it("does not reuse an unverified legacy-start permission bridge for a newer deferred permission question", async () => {
+  const h = legacy();
+  restorePreflight(h.ctx);
+  vi.mocked(h.ctx.ui.select).mockResolvedValue("开始执行");
+  await startApprovedPreflight(h.mock.api, h.ctx);
+  const before = structuredClone(currentRuntime().preflight!);
+  expect(before.version).toBe(2);
+  vi.mocked(h.ctx.ui.select).mockResolvedValue("稍后决定");
+  await approvePreflight(h.mock.api, h.ctx, undefined, "all");
+  const after = currentRuntime().preflight!;
+  expect(
+    after.version === 2 &&
+      before.version === 2 &&
+      after.permissionRequest?.id !== before.permissionRequest?.id,
+  ).toBe(true);
+  expect(after.approval).toEqual(before.approval);
+  expect(currentPreflightRequestIssue(h.ctx, after)).toContain("unanswered");
+  h.mock.sendMessage.mockClear();
+  restoreWithoutWrites(h);
+  expect(currentPreflightRequestIssue(h.ctx, currentRuntime().preflight!)).toContain("unanswered");
+});
+
 it.each([true, false])(
-  "allows old native started shape only with validated v1 trace: %s",
+  "reads the old native started shape only with validated v1 trace, without granting request closure: %s",
   (traced) => {
     const h = legacy();
     const started = { goal: h.approved.goal, startedAt: "2026-01-01T01:00:00.000Z" };
@@ -241,8 +393,13 @@ it.each([true, false])(
         supersedes: { legacyControlEntryId: h.approved.approval!.controlEntryId },
       },
     });
-    if (traced) restoreWithoutWrites(h);
-    else
+    if (traced) {
+      restoreWithoutWrites(h);
+      expect(currentRuntime().preflight?.approval).toEqual(h.approved.approval);
+      expect(currentPreflightRequestIssue(h.ctx, currentRuntime().preflight!)).toContain(
+        "unanswered",
+      );
+    } else
       expect(() => {
         restorePreflight(h.ctx);
       }).toThrow();

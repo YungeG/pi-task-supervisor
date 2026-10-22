@@ -1,4 +1,11 @@
 import { randomUUID } from "node:crypto";
+import {
+  appendOwnerSnapshot,
+  goalStartIdentityIssue,
+  goalPreflightControlIssue,
+  goalPreflightDenialOnly,
+  goalLease,
+} from "./goal-scope";
 import type {
   ExtensionAPI,
   ExtensionCommandContext,
@@ -12,7 +19,6 @@ import {
   sessionJournalView,
 } from "./human-control";
 import {
-  findReadbackProof,
   inspectSessionJournal,
   journalDigest,
   type ReadbackProof,
@@ -25,6 +31,8 @@ import {
   NativePreflightControlSchema,
   preflightPermissionSelection,
   preflightRequestPredecessor,
+  canReusePreflightRequest,
+  currentPreflightRequestIssue,
   preflightPermissionScope,
   preflightStartScope,
   projectPreflightPermissions,
@@ -116,10 +124,10 @@ function savePreparation(
 ): PreflightState {
   try {
     inspectSessionJournal(sessionJournalView(ctx));
-    pi.appendEntry(PREFLIGHT_ENTRY, state);
+    const stored = appendOwnerSnapshot(pi, PREFLIGHT_ENTRY, state);
     const journal = inspectSessionJournal(sessionJournalView(ctx));
     const leaf = journal.branch.at(-1);
-    if (leaf?.customType !== PREFLIGHT_ENTRY || journalDigest(leaf.data) !== journalDigest(state))
+    if (leaf?.customType !== PREFLIGHT_ENTRY || journalDigest(leaf.data) !== journalDigest(stored))
       throw new Error("Preflight request persistence failed");
     currentRuntime().preflight = structuredClone(state);
     return state;
@@ -138,6 +146,20 @@ function legacyStartPermissionMetadata(base: PreflightState, kind: "permission" 
     },
   };
 }
+function prepareLegacyQuestionBase(
+  pi: ExtensionAPI,
+  ctx: ExtensionContext,
+  base: PreflightState,
+  kind: "permission" | "start",
+): PreflightState {
+  if (kind !== "permission" || base.version !== 1 || !base.started || !base.approval) return base;
+  // Preserve the historical conversion shape, then give the actual question its own successor.
+  return savePreparation(pi, ctx, {
+    ...base,
+    version: 2,
+    ...legacyStartPermissionMetadata(base, "start"),
+  });
+}
 function prepareRequest(
   pi: ExtensionAPI,
   ctx: ExtensionContext,
@@ -145,7 +167,7 @@ function prepareRequest(
   kind: "permission" | "start",
   permissionIds?: string[],
 ): PreflightState {
-  const journal = inspectSessionJournal(sessionJournalView(ctx));
+  base = prepareLegacyQuestionBase(pi, ctx, base, kind);
   const request =
     base.version === 2
       ? kind === "permission"
@@ -154,7 +176,7 @@ function prepareRequest(
       : undefined;
   if (
     request &&
-    findReadbackProof(journal, "preflight", request.id).status === "missing" &&
+    canReusePreflightRequest(ctx, base, kind) &&
     (kind === "start" || JSON.stringify(request.permissionIds) === JSON.stringify(permissionIds))
   )
     return base;
@@ -185,19 +207,36 @@ async function present(
   ids: string[],
   start: boolean,
   signal?: AbortSignal,
+  denyOnly = false,
 ): Promise<NativeAnswer | undefined> {
   const runtime = currentRuntime();
   const epoch = runtime.humanEpoch;
+  const lease = goalLease();
   const controller = new AbortController();
   runtime.humanAbort = controller;
   const fingerprint = journalDigest(base);
   const current = () =>
     currentRuntime() === runtime &&
     runtime.humanEpoch === epoch &&
+    goalLease() === lease &&
+    !goalPreflightControlIssue(ctx, denyOnly ? "deny" : "grant") &&
+    (!denyOnly || ctx.isIdle()) &&
     !runtime.journalFault &&
+    (!start || !goalStartIdentityIssue(ctx, base.goal)) &&
     !ctx.hasPendingMessages() &&
     journalDigest(own(ctx)) === fingerprint;
   const presentation = readablePreflight(base, ids, start);
+  let material = preflightMaterial(base, ids, start);
+  if (denyOnly) {
+    const notice =
+      "目标已关闭。本次仅接受“不允许”以终结原问题；“允许”或稍后不会新增权限，也不会重启目标。";
+    presentation.title = "关闭目标：仅可拒绝原权限问题";
+    presentation.body = `${notice}\n\n${presentation.body}`;
+    material = {
+      ...material,
+      sections: [{ title: "仅可拒绝，不可新增许可", markdown: notice }, ...material.sections],
+    };
+  }
   try {
     return await requestNativeAnswer(
       ctx,
@@ -206,7 +245,7 @@ async function present(
         kind: start ? "choice" : "authorization",
         purpose: start ? "first-start" : "authorization",
         ...presentation,
-        material: preflightMaterial(base, ids, start),
+        material,
         ...(start
           ? { options: ["Later", "Start execution"], displayOptions: ["稍后启动", "开始执行"] }
           : {}),
@@ -260,6 +299,24 @@ function retainPending(ctx: ExtensionContext, proof: ConfirmedProof, state: Pref
   if (ownsJournalFault) runtime.journalFault = faultMessage;
   runtime.cancel();
 }
+function permissionMode(ctx: ExtensionContext, base: PreflightState): boolean {
+  const denyOnly = goalPreflightDenialOnly(ctx);
+  const issue = goalPreflightControlIssue(ctx, denyOnly ? "deny" : "grant");
+  if (issue) throw new Error(issue);
+  if (denyOnly && !currentPreflightRequestIssue(ctx, base))
+    throw new Error("Closed GoalRun has no unresolved native question; no new permission request");
+  return denyOnly;
+}
+function permissionAnswerAllowed(
+  ctx: ExtensionContext,
+  answer: NativeAnswer | undefined,
+  denyOnly: boolean,
+): answer is NativeAnswer {
+  if (!answer) return false;
+  if (!denyOnly || answer.outcome === "reject") return true;
+  ctx.ui.notify("目标已关闭：仅“不允许”可提交，未新增许可；原问题仍需最终回应。", "info");
+  return false;
+}
 async function permission(
   pi: ExtensionAPI,
   ctx: ExtensionContext,
@@ -267,6 +324,7 @@ async function permission(
   signal?: AbortSignal,
 ): Promise<PreflightHumanResult> {
   let base = own(ctx);
+  const denyOnly = permissionMode(ctx, base);
   const ids = preflightPermissionSelection(base, selection);
   if (!base.proposal || !base.planId || !base.planDigest)
     throw new Error("No complete preflight proposal");
@@ -281,8 +339,8 @@ async function permission(
     preflightPermissionScope(base, ids),
     base,
   );
-  const answer = await present(ctx, base, frame, ids, false, signal);
-  if (!answer) return result(ctx, base, "deferred");
+  const answer = await present(ctx, base, frame, ids, false, signal, denyOnly);
+  if (!permissionAnswerAllowed(ctx, answer, denyOnly)) return result(ctx, base, "deferred");
   const control: NativePermissionControl = {
     version: 2,
     sessionId: base.sessionId,
@@ -343,15 +401,24 @@ export async function submitAndPresentPreflight(
 ): Promise<PreflightHumanResult> {
   if (!toolCallId || signal?.aborted) throw new Error("Preflight submission cancelled");
   const before = own(ctx);
+  const lease = goalLease();
+  const issue = goalPreflightControlIssue(ctx);
+  if (issue) throw new Error(issue);
   const state = submitPreflight(pi, ctx, preflightId, proposal);
   if (before.revision === state.revision) return result(ctx, state, "already_saved");
   try {
     return await permission(pi, ctx, undefined, signal);
   } catch (error) {
-    if (currentRuntime().journalFault) throw error;
+    if (goalLease() !== lease || currentRuntime().journalFault) throw error;
     persistenceFault();
     throw error;
   }
+}
+function requireUnusedGoalStart(): void {
+  if (currentRuntime().goal?.current?.supervisor)
+    throw new Error(
+      "This GoalRun already saved its first-start; inspect/repair the existing result without another confirmation",
+    );
 }
 export async function startApprovedPreflight(
   pi: ExtensionAPI,
@@ -361,6 +428,7 @@ export async function startApprovedPreflight(
 ): Promise<PreflightHumanResult> {
   idle(ctx);
   let base = own(ctx);
+  requireUnusedGoalStart();
   inspectPreflightStart(ctx, base.goal, planIdHint);
   if (!isTrustedLocalTui(ctx)) return result(ctx, base, "unsupported");
   base = prepareRequest(pi, ctx, base, "start");

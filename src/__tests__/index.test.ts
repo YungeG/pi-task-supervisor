@@ -52,9 +52,10 @@ describe("index (default export)", () => {
     );
 
     // Native continuation boundary plus notification-only abort reconciliation.
-    expect(mockObj.on).toHaveBeenCalledTimes(10);
+    expect(mockObj.on).toHaveBeenCalledTimes(11);
     const eventNames = mockObj.on.mock.calls.map((call: unknown) => (call as [string, unknown])[0]);
     expect(eventNames).toContain("session_start");
+    expect(eventNames).toContain("agent_start");
     expect(eventNames).toContain("session_tree");
     expect(eventNames).toContain("session_shutdown");
     expect(eventNames).toContain("before_agent_start");

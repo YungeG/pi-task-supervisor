@@ -3,6 +3,7 @@ import { randomUUID } from "node:crypto";
 import { validDecisionSpec, type DecisionSpec } from "./decision-spec";
 import { answerBoardDecision, canReplaceBoardDecision } from "./board-human";
 import { currentRuntime } from "./runtime";
+import { goalLease, appendOwnerSnapshot } from "./goal-scope";
 import type {
   ToolDefinition,
   ExtensionAPI,
@@ -105,8 +106,14 @@ function assertBoardCurrent(
   board: Readonly<TaskBoardSnapshot>,
   signal: AbortSignal | undefined,
   enabled: boolean,
+  lease: string,
 ): void {
-  if (signal?.aborted || getBoardRef() !== board || isSessionScopeEnabled() !== enabled)
+  if (
+    signal?.aborted ||
+    goalLease() !== lease ||
+    getBoardRef() !== board ||
+    isSessionScopeEnabled() !== enabled
+  )
     throw new Error("Task update cancelled; session or task board changed before commit");
 }
 
@@ -351,8 +358,9 @@ export function createEditTasksTool(
         const newBoard = applyEdits(board, edits, now);
 
         // Detect phase completion and set pending prompt
+        const lease = goalLease();
         await checkAndSetPhaseCompletion(beforePhases, newBoard);
-        assertBoardCurrent(board, signal, enabled);
+        assertBoardCurrent(board, signal, enabled, lease);
 
         setBoard(newBoard);
 
@@ -372,7 +380,7 @@ export function createEditTasksTool(
           }
           pi.appendEntry(CUSTOM_EVENT_TYPE, event);
         }
-        pi.appendEntry(CUSTOM_SNAPSHOT_TYPE, newBoard);
+        appendOwnerSnapshot(pi, CUSTOM_SNAPSHOT_TYPE, newBoard);
         updateUI(ctx, newBoard);
 
         const counts = getStatusCounts(newBoard);
@@ -437,8 +445,9 @@ export function createCompileTasksTool(
         const newBoard = compileBoard(board, now, params.finalAcceptanceTaskId);
 
         // Detect phase completion and set pending prompt
+        const lease = goalLease();
         await checkAndSetPhaseCompletion(beforePhases, newBoard);
-        assertBoardCurrent(board, signal, enabled);
+        assertBoardCurrent(board, signal, enabled, lease);
 
         setBoard(newBoard);
 
@@ -669,15 +678,16 @@ export function createAdvanceTasksTool(
             assertObservedEvidence(edit.id, edit.data?.evidence);
         }
         const newBoard = applyEdits(board, edits, now);
+        const lease = goalLease();
         await checkAndSetPhaseCompletion(beforePhases, newBoard);
-        assertBoardCurrent(board, signal, enabled);
+        assertBoardCurrent(board, signal, enabled, lease);
 
         setBoard(newBoard);
 
         for (const edit of edits) {
           pi.appendEntry(CUSTOM_EVENT_TYPE, advanceEvent(edit, board, newBoard));
         }
-        pi.appendEntry(CUSTOM_SNAPSHOT_TYPE, newBoard);
+        appendOwnerSnapshot(pi, CUSTOM_SNAPSHOT_TYPE, newBoard);
         bindCompletion(pi, newBoard, ids);
         updateUI(ctx, newBoard);
 

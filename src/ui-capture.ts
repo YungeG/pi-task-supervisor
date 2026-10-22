@@ -17,7 +17,7 @@ import {
 import type { TaskBoardSnapshot } from "./types";
 import type { ReceiptStore } from "./receipt-store";
 
-function freezeClone<T>(value: T): Readonly<T> {
+export function freezeClone<T>(value: T): Readonly<T> {
   const clone = structuredClone(value);
   function freeze(item: unknown): void {
     if (item === null || typeof item !== "object") return;
@@ -350,6 +350,16 @@ export function captureUiBoardView(
       currentRequest(board),
       latestResponse(ctx),
       preflightDocument(ctx, input),
+      ...(currentRuntime().goal?.archives.length
+        ? [
+            document(
+              "goal-history",
+              "目标历史（只读）",
+              "available",
+              `已归档 ${currentRuntime().goal?.archives.length} 个目标。/task-supervisor history 查看；不会切换当前目标、恢复、批准或启动。`,
+            ),
+          ]
+        : []),
     ],
   });
   assertIdentity(ctx, board, scope);

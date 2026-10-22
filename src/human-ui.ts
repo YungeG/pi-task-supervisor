@@ -2,7 +2,7 @@ import type { ExtensionContext } from "@earendil-works/pi-coding-agent";
 import { realpathSync, readFileSync, statSync } from "node:fs";
 import { dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
-import type { ReadbackFrame } from "./human-journal";
+import { isGoalReadbackFrame, type NativeReadbackFrame } from "./human-journal";
 import { isSafeBoundedText } from "./validation";
 import { createScopeReview } from "./human-scope-view";
 import { materialLine, type HumanMaterial } from "./human-material-view";
@@ -119,7 +119,7 @@ export function isTrustedLocalTui(ctx: ExtensionContext): boolean {
 
 /** Frozen question structure for native UI interaction. */
 export interface NativeQuestion {
-  readonly frame: ReadbackFrame;
+  readonly frame: NativeReadbackFrame;
   readonly kind: "authorization" | "choice" | "information";
   readonly title: string;
   readonly body: string;
@@ -143,7 +143,7 @@ export interface NativeAnswer {
 
 interface AnswerMetadata {
   readonly sessionManager: object;
-  readonly frame: ReadbackFrame;
+  readonly frame: NativeReadbackFrame;
   readonly signal?: AbortSignal;
   readonly isCurrent: () => boolean;
   readonly sessionId: string;
@@ -177,7 +177,7 @@ export async function requestNativeAnswer(
   if (!sessionId || !leafId) return undefined;
 
   // Check frame.sessionId matches ctx.sessionId before UI
-  if ((question.frame.version as number) !== 1 || question.frame.sessionId !== sessionId)
+  if (!nativeFrameVersion(question.frame) || question.frame.sessionId !== sessionId)
     return undefined;
 
   const signals = [ctx.signal, signal].filter((item): item is AbortSignal => item !== undefined);
@@ -624,7 +624,7 @@ function createAnswer(outcome: NativeAnswer["outcome"], value: string | undefine
 export function requireNativeAnswer(
   ctx: ExtensionContext,
   answer: unknown,
-  expectedFrame: ReadbackFrame,
+  expectedFrame: NativeReadbackFrame,
 ): NativeAnswer {
   // Check private identity
   if (!answer || typeof answer !== "object") {
@@ -654,7 +654,7 @@ export function requireNativeAnswer(
   }
 
   // Check frame version at runtime (cannot rely on TS type alone)
-  if ((expectedFrame.version as number) !== 1) {
+  if (!nativeFrameVersion(expectedFrame)) {
     throw new Error("Invalid frame version");
   }
 
@@ -687,15 +687,24 @@ function branchContains(ctx: ExtensionContext, anchor: string): boolean {
   );
 }
 
-function framesEqual(a: ReadbackFrame, b: ReadbackFrame): boolean {
+function nativeFrameVersion(frame: NativeReadbackFrame): boolean {
+  return (frame.version as number) === 1 || isGoalReadbackFrame(frame);
+}
+function framesEqual(a: NativeReadbackFrame, b: NativeReadbackFrame): boolean {
+  const common = (f: NativeReadbackFrame) => [
+    f.version,
+    f.owner,
+    f.sessionId,
+    f.requestId,
+    f.presentationId,
+    f.scopeDigest,
+  ];
+  if (JSON.stringify(common(a)) !== JSON.stringify(common(b))) return false;
+  if (a.version === 2 && b.version === 2)
+    return a.baseEntryId === b.baseEntryId && a.baseEntryDigest === b.baseEntryDigest;
   return (
-    (a.version as number) === 1 &&
-    (b.version as number) === 1 &&
-    a.owner === b.owner &&
-    a.sessionId === b.sessionId &&
-    a.requestId === b.requestId &&
-    a.presentationId === b.presentationId &&
-    a.scopeDigest === b.scopeDigest &&
+    a.version === 1 &&
+    b.version === 1 &&
     a.baseSnapshotEntryId === b.baseSnapshotEntryId &&
     a.baseSnapshotDigest === b.baseSnapshotDigest
   );

@@ -4,13 +4,23 @@ import { lstatSync } from "node:fs";
 import {
   inspectSessionJournal,
   findReadbackProof,
+  findGoalReadbackProof,
   journalDigest,
   JournalReadError,
   type ReadbackFrame,
   type ReadbackProof,
+  type GoalReadbackFrame,
+  type GoalReadbackProof,
+  type NativeReadbackFrame,
   type JournalNode,
 } from "./human-journal";
 import { requireNativeAnswer, type NativeAnswer } from "./human-ui";
+import {
+  appendOwnerSnapshot,
+  ownerSnapshot,
+  requireCurrentCarrier,
+  selectedGoalEntries,
+} from "./goal-scope";
 
 export function sessionJournalView(ctx: ExtensionContext) {
   return {
@@ -50,13 +60,13 @@ export function captureReadbackFrame(
   const snapshotType =
     owner === "board" ? "continuous-tasks:snapshot" : "continuous-tasks:preflight";
   const stateDigest = journalDigest(state);
-  const base = [...journal.branch]
+  const base = [...selectedGoalEntries(journal.branch, owner)]
     .reverse()
     .find(
       (node) =>
         node.type === "custom" &&
         node.customType === snapshotType &&
-        journalDigest(node.data) === stateDigest,
+        journalDigest(ownerSnapshot(node.data)) === stateDigest,
     );
   if (!base) throw new JournalReadError("READBACK_INVALID");
   return {
@@ -67,7 +77,7 @@ export function captureReadbackFrame(
     presentationId: randomUUID(),
     scopeDigest: journalDigest(scope),
     baseSnapshotEntryId: base.id,
-    baseSnapshotDigest: stateDigest,
+    baseSnapshotDigest: journalDigest(base.data),
   };
 }
 
@@ -109,23 +119,87 @@ export function publishReadbackControl(
   const base = before.branch.find((node) => node.id === frame.baseSnapshotEntryId);
   if (!base || journalDigest(base.data) !== frame.baseSnapshotDigest)
     throw new JournalReadError("READBACK_INVALID");
+  requireCurrentCarrier(base.data);
   const controlType =
     frame.owner === "board" ? "continuous-tasks:event" : "continuous-tasks:preflight-control";
   const control = { ...body, humanInteraction: structuredClone(frame) };
   pi.appendEntry(controlType, control);
   const observed = requireObservedAppend(ctx, controlType, control);
   // No witness can be created when the original control append/readback failed.
+  publishWitness(pi, ctx, observed, frame);
+  const proof = findReadbackProof(
+    inspectSessionJournal(sessionJournalView(ctx)),
+    frame.owner,
+    frame.requestId,
+  );
+  if (proof.status !== "confirmed") throw new JournalReadError("READBACK_INVALID");
+  return proof;
+}
+
+function publishWitness(
+  pi: ExtensionAPI,
+  ctx: ExtensionContext,
+  control: JournalNode,
+  frame: NativeReadbackFrame,
+): void {
   const witness = {
     version: 1,
-    controlEntryId: observed.id,
-    controlDigest: observed.digest,
+    controlEntryId: control.id,
+    controlDigest: control.digest,
     frame: structuredClone(frame),
   };
   pi.appendEntry("continuous-tasks:human-readback", witness);
   requireObservedAppend(ctx, "continuous-tasks:human-readback", witness);
-  const proof = findReadbackProof(
+}
+
+export function captureGoalReadbackFrame(
+  ctx: ExtensionContext,
+  requestId: string,
+  scope: unknown,
+  baseEntryId: string,
+): GoalReadbackFrame {
+  const journal = inspectSessionJournal(sessionJournalView(ctx));
+  const base = journal.branch.find((node) => node.id === baseEntryId);
+  if (
+    !base ||
+    base.type !== "custom" ||
+    !["continuous-tasks:supervisor", "continuous-tasks:snapshot", "phased-tasks:snapshot"].includes(
+      base.customType ?? "",
+    )
+  )
+    throw new JournalReadError("READBACK_INVALID");
+  return {
+    version: 2,
+    owner: "goal",
+    sessionId: journal.sessionId,
+    requestId,
+    presentationId: randomUUID(),
+    scopeDigest: journalDigest(scope),
+    baseEntryId,
+    baseEntryDigest: base.digest,
+  };
+}
+/** A is also the old-reader version fence; B never exists without observed A. */
+export function publishGoalReadbackControl(
+  pi: ExtensionAPI,
+  ctx: ExtensionContext,
+  answer: NativeAnswer,
+  frame: GoalReadbackFrame,
+  body: Record<string, unknown>,
+): Extract<GoalReadbackProof, { status: "confirmed" }> {
+  requireNativeAnswer(ctx, answer, frame);
+  const before = inspectSessionJournal(sessionJournalView(ctx));
+  if (findGoalReadbackProof(before, frame.requestId).status !== "missing")
+    throw new JournalReadError("READBACK_CONFLICT");
+  const base = before.branch.find((node) => node.id === frame.baseEntryId);
+  if (!base || base.digest !== frame.baseEntryDigest)
+    throw new JournalReadError("READBACK_INVALID");
+  const control = { ...body, humanInteraction: structuredClone(frame) };
+  pi.appendEntry("continuous-tasks:supervisor", control);
+  const observed = requireObservedAppend(ctx, "continuous-tasks:supervisor", control);
+  publishWitness(pi, ctx, observed, frame);
+  const proof = findGoalReadbackProof(
     inspectSessionJournal(sessionJournalView(ctx)),
-    frame.owner,
     frame.requestId,
   );
   if (proof.status !== "confirmed") throw new JournalReadError("READBACK_INVALID");
@@ -153,6 +227,6 @@ export function saveReadbackProjection(
     throw new JournalReadError("READBACK_INVALID");
   const kind =
     proof.frame.owner === "board" ? "continuous-tasks:snapshot" : "continuous-tasks:preflight";
-  pi.appendEntry(kind, snapshot);
-  requireObservedAppend(ctx, kind, snapshot);
+  const stored = appendOwnerSnapshot(pi, kind, snapshot);
+  requireObservedAppend(ctx, kind, stored);
 }

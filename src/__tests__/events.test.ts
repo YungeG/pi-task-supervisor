@@ -28,6 +28,7 @@ describe("continuous task lifecycle events", () => {
       "session_shutdown",
       "session_before_compact",
       "input",
+      "agent_start",
       "before_agent_start",
       "agent_before_settle",
       "agent_settled",

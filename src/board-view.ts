@@ -368,6 +368,9 @@ class ReadOnlyBoard implements Component {
     const tasks = this.tasks();
     return [
       ...FIXED_ITEMS,
+      ...(this.view.documents.some((document) => document.id === "goal-history")
+        ? [{ value: "history", label: "目标历史（只读）" }]
+        : []),
       ...this.phaseIds().flatMap((phase) => {
         const matching = tasks.filter((task) => task.phase === phase);
         return matching.length ? this.phaseItems(phase, matching) : [];
@@ -591,6 +594,11 @@ class ReadOnlyBoard implements Component {
   }
   private detailsFor(value: string): { title: string; text: string } | undefined {
     const title = FIXED_ITEMS.find((item) => item.value === value)?.label ?? "任务详情";
+    if (value === "history")
+      return {
+        title: "目标历史（只读）",
+        text: documentText(this.view, "goal-history", "目标历史"),
+      };
     if (value === "overview") return { title, text: overviewText(this.view) };
     if (value === "confirmation") return { title, text: confirmationText(this.view) };
     if (value === "acceptance") return { title, text: acceptanceText(this.view) };
@@ -599,6 +607,12 @@ class ReadOnlyBoard implements Component {
   }
 
   private open(value: string): void {
+    if (value === "history" && this.env.openHistory) {
+      this.closed = true;
+      this.env.openHistory();
+      this.done();
+      return;
+    }
     if (value.startsWith("phase:")) {
       const phase = Number(value.slice(6));
       if (this.collapsed.has(phase)) this.collapsed.delete(phase);

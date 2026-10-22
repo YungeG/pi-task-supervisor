@@ -16,6 +16,12 @@ export interface JournalNode {
   customType?: string;
   data?: unknown;
   digest: string;
+  wireVersion?: number;
+  toolCallIds?: string[];
+  toolCalls?: Array<{ id: string; name?: string }>;
+  toolCallsIncomplete?: true;
+  receiptGoalId?: string;
+  receiptSessionId?: string;
 }
 export interface SessionJournal {
   sessionId: string;
@@ -38,6 +44,34 @@ export const ReadbackFrameSchema = Type.Object(
   { additionalProperties: false },
 );
 export type ReadbackFrame = Static<typeof ReadbackFrameSchema>;
+export const GoalReadbackFrameSchema = Type.Object(
+  {
+    version: Type.Literal(2),
+    owner: Type.Literal("goal"),
+    sessionId: frameId,
+    requestId: frameId,
+    presentationId: frameId,
+    scopeDigest: frameHash,
+    baseEntryId: frameId,
+    baseEntryDigest: frameHash,
+  },
+  { additionalProperties: false },
+);
+export type GoalReadbackFrame = Static<typeof GoalReadbackFrameSchema>;
+export type NativeReadbackFrame = ReadbackFrame | GoalReadbackFrame;
+export function isGoalReadbackFrame(value: unknown): value is GoalReadbackFrame {
+  return Check(GoalReadbackFrameSchema, value);
+}
+export type GoalReadbackProof =
+  | { status: "missing" }
+  | { status: "unconfirmed"; control: JournalNode; frame: GoalReadbackFrame }
+  | {
+      status: "confirmed";
+      control: JournalNode;
+      witness: JournalNode;
+      base: JournalNode;
+      frame: GoalReadbackFrame;
+    };
 export interface ReadbackWitness {
   version: 1;
   controlEntryId: string;
@@ -102,6 +136,58 @@ function validateLimits(limits: JournalLimits): void {
     fail("JOURNAL_LIMIT");
 }
 
+function retainedData(value: Record<string, unknown>): boolean {
+  if (typeof value.customType === "string" && RETAINED.has(value.customType)) return true;
+  if (value.customType !== "continuous-tasks:supervisor" || !record(value.data)) return false;
+  return (
+    value.data.version === 5 &&
+    value.data.protocol === "goal-lifecycle-v1" &&
+    ["transition-control", "transition-committed", "goal-state"].includes(String(value.data.kind))
+  );
+}
+
+function ownerMetadata(
+  value: Record<string, unknown>,
+): Pick<JournalNode, "wireVersion" | "receiptGoalId" | "receiptSessionId"> {
+  const data = value.data;
+  if (value.customType === "continuous-tasks:supervisor")
+    return { wireVersion: record(data) && typeof data.version === "number" ? data.version : -1 };
+  if (value.customType === "continuous-tasks:receipt-ledger" && record(data))
+    return {
+      receiptGoalId: typeof data.goalId === "string" ? data.goalId : undefined,
+      receiptSessionId: typeof data.sessionId === "string" ? data.sessionId : undefined,
+    };
+  return {};
+}
+
+function nativeToolCalls(
+  value: Record<string, unknown>,
+): Pick<JournalNode, "toolCalls" | "toolCallsIncomplete"> {
+  const message = value.message;
+  if (value.type !== "message" || !record(message) || message.role !== "assistant") return {};
+  // Uninspected content is not evidence that no duplicate call exists.
+  if (!Array.isArray(message.content) || message.content.length > 1000)
+    return { toolCallsIncomplete: true };
+  return {
+    toolCalls: message.content.flatMap((block) =>
+      record(block) &&
+      block.type === "toolCall" &&
+      typeof block.id === "string" &&
+      block.id.length <= 2000
+        ? [
+            {
+              id: block.id,
+              name:
+                typeof block.name === "string" && block.name.length > 0 && block.name.length <= 200
+                  ? block.name
+                  : undefined,
+            },
+          ]
+        : [],
+    ),
+  };
+}
+
 function parseEntry(
   value: Record<string, unknown>,
   nodes: Map<string, JournalNode>,
@@ -116,15 +202,17 @@ function parseEntry(
     nodes.has(value.id)
   )
     fail("JOURNAL_INVALID");
+  const calls = nativeToolCalls(value);
   const node: JournalNode = {
     id: value.id,
     parentId: value.parentId,
     type: value.type,
     ...(typeof value.customType === "string" ? { customType: value.customType } : {}),
-    ...(typeof value.customType === "string" && RETAINED.has(value.customType)
-      ? { data: value.data }
-      : {}),
+    ...(retainedData(value) ? { data: value.data } : {}),
     digest: journalDigest(value),
+    ...ownerMetadata(value),
+    toolCallIds: calls.toolCalls?.map((call) => call.id),
+    ...calls,
   };
   nodes.set(value.id, node);
   return node;
@@ -258,6 +346,10 @@ function findControl(
   for (const node of branch) {
     if (node.type !== "custom" || !record(node.data)) continue;
     if (!Object.hasOwn(node.data, "humanInteraction")) continue;
+    if (isGoalReadbackFrame(node.data.humanInteraction)) {
+      validateGoalControl(node, sessionId);
+      continue;
+    }
     if (!frame(node.data.humanInteraction)) fail("READBACK_INVALID");
     const binding = node.data.humanInteraction;
     if (binding.sessionId !== sessionId) fail("READBACK_INVALID");
@@ -276,7 +368,7 @@ function validateWitnessData(data: Record<string, unknown>): void {
     !identifier(data.controlEntryId) ||
     typeof data.controlDigest !== "string" ||
     !/^[a-f0-9]{64}$/.test(data.controlDigest) ||
-    !frame(data.frame)
+    !(frame(data.frame) || isGoalReadbackFrame(data.frame))
   )
     fail("READBACK_INVALID");
 }
@@ -320,6 +412,70 @@ function validateWitness(
   )
     fail("READBACK_INVALID");
   return base;
+}
+
+function validateGoalControl(node: JournalNode, sessionId: string): GoalReadbackFrame {
+  const data = node.data;
+  if (!record(data) || !isGoalReadbackFrame(data.humanInteraction)) fail("READBACK_INVALID");
+  const binding = data.humanInteraction;
+  if (
+    node.customType !== "continuous-tasks:supervisor" ||
+    data.version !== 5 ||
+    data.protocol !== "goal-lifecycle-v1" ||
+    data.kind !== "transition-control" ||
+    data.transitionId !== binding.requestId ||
+    binding.sessionId !== sessionId
+  )
+    fail("READBACK_INVALID");
+  return binding;
+}
+function goalProofBase(
+  journal: SessionJournal,
+  control: JournalNode,
+  witness: JournalNode,
+  binding: GoalReadbackFrame,
+): JournalNode {
+  const base = journal.nodes.get(binding.baseEntryId);
+  const data = witness.data as ReadbackWitness;
+  const branch = journal.branch;
+  if (
+    !base ||
+    base.type !== "custom" ||
+    !["continuous-tasks:supervisor", "continuous-tasks:snapshot", "phased-tasks:snapshot"].includes(
+      base.customType ?? "",
+    ) ||
+    base.digest !== binding.baseEntryDigest ||
+    data.controlDigest !== control.digest ||
+    journalDigest(data.frame) !== journalDigest(binding) ||
+    branch.indexOf(base) < 0 ||
+    branch.indexOf(base) >= branch.indexOf(control) ||
+    branch.indexOf(witness) <= branch.indexOf(control)
+  )
+    fail("READBACK_INVALID");
+  return base;
+}
+/** Goal frame2 uses the complete native base node, never a fabricated legacy snapshot. */
+export function findGoalReadbackProof(
+  journal: SessionJournal,
+  requestId: string,
+): GoalReadbackProof {
+  const candidates = journal.branch.filter(
+    (node) =>
+      record(node.data) &&
+      node.data.kind === "transition-control" &&
+      node.customType === "continuous-tasks:supervisor",
+  );
+  const matching = candidates.flatMap((control) => {
+    const binding = validateGoalControl(control, journal.sessionId);
+    return binding.requestId === requestId ? [{ control, frame: binding }] : [];
+  });
+  if (matching.length > 1) fail("READBACK_CONFLICT");
+  const found = matching[0];
+  if (!found) return { status: "missing" };
+  const witness = collectWitnesses(journal.branch, found.control.id)[0];
+  if (!witness) return { status: "unconfirmed", ...found };
+  const base = goalProofBase(journal, found.control, witness, found.frame);
+  return { status: "confirmed", ...found, witness, base };
 }
 
 /** Structural disk evidence only; the owner must separately verify source, scope and action. */

@@ -6,6 +6,7 @@ import type { SupervisorState } from "./supervisor";
 import type { PreflightState } from "./preflight";
 import type { ReceiptStore } from "./receipt-store";
 import type { TaskBoardSnapshot } from "./types";
+import type { GoalRuntime } from "./goal-records";
 
 export interface ProjectionRepairHint {
   sessionId: string;
@@ -17,6 +18,9 @@ export interface ProjectionRepairHint {
 
 export interface TaskRuntime {
   board: TaskBoardSnapshot;
+  goal: GoalRuntime | undefined;
+  goalEpoch: number;
+  planningLease: string | undefined;
   enabled: boolean;
   cancel: () => void;
   manualPauseDepth: number;
@@ -35,6 +39,9 @@ export interface TaskRuntime {
 export function createRuntime(): TaskRuntime {
   return {
     board: createEmptyBoard(),
+    goal: undefined,
+    goalEpoch: 0,
+    planningLease: undefined,
     enabled: false,
     cancel: (): void => undefined,
     manualPauseDepth: 0,

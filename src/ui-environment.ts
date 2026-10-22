@@ -6,4 +6,5 @@ export type UiViewEnvironment = Readonly<{
   keybindings: KeybindingsManager;
   requestRender: () => void;
   rows: () => number;
+  openHistory?: () => void;
 }>;

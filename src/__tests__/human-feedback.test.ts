@@ -1,5 +1,6 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
 import type { ExtensionContext } from "@earendil-works/pi-coding-agent";
+import type { ReadbackFrame } from "../human-journal";
 import { KeybindingsManager, TUI_KEYBINDINGS, type Component } from "@earendil-works/pi-tui";
 import { readFileSync, realpathSync, statSync } from "node:fs";
 import {
@@ -45,7 +46,8 @@ function trusted(): void {
   process.argv = ["node", `${prefix}/lib/node_modules/@earendil-works/pi-coding-agent/dist/cli.js`];
 }
 
-function question(overrides: Partial<NativeQuestion> = {}): NativeQuestion {
+type LegacyQuestion = Omit<NativeQuestion, "frame"> & { frame: ReadbackFrame };
+function question(overrides: Partial<LegacyQuestion> = {}): LegacyQuestion {
   return {
     frame: {
       version: 1,
@@ -443,7 +445,7 @@ describe("captured purposes and exact native mappings", () => {
     async (overrides) => {
       const h = harness();
       const lease = beginReadOnlyView(h.ctx)!;
-      const q = question(overrides as Partial<NativeQuestion>);
+      const q = question(overrides as Partial<LegacyQuestion>);
       expect(await requestNativeAnswer(h.ctx, q, () => true)).toBeUndefined();
       expect(lease.signal.aborted).toBe(false);
       lease.finish();

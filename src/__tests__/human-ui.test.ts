@@ -337,6 +337,35 @@ describe("requestNativeAnswer - positive mechanism tests", () => {
     process.argv = ["node", trustedCliPath];
   }
 
+  it("issues a private goal-frame2 archive-and-plan answer without treating it as business approval", async () => {
+    setupTrustedTui();
+    const ctx = createMockContext();
+    vi.mocked(ctx.ui.select).mockResolvedValueOnce("选项 1");
+    const frame = {
+      version: 2,
+      owner: "goal",
+      sessionId: "test-session",
+      requestId: "goal-request",
+      presentationId: "goal-screen",
+      scopeDigest: "a".repeat(64),
+      baseEntryId: "old-checkpoint",
+      baseEntryDigest: "b".repeat(64),
+    } as const;
+    const question: NativeQuestion = {
+      frame,
+      kind: "choice",
+      title: "归档旧目标并规划新目标",
+      body: "保留原任务与证据；不启动业务执行。",
+      options: ["Archive and plan new goal", "Cancel"],
+    };
+    const answer = await requestNativeAnswer(ctx, question, () => true);
+    expect(answer?.outcome).toBe("answer");
+    expect(answer?.value).toBe("Archive and plan new goal");
+    expect(requireNativeAnswer(ctx, answer, frame)).toBe(answer);
+    expect(() => requireNativeAnswer(ctx, { ...answer }, frame)).toThrow(
+      "Unrecognized native answer",
+    );
+  });
   it("maps the displayed Chinese approval label to the unchanged canonical outcome", async () => {
     setupTrustedTui();
     const ctx = createMockContext({ mode: "tui", hasUI: true });
@@ -775,7 +804,7 @@ describe("requireNativeAnswer - enhanced validation", () => {
     );
   });
 
-  it("rejects when frame version is not 1", async () => {
+  it("rejects a non-legacy version with a legacy owner", async () => {
     setupTrustedTui();
     const ctx = createMockContext({ mode: "tui", hasUI: true });
     const selectMock = vi.mocked(ctx.ui.select);
@@ -791,7 +820,10 @@ describe("requireNativeAnswer - enhanced validation", () => {
     const answer = await requestNativeAnswer(ctx, question, () => true);
     expect(answer).toBeDefined();
 
-    const invalidFrame = { ...question.frame, version: 2 as unknown as 1 };
+    const invalidFrame = {
+      ...createMockFrame({ sessionId: "test-session" }),
+      version: 2 as unknown as 1,
+    };
     expect(() => requireNativeAnswer(ctx, answer, invalidFrame)).toThrow("Invalid frame version");
   });
 
