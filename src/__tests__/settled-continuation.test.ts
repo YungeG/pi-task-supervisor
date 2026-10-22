@@ -5,7 +5,7 @@ import { supervisorState, type Advisor, type Advice } from "../supervisor";
 import { activeBoard, BOUNDARY, deferred, lifecycle } from "./helpers/lifecycle";
 
 const guide: Advice = {
-  action: "guide",
+  action: "next_batch",
   message: "Finish the approved implementation and validation",
   taskIds: ["t-1.1"],
   evidenceRefs: [],
@@ -18,7 +18,7 @@ describe("native supervisor continuation and compaction", () => {
     setBoard(activeBoard());
   });
 
-  it("returns concrete guidance through a native boundary, never as a user message", async () => {
+  it("returns host next-batch control through a native boundary, never as a user message", async () => {
     const advisor = vi.fn<Advisor>(async () => ({ advice: guide }));
     const h = lifecycle(advisor);
     await h.command("supervise Finish and verify the approved work");
@@ -35,7 +35,8 @@ describe("native supervisor continuation and compaction", () => {
         },
       ],
     });
-    expect(result.entries[0].content).toContain(guide.message);
+    expect(result.entries[0].content).toContain("get_ready_tasks");
+    expect(result.entries[0].content).not.toContain(guide.message);
     expect(h.mock.sendUserMessage).not.toHaveBeenCalled();
     expect(supervisorState()).toMatchObject({ status: "active", pending: true, continuations: 1 });
   });

@@ -11,6 +11,8 @@ const longReceipts = process.argv.includes("--long-receipts");
 const receiptReadCount = longReceipts ? Number(process.env.PI_RECEIPT_SMOKE_COUNT ?? 1000) : 0;
 if (!Number.isSafeInteger(receiptReadCount) || receiptReadCount < 0 || receiptReadCount > 1000)
   throw new Error("Invalid bounded smoke read count");
+const batchContinuation = process.argv.includes("--batch-continuation");
+const batchStopAdvice = "本批已经完成。现在整体暂停，不领取下一批任务，等待用户确认。";
 const preflight = process.argv.includes("--preflight");
 const asyncExecution = process.argv.includes("--async-execution");
 const compaction = process.argv.includes("--compaction");
@@ -20,6 +22,7 @@ const interruptCompaction =
   process.argv.includes("--interrupt-compaction") || nativeAbort || ordinaryPause;
 const supervised =
   process.argv.includes("--supervised") ||
+  batchContinuation ||
   longReceipts ||
   compaction ||
   interruptCompaction ||
@@ -119,7 +122,7 @@ function latestSupervisor(manager) {
   return { ...state, epoch: records.at(-1)?.data.epoch ?? state.epoch, receipts };
 }
 
-function advisory(action) {
+function advisory(action, taskIds = ["t-2.1"]) {
   return (context) => {
     if (context.tools?.length) throw new Error("Supervisor was given executor tools");
     const content = context.messages.findLast((message) => message.role === "user")?.content;
@@ -150,11 +153,13 @@ function advisory(action) {
       JSON.stringify({
         action,
         message:
-          action === "guide"
-            ? "Claim and complete both approved tasks, running fresh host validation during each review."
+          action === "next_batch"
+            ? batchContinuation && taskIds.includes("t-2.1")
+              ? batchStopAdvice
+              : "Claim the next approved batch and collect fresh host validation during review."
             : "All approved work has host validation.",
-        taskIds: action === "guide" ? ["t-1.1", "t-2.1"] : ["t-2.1"],
-        evidenceRefs: action === "guide" ? [] : ["tool:final-validation"],
+        taskIds,
+        evidenceRefs: action === "next_batch" ? [] : ["tool:final-validation"],
       }),
     );
   };
@@ -173,7 +178,7 @@ function interruptedAdvisory(context) {
       resolveReply(
         fauxAssistantMessage(
           JSON.stringify({
-            action: "guide",
+            action: "next_batch",
             message: "Stale advice must never be delivered",
             taskIds: ["t-1.1"],
             evidenceRefs: [],
@@ -418,7 +423,7 @@ try {
     }),
     tool("compile_tasks", { finalAcceptanceTaskId: "t-2.1" }),
     fauxAssistantMessage("Implementation phase prepared; ending this turn."),
-    ...(supervised ? [interruptCompaction ? interruptedAdvisory : advisory("guide")] : []),
+    ...(supervised ? [interruptCompaction ? interruptedAdvisory : advisory("next_batch", ["t-1.1"])] : []),
     tool("get_ready_tasks", { count: 1 }),
     ...(asyncExecution
       ? [
@@ -441,8 +446,36 @@ try {
     tool("advance_tasks", {
       transitions: [{ id: "t-1.1", evidence: proof("implementation-validation") }],
     }),
-    ...(compaction ? [compactionStop, advisory("guide")] : []),
-    tool("get_ready_tasks", { count: 1 }),
+    ...(compaction || batchContinuation
+      ? [
+          compaction
+            ? compactionStop
+            : fauxAssistantMessage("First batch verified; yielding to the next-batch checkpoint."),
+          advisory("next_batch"),
+        ]
+      : []),
+    (context) => {
+      if (batchContinuation) {
+        const next = sessionManager.getBranch().findLast(
+          (entry) => entry.type === "custom_message" && entry.customType === "continuous-tasks:continue",
+        );
+        const board = latestSnapshot(sessionManager);
+        const state = latestSupervisor(sessionManager);
+        if (
+          next?.details?.action !== "next_batch" ||
+          !next.content.includes("get_ready_tasks") ||
+          !next.content.includes("not a goal pause") ||
+          JSON.stringify(context.messages).includes(batchStopAdvice) ||
+          board.tasks[0].status !== "done" ||
+          board.tasks[1].status !== "ready" ||
+          state.status !== "active" ||
+          state.continuations !== 2 ||
+          state.stagnant !== 0
+        )
+          throw new Error("Batch handoff forwarded contradictory prose, lost host control, or spun without progress");
+      }
+      return tool("get_ready_tasks", { count: 1 });
+    },
     tool("advance_tasks", { transitions: [{ id: "t-2.1" }] }),
     ...(supervised ? [tool("validate_smoke", {}, "final-validation")] : []),
     tool("advance_tasks", { transitions: [{ id: "t-2.1", evidence: proof("final-validation") }] }),
@@ -798,14 +831,14 @@ try {
 
   if (extensionErrors.length > 0)
     throw new Error(`Extension errors: ${JSON.stringify(extensionErrors)}`);
-  if (agentStarts !== (preflight ? 3 : compaction || asyncExecution ? 3 : 2))
+  if (agentStarts !== (preflight ? 3 : compaction || batchContinuation || asyncExecution ? 3 : 2))
     throw new Error(`Unexpected agent run count: ${agentStarts}`);
   if (completedCompactions !== ((compaction || interruptCompaction) && !ordinaryPause ? 1 : 0))
     throw new Error("Unexpected automatic compaction count");
   if (faux.getPendingResponseCount() !== 0) throw new Error("Faux responses were not exhausted");
   if (userMessages.length !== (supervised ? 0 : 1))
     throw new Error("Auto-continuation forged a user message");
-  if (continuationMessages.length !== (compaction || nativeAbort ? 3 : supervised ? 2 : 1)) {
+  if (continuationMessages.length !== (compaction || batchContinuation || nativeAbort ? 3 : supervised ? 2 : 1)) {
     throw new Error(`Unexpected hidden continuation count: ${continuationMessages.length}`);
   }
   if (
@@ -844,8 +877,8 @@ try {
     const state = latestSupervisor(sessionManager);
     if (
       state?.status !== "completed" ||
-      state.reviews !== (compaction ? 3 : nativeAbort ? 1 : 2) ||
-      state.continuations !== (compaction ? 2 : interruptCompaction ? 0 : 1) ||
+      state.reviews !== (compaction || batchContinuation ? 3 : nativeAbort ? 1 : 2) ||
+      state.continuations !== (compaction || batchContinuation ? 2 : interruptCompaction ? 0 : 1) ||
       state.receipts.length !== 2 + receiptReadCount ||
       state.bindings.length !== 2
     )
@@ -951,23 +984,25 @@ try {
       result: "PASS",
       preflightApprovedAndSeparatelyStarted: preflight,
       preflightOptionalPermissionNotGranted: preflight,
-      mode: longReceipts
-        ? "supervised-long-receipts"
-        : preflight
-          ? "supervised-preflight"
-          : asyncExecution
-            ? "supervised-async-execution"
-            : ordinaryPause
-              ? "supervised-ordinary-pause"
-              : nativeAbort
-                ? "supervised-native-abort"
-                : interruptCompaction
-                  ? "supervised-interrupted-compaction"
-                  : compaction
-                    ? "supervised-compaction"
-                    : supervised
-                      ? "supervised"
-                      : "board-only",
+      mode: batchContinuation
+        ? "supervised-batch-continuation"
+        : longReceipts
+          ? "supervised-long-receipts"
+          : preflight
+            ? "supervised-preflight"
+            : asyncExecution
+              ? "supervised-async-execution"
+              : ordinaryPause
+                ? "supervised-ordinary-pause"
+                : nativeAbort
+                  ? "supervised-native-abort"
+                  : interruptCompaction
+                    ? "supervised-interrupted-compaction"
+                    : compaction
+                      ? "supervised-compaction"
+                      : supervised
+                        ? "supervised"
+                        : "board-only",
       completedCompactions,
       supervisorAccepted: supervised,
       sessionId: sessionManager.getSessionId(),

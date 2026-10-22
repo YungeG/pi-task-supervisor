@@ -1,5 +1,11 @@
 # Changelog
 
+## Isolated batch-continuation fix — candidate
+
+- Distinguish current-batch guidance, `next_batch`, goal-wide hold and final acceptance. Check next-batch qualification against claimed/ready tasks and unresolved execution references; reject ambiguous old `guide` handoffs immediately rather than waiting for stagnation protection.
+- Generate next-batch execution instructions and notices in the host, without forwarding contradictory advisor prose. Completing a batch is a checkpoint, not a goal pause or renewed-approval request.
+- Add native-boundary regressions and an isolated real-Pi SDK/faux-provider two-batch smoke. Preserve approvals, explicit pause/stop, external execution ownership, evidence, budgets, recovery and persisted formats. This is separate from journal-growth work; no merge, installation, reload or business acceptance is implied.
+
 ## Isolated stale Supervisor footer fix — candidate
 
 - Synchronize the legacy Supervisor status on every RPC/print refresh, clearing absent, foreign-session and stopped/non-pending owner indicators instead of leaving a cached footer value.

@@ -7,7 +7,7 @@ import { activeBoard, BOUNDARY, lifecycle } from "./helpers/lifecycle";
 import { appendMockEntries } from "./helpers/mocks";
 
 const guide = {
-  action: "guide",
+  action: "next_batch",
   message: "Finish the approved implementation",
   taskIds: ["t-1.1"],
   evidenceRefs: [],

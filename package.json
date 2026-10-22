@@ -41,7 +41,7 @@
     "test": "vitest run",
     "test:watch": "vitest",
     "test:coverage": "vitest run --coverage",
-    "test:smoke": "node test/real-pi-smoke.mjs && node test/real-pi-smoke.mjs --supervised && node test/real-pi-smoke.mjs --compaction && node test/real-pi-smoke.mjs --interrupt-compaction && node test/real-pi-smoke.mjs --native-abort && node test/real-pi-smoke.mjs --ordinary-pause && node test/real-pi-smoke.mjs --async-execution && node test/preflight-smoke.mjs && node test/real-pi-smoke.mjs --long-receipts && node test/receipt-storage-smoke.mjs && node test/receipt-storage-smoke.mjs --intent && node test/receipt-storage-smoke.mjs --v2",
+    "test:smoke": "node test/real-pi-smoke.mjs && node test/real-pi-smoke.mjs --supervised && node test/real-pi-smoke.mjs --batch-continuation && node test/real-pi-smoke.mjs --compaction && node test/real-pi-smoke.mjs --interrupt-compaction && node test/real-pi-smoke.mjs --native-abort && node test/real-pi-smoke.mjs --ordinary-pause && node test/real-pi-smoke.mjs --async-execution && node test/preflight-smoke.mjs && node test/real-pi-smoke.mjs --long-receipts && node test/receipt-storage-smoke.mjs && node test/receipt-storage-smoke.mjs --intent && node test/receipt-storage-smoke.mjs --v2",
     "check": "npm run typecheck && npm run lint && npm run format:check && npm run test:coverage && npm run test:smoke",
     "format": "prettier --write src/",
     "format:check": "prettier --check src/",

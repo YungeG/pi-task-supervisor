@@ -88,7 +88,7 @@ function pauseBoard(
   holdSupervisor(pi, ctx, "paused", reason, cause);
 }
 
-function continuation(prompt: string): BoundaryResult {
+function continuation(prompt: string, action?: "guide" | "next_batch"): BoundaryResult {
   return {
     continue: true,
     entries: [
@@ -97,7 +97,7 @@ function continuation(prompt: string): BoundaryResult {
         customType: "continuous-tasks:continue",
         content: prompt,
         display: false,
-        details: { generation: getBoardRef().generation },
+        details: { generation: getBoardRef().generation, ...(action ? { action } : {}) },
       },
     ],
   };
@@ -187,8 +187,14 @@ async function supervisedBoundary(
   if (!current()) return undefined;
   const advice = await cancellable(reviewSupervisor(pi, ctx, signal, advisor), signal);
   if (!advice || !current() || ctx.hasPendingMessages()) return undefined;
+  if (advice.action === "next_batch")
+    return continuation(
+      `[SUPERVISOR CONTROL — NOT USER APPROVAL]\nAction: next_batch. No batch is claimed and ready work remains; this is not a goal pause. Call get_ready_tasks to claim the next ready batch now. Work within the existing authorized scope; batch completion alone does not require another confirmation.\n${formatContinuePrompt(getBoardRef())}\nReview targets: ${advice.taskIds.join(", ")}\nEvidence: ${advice.evidenceRefs.join(", ") || "collect fresh tool evidence"}\nPreserve all real approvals, pauses, budgets and existing execution receipts.`,
+      "next_batch",
+    );
   return continuation(
     `[SUPERVISOR ADVICE — NOT USER APPROVAL]\n${advice.message}\nTasks: ${advice.taskIds.join(", ") || "prepare/repair the goal's task plan"}\nEvidence: ${advice.evidenceRefs.join(", ") || "collect fresh tool evidence"}\nPreserve all real approvals, pauses, budgets and existing execution receipts.`,
+    "guide",
   );
 }
 

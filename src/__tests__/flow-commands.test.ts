@@ -228,7 +228,8 @@ describe("ordinary supervised pause recovery", () => {
     await lane.command("supervise Finish authorized work");
     lane.ctx.abort = vi.fn();
     const result = await lane.fire("before_agent_start");
-    expect(result.message.content).toContain("finish this run normally");
+    expect(result.message.content).toContain("yield to the native supervisor checkpoint");
+    expect(result.message.content).toContain("A completed batch is not a goal pause");
     expect(result.message.content).toContain("guidance, not a host-enforced phase gate");
     expect(lane.ctx.abort).not.toHaveBeenCalled();
     expect(supervisorState()?.reviews).toBe(0);

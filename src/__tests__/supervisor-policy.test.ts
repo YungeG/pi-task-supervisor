@@ -18,7 +18,7 @@ import {
 import { createMockAPI, createMockContext } from "./helpers/mocks";
 
 const guide: Advice = {
-  action: "guide",
+  action: "next_batch",
   message: "Complete approved implementation",
   taskIds: ["t-1.1"],
   evidenceRefs: [],

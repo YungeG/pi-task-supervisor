@@ -5,7 +5,7 @@ import { getStatusCounts } from "./validation";
 // ── Plain-Text Formatting (for LLM tool output) ──
 
 const BATCH_GUIDANCE =
-  "Batch checkpoint: claim one ready batch when none is active. After verified completion, report results and the next step and finish this run normally before claiming another batch. " +
+  "Batch checkpoint: claim one ready batch when none is active. After verified completion, report results and yield to the native supervisor checkpoint. A completed batch is not a goal pause. On next_batch control, claim the next ready batch now rather than repeat a stop acknowledgment or request confirmation for already-approved work. " +
   "This is guidance, not a host-enforced phase gate. Do not abort or mark unfinished tasks done to force a checkpoint; inspect existing execution references and do not launch duplicate writers.";
 
 /** Returns a phase label string including the title if available. */
