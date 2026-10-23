@@ -3,6 +3,7 @@ import type {
   ExtensionContext,
   ExtensionCommandContext,
 } from "@earendil-works/pi-coding-agent";
+import type { RestoreJournalRead } from "./restore-journal";
 import type { DecisionRecord, TaskBoardSnapshot } from "./types";
 import { CUSTOM_SNAPSHOT_TYPE } from "./types";
 import { cloneBoard, isValidSnapshotV2, isSafeBoundedText } from "./validation";
@@ -282,10 +283,11 @@ export function readBoardHumanPresentation(
 export function restoreBoardHuman(
   ctx: ExtensionContext,
   board: TaskBoardSnapshot,
+  restoration?: RestoreJournalRead,
 ): TaskBoardSnapshot {
   currentRuntime().boardHumanContext = undefined;
   currentRuntime().boardRepair = undefined;
-  const persisted = inspectRestorableSession(ctx);
+  const persisted = restoration ? restoration.inspect(ctx) : inspectRestorableSession(ctx);
   const controls = selectedGoalEntries(ctx.sessionManager.getBranch()).filter(
     (entry) =>
       entry.type === "custom" &&

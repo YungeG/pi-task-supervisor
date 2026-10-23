@@ -3,7 +3,14 @@ import type {
   ExtensionCommandContext,
   ExtensionContext,
 } from "@earendil-works/pi-coding-agent";
+import type { RestoreJournalRead } from "./restore-journal";
 import { randomUUID } from "node:crypto";
+
+export interface GoalRestoreOptions {
+  read: RestoreJournalRead;
+  install: (operation: () => void) => void;
+  afterConfirmedAppend: (entryId: string) => void;
+}
 import { createEmptyBoard } from "./engine";
 import { getBoardRef } from "./state";
 import { currentRuntime } from "./runtime";
@@ -383,6 +390,7 @@ function installGoalView(view: GoalRuntime): void {
   runtime.supervisor = undefined;
   runtime.receiptStore = undefined;
   runtime.receiptIdentity = undefined;
+  runtime.receiptPersistence = undefined;
   runtime.boardHumanContext = undefined;
   runtime.boardRepair = undefined;
   runtime.preflightRepair = undefined;
@@ -406,15 +414,36 @@ function makeCommit(
     seed: structuredClone(control.seed),
   };
 }
-function commitPending(pi: ExtensionAPI, ctx: ExtensionContext, view: GoalRuntime): GoalRuntime {
+function commitPending(
+  pi: ExtensionAPI,
+  ctx: ExtensionContext,
+  view: GoalRuntime,
+  restore?: GoalRestoreOptions,
+): GoalRuntime {
   const pending = view.pending;
   if (!pending?.confirmed) return view;
-  const journal = inspectSessionJournal(sessionJournalView(ctx));
-  const proof = findGoalReadbackProof(journal, pending.control.transitionId);
-  if (proof.status !== "confirmed" || proof.control.id !== pending.controlEntryId)
-    return failure("transition proof changed before commit");
-  appendObservedGoalCheckpoint(pi, ctx, makeCommit(pending.control, proof.control, proof.witness));
-  return readGoalJournal(ctx) ?? failure("committed goal selection disappeared");
+  let committed: string;
+  try {
+    const journal = inspectSessionJournal(sessionJournalView(ctx));
+    const proof = findGoalReadbackProof(journal, pending.control.transitionId);
+    if (proof.status !== "confirmed" || proof.control.id !== pending.controlEntryId)
+      return failure("transition proof changed before commit");
+    committed = appendObservedGoalCheckpoint(
+      pi,
+      ctx,
+      makeCommit(pending.control, proof.control, proof.witness),
+    );
+    if (!restore) return readGoalJournal(ctx) ?? failure("committed goal selection disappeared");
+  } catch (error) {
+    view.blocked = error instanceof Error ? error.message : "Goal transition commit uncertain";
+    return view;
+  }
+  // A failed lease refresh must reach the orchestrator, not install an uncertain old view.
+  restore.afterConfirmedAppend(committed);
+  return (
+    readGoalJournal(ctx, restore.read.inspect(ctx)) ??
+    failure("committed goal selection disappeared")
+  );
 }
 function transitionHold(ctx: ExtensionContext, reason: string): void {
   const runtime = currentRuntime();
@@ -425,18 +454,19 @@ function transitionHold(ctx: ExtensionContext, reason: string): void {
 export function restoreGoalLifecycle(
   pi: ExtensionAPI,
   ctx: ExtensionContext,
+  restore?: GoalRestoreOptions,
 ): GoalRuntime | undefined {
-  let view = readGoalJournal(ctx);
+  const view = readGoalJournal(ctx, restore?.read.inspect(ctx));
   if (!view) {
     currentRuntime().goal = undefined;
     return undefined;
   }
-  try {
-    if (view.pending?.confirmed) view = commitPending(pi, ctx, view);
-  } catch (error) {
-    view.blocked = error instanceof Error ? error.message : "Goal transition commit uncertain";
-  }
-  installGoalView(view);
+  const selectedView = commitPending(pi, ctx, view, restore);
+  if (restore)
+    restore.install(() => {
+      installGoalView(selectedView);
+    });
+  else installGoalView(selectedView);
   const selected = currentRuntime().goal?.current;
   const preflight = currentRuntime().preflight;
   if (selected?.supervisor === null && selected.phase === "planning") {

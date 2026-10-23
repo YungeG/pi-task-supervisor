@@ -27,6 +27,7 @@ export interface TaskRuntime {
   supervisor: SupervisorState | undefined;
   receiptStore: ReceiptStore | undefined;
   receiptIdentity: string | undefined;
+  receiptPersistence: "legacy-v1" | "ledger" | undefined;
   preflight: PreflightState | undefined;
   preflightRepair?: ProjectionRepairHint;
   boardRepair?: ProjectionRepairHint;
@@ -48,6 +49,7 @@ export function createRuntime(): TaskRuntime {
     supervisor: undefined as SupervisorState | undefined,
     receiptStore: undefined as ReceiptStore | undefined,
     receiptIdentity: undefined as string | undefined,
+    receiptPersistence: undefined,
     preflight: undefined as PreflightState | undefined,
     preflightRepair: undefined,
     boardRepair: undefined,

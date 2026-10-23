@@ -6,7 +6,11 @@ import type {
 } from "@earendil-works/pi-coding-agent";
 import type { ContinuousTasksConfig } from "./config";
 import { createEmptyBoard } from "./engine";
-import { inspectRestorableSession } from "./human-control";
+import {
+  beginRestoreJournal,
+  RestoreReadInvalidated,
+  type RestoreJournalCycle,
+} from "./restore-journal";
 import { formatJournalReadError } from "./human-journal";
 import { restoreBoardHuman, boardHumanContext, canReplaceBoardDecision } from "./board-human";
 import { claimedExecutionRefs, executionWaitTimer, waitForExecutions } from "./async-execution";
@@ -295,6 +299,7 @@ function restoreFaultedSupervisor(pi: ExtensionAPI, ctx: ExtensionContext): void
     restoreSupervisor(pi, ctx);
   } catch {
     currentRuntime().supervisor = undefined;
+    currentRuntime().receiptPersistence = undefined;
   }
 }
 
@@ -314,10 +319,64 @@ function clearOwnedUI(ctx: ExtensionContext): void {
   }
 }
 
+function reportRestoreFailure(
+  pi: ExtensionAPI,
+  ctx: ExtensionContext,
+  board: ReturnType<typeof createEmptyBoard>,
+  error: unknown,
+): void {
+  // Do not reinterpret malformed durable state as an inactive, safe-to-continue supervisor.
+  const diagnostic = formatJournalReadError(error);
+  const reason = diagnostic
+    ? `Journal restore blocked: ${diagnostic}; inspect session journal state before recovery`
+    : error instanceof Error && /preflight/i.test(error.message)
+      ? "Invalid preflight journal; inspect session state before recovery"
+      : "Invalid supervisor journal; inspect session state before recovery";
+  currentRuntime().journalFault =
+    board.tasks.length === 0
+      ? `${reason}; task view not restored, counts unknown (saved records are not deleted)`
+      : reason;
+  // An unstable source exhausted its bounded read attempts: do not scan it again for UI.
+  if (error instanceof RestoreReadInvalidated) {
+    currentRuntime().journalFault = `${reason}; task view not restored, counts unknown (saved records are not deleted)`;
+    currentRuntime().supervisor = undefined;
+    currentRuntime().receiptStore = undefined;
+    currentRuntime().receiptIdentity = undefined;
+    currentRuntime().receiptPersistence = undefined;
+    board = createEmptyBoard();
+    setBoard(board);
+  } else {
+    // Restore only a held view after another owner's failure; no writes or replay.
+    restoreFaultedSupervisor(pi, ctx);
+  }
+  setSessionScopeEnabled(false);
+  updateActiveTools(pi, false);
+  updateUI(ctx, board);
+  const faultStatus = `Supervisor: fault (${diagnostic ?? "journal restore"})`;
+  if (ctx.hasUI && ctx.mode !== "tui") ctx.ui.setStatus("continuous-supervisor", faultStatus);
+  pi.sendMessage(
+    {
+      customType: "continuous-tasks:notice",
+      content: `${currentRuntime().journalFault}; task continuation disabled.`,
+      display: true,
+    },
+    { triggerTurn: false },
+  );
+}
+
+function retryRestoreRead(error: unknown, attempt: number): boolean {
+  return (
+    attempt === 0 &&
+    error instanceof RestoreReadInvalidated &&
+    ["source", "leaf"].includes(error.reason)
+  );
+}
+
 async function restoreSession(
   pi: ExtensionAPI,
   control: Control,
   ctx: ExtensionContext,
+  attempt = 0,
 ): Promise<void> {
   control.cancel();
   invalidateGoalCallbacks();
@@ -342,43 +401,45 @@ async function restoreSession(
   currentRuntime().preflight = undefined;
   currentRuntime().boardRepair = undefined;
   currentRuntime().boardHumanContext = undefined;
+  let cycle: RestoreJournalCycle | undefined;
   try {
-    inspectRestorableSession(ctx);
-    restoreGoalLifecycle(pi, ctx);
-    board = restoreBoardHuman(ctx, reconstructState(ctx));
+    const active = beginRestoreJournal(ctx);
+    cycle = active;
+    restoreGoalLifecycle(pi, ctx, {
+      read: active.read,
+      install: (operation) => {
+        active.installGoal(ctx, operation);
+      },
+      afterConfirmedAppend: (id) => {
+        active.afterConfirmedAppend(ctx, id);
+      },
+    });
+    board = restoreBoardHuman(ctx, reconstructState(ctx), active.read);
     restoreSessionScope(pi, ctx);
     setBoard(board);
-    restorePreflight(ctx);
-    restoreSupervisor(pi, ctx);
-    updateUI(ctx, board);
+    restorePreflight(ctx, active.read);
+    active.runSupervisorRestore(ctx, () => {
+      restoreSupervisor(pi, ctx, active.read);
+    });
+    updateUI(ctx, board, active.read);
+    active.assertCurrent(ctx);
     updateActiveTools(pi, isSessionScopeEnabled());
   } catch (error) {
-    // Do not reinterpret malformed durable state as an inactive, safe-to-continue supervisor.
-    const diagnostic = formatJournalReadError(error);
-    const reason = diagnostic
-      ? `Journal restore blocked: ${diagnostic}; inspect session journal state before recovery`
-      : error instanceof Error && /preflight/i.test(error.message)
-        ? "Invalid preflight journal; inspect session state before recovery"
-        : "Invalid supervisor journal; inspect session state before recovery";
-    currentRuntime().journalFault =
-      board.tasks.length === 0
-        ? `${reason}; task view not restored, counts unknown (saved records are not deleted)`
-        : reason;
-    // Restore only a held view after another owner's failure; no writes or replay.
-    restoreFaultedSupervisor(pi, ctx);
-    setSessionScopeEnabled(false);
-    updateActiveTools(pi, false);
-    updateUI(ctx, board);
-    const faultStatus = `Supervisor: fault (${diagnostic ?? "journal restore"})`;
-    if (ctx.hasUI && ctx.mode !== "tui") ctx.ui.setStatus("continuous-supervisor", faultStatus);
-    pi.sendMessage(
-      {
-        customType: "continuous-tasks:notice",
-        content: `${currentRuntime().journalFault}; task continuation disabled.`,
-        display: true,
-      },
-      { triggerTurn: false },
-    );
+    if (
+      currentRuntime() !== runtime ||
+      ctx.sessionManager !== manager ||
+      manager.getSessionId() !== sessionId ||
+      (error instanceof RestoreReadInvalidated && error.reason === "epoch")
+    )
+      return;
+    if (retryRestoreRead(error, attempt)) {
+      cycle?.close();
+      await restoreSession(pi, control, ctx, 1);
+      return;
+    }
+    reportRestoreFailure(pi, ctx, board, error);
+  } finally {
+    cycle?.close();
   }
 }
 

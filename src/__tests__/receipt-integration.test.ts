@@ -10,6 +10,7 @@ import {
   recoverSupervisor,
   readSupervisorStartRecord,
   supervisorState,
+  saveSupervisor,
   SUPERVISOR_ENTRY,
   assertObservedEvidence,
 } from "../supervisor";
@@ -219,6 +220,23 @@ describe("receipt integration safety and legacy formats", () => {
     setBoard(board);
     h.restore();
     expect(supervisorState()!.epoch).toBe(10);
+  });
+
+  it("retains v2 checkpoint writes but refuses a full v1 fallback when its view is lost", () => {
+    const h = v2Fixture(2, "paused");
+    h.restore();
+    saveSupervisor(h.mock.api);
+    expect(h.manager.getLeafEntry()).toMatchObject({
+      type: "custom",
+      data: { version: 2, receipts: [], receiptJournal: { count: 2 } },
+    });
+    const before = structuredClone(h.manager.getBranch());
+    currentRuntime().receiptStore = undefined;
+
+    expect(() => {
+      saveSupervisor(h.mock.api);
+    }).toThrow(/receipt ledger is unavailable/);
+    expect(h.manager.getBranch()).toEqual(before);
   });
 
   it("reads an installed-format v2 completed goal without silently discarding supervision", () => {

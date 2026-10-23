@@ -6,6 +6,7 @@ import { getBoard, resetState, setBoard } from "../state";
 import { currentRuntime } from "../runtime";
 import {
   assertObservedEvidence,
+  holdSupervisor,
   recoverSupervisor,
   restoreSupervisor,
   readSupervisorStartRecord,
@@ -480,6 +481,80 @@ describe("long-running host receipt lifecycle", () => {
     },
   );
 
+  it("does not manufacture a legacy gap or migration when a modern 500-entry cache loses its store", () => {
+    const h = fixture();
+    currentRuntime().receiptStore!.configure({ maxEntries: 512, maxBytes: 1_048_576 });
+    for (let i = 0; i < 500; i++) h.capture(`modern-cached-${i}`);
+    holdSupervisor(h.mock.api, h.ctx, "paused", "Synthetic lost-store recovery", "user_pause");
+    expect(supervisorState()!.receipts).toHaveLength(500);
+    const before = structuredClone(h.manager.getBranch());
+    currentRuntime().receiptStore = undefined;
+
+    expect(() => {
+      recoverSupervisor(h.mock.api, h.ctx);
+    }).toThrow(/receipt ledger is unavailable/);
+    expect(h.manager.getBranch()).toEqual(before);
+    expect(supervisorState()!.status).toBe("fault");
+  });
+
+  it("preserves genuine v1 control writes but never falls back after explicit ledger migration", () => {
+    const h = legacyFixture(2);
+    const receipts = structuredClone(supervisorState()!.receipts);
+    saveSupervisor(h.mock.api);
+    expect(h.manager.getLeafEntry()).toMatchObject({
+      type: "custom",
+      data: { version: 1, receipts },
+    });
+
+    recoverSupervisor(h.mock.api, h.ctx);
+    expect(h.manager.getLeafEntry()).toMatchObject({
+      type: "custom",
+      data: { version: 3, receipts: [] },
+    });
+    const before = structuredClone(h.manager.getBranch());
+    currentRuntime().receiptStore = undefined;
+    expect(() => {
+      saveSupervisor(h.mock.api);
+    }).toThrow(/receipt ledger is unavailable/);
+    expect(h.manager.getBranch()).toEqual(before);
+  });
+
+  it("does not mistake a restored modern runtime state for legacy persistence", () => {
+    const h = fixture();
+    h.capture("retained-proof");
+    saveSupervisor(h.mock.api);
+    restoreSupervisor(h.mock.api, h.ctx);
+    expect(supervisorState()!.version).toBe(1);
+    const before = structuredClone(h.manager.getBranch());
+    currentRuntime().receiptStore = undefined;
+
+    expect(() => {
+      saveSupervisor(h.mock.api);
+    }).toThrow(/receipt ledger is unavailable/);
+    expect(h.manager.getBranch()).toEqual(before);
+  });
+
+  it.each(["reset", "empty-session"] as const)(
+    "does not retain legacy write permission after %s when a stale state reappears",
+    (boundary) => {
+      const h = legacyFixture(2);
+      const stale = structuredClone(supervisorState()!);
+      if (boundary === "reset") resetState();
+      else {
+        const ctx = createMockContext();
+        Object.assign(ctx, { sessionManager: SessionManager.inMemory() });
+        restoreSupervisor(h.mock.api, ctx);
+      }
+      currentRuntime().supervisor = stale;
+      const before = structuredClone(h.manager.getBranch());
+
+      expect(() => {
+        saveSupervisor(h.mock.api);
+      }).toThrow(/receipt ledger is unavailable/);
+      expect(h.manager.getBranch()).toEqual(before);
+    },
+  );
+
   it("does not migrate or reopen a stopped legacy goal", () => {
     const h = legacyFixture(500, "stopped");
     expect(supervisorState()!.status).toBe("stopped");
@@ -657,6 +732,64 @@ describe("long-running host receipt lifecycle", () => {
     expect(currentRuntime().receiptStore!.pendingCount).toBe(1);
     expect(currentRuntime().receiptStore!.stats.count).toBe(0);
     expect(supervisorState()!.epoch).toBe(1);
+  });
+
+  it("measures total incremental Supervisor bytes including a checkpoint per result", () => {
+    const n = Number(process.env.PHASE_A_RESOURCE_N ?? 10);
+    expect(Number.isSafeInteger(n) && n >= 10 && n <= 1000 && n % 2 === 0).toBe(true);
+    const h = fixture();
+    const encoded = () =>
+      h.manager
+        .getBranch()
+        .filter((e) => e.type === "custom")
+        .reduce((sum, e) => sum + Buffer.byteLength(JSON.stringify(e), "utf8") + 1, 0);
+    const initialBytes = encoded();
+    const started = performance.now();
+    let halfBytes = 0;
+    for (let i = 0; i < n; i++) {
+      h.capture(`linear-${String(i).padStart(4, "0")}`);
+      saveSupervisor(h.mock.api);
+      if (i + 1 === n / 2) halfBytes = encoded() - initialBytes;
+    }
+    const addedBytes = encoded() - initialBytes;
+    const entries = h.manager.getBranch();
+    const checkpoints = entries.filter(
+      (e) => e.type === "custom" && e.customType === SUPERVISOR_ENTRY,
+    );
+    const bodies = entries.filter(
+      (e) => e.type === "custom" && e.customType === RECEIPT_LEDGER_ENTRY,
+    );
+    expect(addedBytes / halfBytes).toBeLessThanOrEqual(2.2);
+    expect(checkpoints).toHaveLength(n + 1);
+    expect(bodies).toHaveLength(n);
+    for (const entry of checkpoints)
+      expect(entry).toMatchObject({ data: { version: 3, receipts: [] } });
+    const stats = currentRuntime().receiptStore!.stats;
+    expect(stats.count).toBe(n);
+    expect(stats.cacheEntries).toBeLessThanOrEqual(stats.maxEntries);
+    expect(stats.cacheBytes).toBeLessThanOrEqual(stats.maxBytes);
+    expect(currentRuntime().receiptStore!.readReceipts(["tool:linear-0000"])).toHaveLength(1);
+    if (process.env.PHASE_A_RESOURCE_REPORT)
+      writeFileSync(
+        process.env.PHASE_A_RESOURCE_REPORT,
+        JSON.stringify(
+          {
+            n,
+            initialBytes,
+            halfBytes,
+            addedSupervisorBytes: addedBytes,
+            growth: addedBytes / halfBytes,
+            checkpoints: checkpoints.length,
+            receiptBodies: bodies.length,
+            elapsedMs: performance.now() - started,
+            measurement:
+              "Real SDK in-memory custom entries encoded with newline; not disk latency or native transcript",
+            ...stats,
+          },
+          null,
+          2,
+        ) + "\n",
+      );
   });
 
   it("measures linear encoded ledger growth with a bounded raw cache", () => {

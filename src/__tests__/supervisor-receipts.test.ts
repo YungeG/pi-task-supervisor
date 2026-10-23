@@ -102,6 +102,18 @@ describe("original V2 receipt regressions across V3 integration", () => {
     expect(supervisorState()!.epoch).toBe(1);
   });
 
+  it("rejects saving a modern Supervisor after its runtime store is lost without appending v1", () => {
+    const h = setup();
+    h.capture(event("before-store-loss"));
+    const before = structuredClone(h.manager.getBranch());
+    currentRuntime().receiptStore = undefined;
+
+    expect(() => {
+      saveSupervisor(h.mock.api);
+    }).toThrow(/receipt ledger is unavailable/);
+    expect(h.manager.getBranch()).toEqual(before);
+  });
+
   it("stores receipt bodies once rather than duplicating them in every checkpoint", () => {
     const h = setup();
     h.capture(event("one"));
