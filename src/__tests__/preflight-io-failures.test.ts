@@ -281,6 +281,7 @@ it("shows saved-result repair guidance instead of asking for approval again", as
 });
 it("delivers rejection and partial permission state to Main without an execution agreement", async () => {
   const h = await ready(false);
+  h.chooseDraft(2);
   vi.mocked(h.ctx.ui.select).mockResolvedValue("不允许");
   await approvePreflight(h.mock.api, h.ctx);
   expect(preflightContext(h.ctx)).toContain("selection was rejected");

@@ -161,7 +161,7 @@ it("can explicitly end an approved but never-started planning goal without revok
   expect(
     f.entries().filter((e) => e.customType === "continuous-tasks:preflight-control"),
   ).toHaveLength(controls);
-  vi.mocked(f.ctx.ui.select).mockResolvedValue("选项 1");
+  vi.mocked(f.ctx.ui.select).mockResolvedValue("确认提交所选方案");
   await f.command("supervise New goal after approved draft");
   expect(currentRuntime().goal?.current?.seed.goal).toBe("New goal after approved draft");
   expect(currentRuntime().preflight?.approval).toBeUndefined();

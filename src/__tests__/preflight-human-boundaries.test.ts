@@ -102,6 +102,7 @@ it("defer does not change approval state and produces no sendMessage", async () 
 
 it("reject does not grant approval and never starts", async () => {
   const h = await submitted();
+  h.chooseDraft(2);
   vi.mocked(h.ctx.ui.select).mockResolvedValue("不允许");
   h.mock.sendMessage.mockClear();
   const result = await approvePreflight(h.mock.api, h.ctx);

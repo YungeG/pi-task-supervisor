@@ -28,7 +28,7 @@ afterEach(() => {
   vi.restoreAllMocks();
 });
 async function start(f: Awaited<ReturnType<typeof goalFixture>>, text: string) {
-  vi.mocked(f.ctx.ui.select).mockResolvedValue("选项 1");
+  vi.mocked(f.ctx.ui.select).mockResolvedValue("确认提交所选方案");
   await f.command(`supervise ${text}`);
   await f.fire("agent_start");
   vi.mocked(f.ctx.ui.select).mockResolvedValue("允许上述范围");
@@ -377,7 +377,7 @@ it("does not let an old native settled notification settle a newly dispatched pl
   await f.command("supervise Older pure planning");
   await f.fire("agent_start");
   await f.command("stop");
-  vi.mocked(f.ctx.ui.select).mockResolvedValue("选项 1");
+  vi.mocked(f.ctx.ui.select).mockResolvedValue("确认提交所选方案");
   await f.command("supervise New pure planning");
   await f.fire("agent_start");
   const count = f.entries().length;

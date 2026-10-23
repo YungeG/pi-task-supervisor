@@ -542,12 +542,18 @@ function archiveQuestion(
         cost: state.cost,
       }
     : "未启动监督，无已记录的 Supervisor 用量";
+  const body = `旧目标原值：\n${oldGoal}\n旧目标身份：${choice.source.goalKey}\n旧状态：${state?.status ?? runtime.goal?.current?.phase ?? board.workflowStatus}\n旧任务计数：${JSON.stringify(counts)}；未完成记录原样归档。\n旧用量原样保留：${JSON.stringify(usage)}\n新目标原值：\n${choice.seed.goal}\n新目标模型：${choice.seed.model.provider}/${choice.seed.model.id}\n\n新目标独立记账，从零开始 reviews/continuations/stagnant，重新规划、授权、启动；这不是重置旧目标额度。本次不批准业务，不启动旧任务，不取消外部进程。`;
   return {
     frame,
     kind: "choice" as const,
     purpose: "business-choice" as const,
     title: "归档旧目标并规划新目标",
-    body: `旧目标原值：\n${oldGoal}\n旧目标身份：${choice.source.goalKey}\n旧状态：${state?.status ?? runtime.goal?.current?.phase ?? board.workflowStatus}\n旧任务计数：${JSON.stringify(counts)}；未完成记录原样归档。\n旧用量原样保留：${JSON.stringify(usage)}\n新目标原值：\n${choice.seed.goal}\n新目标模型：${choice.seed.model.provider}/${choice.seed.model.id}\n\n新目标独立记账，从零开始 reviews/continuations/stagnant，重新规划、授权、启动；这不是重置旧目标额度。本次不批准业务，不启动旧任务，不取消外部进程。`,
+    body,
+    material: {
+      context: choice.seed.goal,
+      summary: ["只归档并只读规划；不授予业务权限、不启动旧任务。", `新目标：${choice.seed.goal}`],
+      sections: [{ title: "旧目标与新目标", markdown: body }],
+    },
     options: ["Archive and plan new goal", "Cancel"],
     displayOptions: ["归档旧目标并规划新目标", "取消（不提交）"],
   };

@@ -8,6 +8,9 @@ import { createScopeReview } from "./human-scope-view";
 import { materialLine, type HumanMaterial } from "./human-material-view";
 import { suspendTaskWidget } from "./board-ui";
 import { closeReadOnlyView } from "./ui-view-lifecycle";
+import { DecisionCard, isDecisionDraft, type DecisionDraft } from "./human-decision-card";
+import type { UiViewEnvironment } from "./ui-environment";
+import type { Component } from "@earendil-works/pi-tui";
 import { visibleWidth, truncateToWidth, stripTerminalSequences } from "@earendil-works/pi-tui";
 
 /**
@@ -123,7 +126,7 @@ export interface NativeQuestion {
   readonly kind: "authorization" | "choice" | "information";
   readonly title: string;
   readonly body: string;
-  /** Optional formatted browsing/context only; exact original review remains mandatory. */
+  /** Optional Markdown material; canonical scope is reviewed once, never replaced by this preview. */
   readonly material?: HumanMaterial;
   readonly options?: readonly string[];
   /** Display-only labels aligned with canonical options; never persisted as answers. */
@@ -383,6 +386,56 @@ function reviewText(question: NativeQuestion, purpose: Purpose): string {
   return contents.join("\n\n");
 }
 
+/** Same lifecycle and actual completion handshake for readonly review and draft cards. */
+async function questionView<T>(
+  ctx: ExtensionContext,
+  current: () => boolean,
+  signal: AbortSignal | undefined,
+  create: (
+    env: UiViewEnvironment,
+    done: (value: T | undefined) => void,
+  ) => Component & { dispose(): void },
+): Promise<T | undefined> {
+  if (!current()) return undefined;
+  let component: (Component & { dispose(): void }) | undefined;
+  let abort: (() => void) | undefined;
+  const completion: { done: boolean; value: T | undefined } = { done: false, value: undefined };
+  try {
+    const result = await ctx.ui.custom<T | undefined>((tui, theme, keybindings, done) => {
+      const validBeforeFactory = current();
+      const finish = (value: T | undefined) => {
+        if (completion.done) return;
+        completion.done = true;
+        completion.value = value;
+        done(value);
+      };
+      component = create(
+        {
+          theme,
+          keybindings,
+          requestRender: () => {
+            tui.requestRender();
+          },
+          rows: () => Math.max(0, tui.terminal.rows - HOST_CHROME_ROWS),
+        },
+        finish,
+      );
+      abort = () => {
+        component?.dispose();
+        finish(undefined);
+      };
+      signal?.addEventListener("abort", abort, { once: true });
+      if (!validBeforeFactory || !current()) abort();
+      return component;
+    });
+    return current() && completion.done && result === completion.value
+      ? completion.value
+      : undefined;
+  } finally {
+    if (abort) signal?.removeEventListener("abort", abort);
+    component?.dispose();
+  }
+}
 async function reviewScope(
   ctx: ExtensionContext,
   text: string,
@@ -390,46 +443,104 @@ async function reviewScope(
   signal?: AbortSignal,
   material?: HumanMaterial,
 ): Promise<boolean> {
-  if (!current()) return false;
-  let component: ReturnType<typeof createScopeReview> | undefined;
-  let abort: (() => void) | undefined;
-  let completion: "reviewed" | "cancelled" | undefined;
-  try {
-    const result = await ctx.ui.custom<"reviewed" | "cancelled">(
-      (tui, theme, keybindings, done) => {
-        const validBeforeFactory = current();
-        const finish = (value: "reviewed" | "cancelled") => {
-          if (completion !== undefined) return;
-          completion = value;
-          done(value);
-        };
-        component = createScopeReview(
-          text,
-          {
-            theme,
-            keybindings,
-            requestRender: () => {
-              tui.requestRender();
-            },
-            rows: () => Math.max(0, tui.terminal.rows - HOST_CHROME_ROWS),
-          },
-          finish,
-          material,
-        );
-        abort = () => {
-          component?.dispose();
-          finish("cancelled");
-        };
-        signal?.addEventListener("abort", abort, { once: true });
-        if (!validBeforeFactory || !current()) abort();
-        return component;
-      },
+  const result = await questionView<"reviewed" | "cancelled">(ctx, current, signal, (env, done) =>
+    createScopeReview(text, env, done, material),
+  );
+  return result === "reviewed";
+}
+function validDraftInformation(question: NativeQuestion, value: string): boolean {
+  return (
+    question.kind !== "information" ||
+    (isSafeBoundedText(value, 1000) &&
+      (!question.informationValidator || question.informationValidator(value)))
+  );
+}
+function decisionDraftValue(question: NativeQuestion, draft: DecisionDraft): string | undefined {
+  if (question.kind === "authorization")
+    return draft.index === 1 ? "Approve" : draft.index === 2 ? "Reject" : undefined;
+  if (question.kind === "choice") return question.options?.[(draft.index ?? 0) - 1];
+  return draft.value !== undefined && validDraftInformation(question, draft.value)
+    ? draft.value
+    : undefined;
+}
+function draftConfirmation(
+  question: NativeQuestion,
+  purpose: Purpose,
+  value: string,
+  index?: number,
+): { title: string; label: string } {
+  const names = {
+    authorization: "范围确认（全文已核对）",
+    "first-start": "首次启动（全文已核对）",
+    "business-choice": "业务选择（全文已核对）",
+    information: "补充信息（全文已核对）",
+  };
+  let label = "确认提交所选方案";
+  if (question.kind === "authorization") label = value === "Approve" ? "允许上述范围" : "不允许";
+  else if (purpose === "first-start") label = "开始执行";
+  else if (question.kind === "information") label = "确认提交信息";
+  const detail =
+    question.kind === "authorization"
+      ? label
+      : question.kind === "choice"
+        ? `选项 ${index ?? 0} · ${JSON.stringify(value)}`
+        : JSON.stringify(value);
+  return {
+    label,
+    title: promptTitle(names[purpose], question) + "\n" + materialLine("草稿：" + detail, 64),
+  };
+}
+async function confirmDecisionDraft(
+  ctx: ExtensionContext,
+  question: NativeQuestion,
+  purpose: Purpose,
+  draft: DecisionDraft,
+  current: () => boolean,
+  signal?: AbortSignal,
+): Promise<string | typeof REVIEW_AGAIN | typeof RETRY_INPUT | undefined> {
+  const value = decisionDraftValue(question, draft);
+  if (value === undefined) return undefined;
+  const confirmation = draftConfirmation(question, purpose, value, draft.index);
+  const later =
+    purpose === "first-start" ? "稍后启动" : purpose === "information" ? "稍后输入" : "稍后决定";
+  const index = await selectOffered(
+    ctx,
+    confirmation.title,
+    [later, confirmation.label, "返回修改", REVIEW_LABEL],
+    current,
+    signal,
+  );
+  if (!current()) return undefined;
+  if (index === 2) return RETRY_INPUT;
+  if (index === 3) return REVIEW_AGAIN;
+  if (index !== 1 || !validDraftInformation(question, value)) return undefined;
+  return value;
+}
+async function invokeDecisionCard(
+  ctx: ExtensionContext,
+  question: NativeQuestion,
+  purpose: Purpose,
+  current: () => boolean,
+  signal?: AbortSignal,
+): Promise<string | undefined> {
+  let initial: DecisionDraft | undefined;
+  let recheck = false;
+  while (current()) {
+    const draft = await questionView<DecisionDraft>(
+      ctx,
+      current,
+      signal,
+      (env, done) =>
+        new DecisionCard(question, reviewText(question, purpose), env, done, initial, recheck),
     );
-    return current() && result === "reviewed" && completion === "reviewed";
-  } finally {
-    if (abort) signal?.removeEventListener("abort", abort);
-    component?.dispose();
+    if (!current() || !isDecisionDraft(draft, question)) return undefined;
+    const result = await confirmDecisionDraft(ctx, question, purpose, draft, current, signal);
+    if (!current()) return undefined;
+    if (result !== REVIEW_AGAIN && result !== RETRY_INPUT) return result;
+    initial = draft;
+    recheck = result === REVIEW_AGAIN;
   }
+  return undefined;
 }
 
 async function invokeUI(
@@ -443,11 +554,11 @@ async function invokeUI(
     if (!purpose || !validDisplayMetadata(question) || !current()) return undefined;
     await closeReadOnlyView(ctx);
     if (!current()) return undefined;
+    if (question.material) return await invokeDecisionCard(ctx, question, purpose, current, signal);
     const text = reviewText(question, purpose);
     let needsReview = true;
     while (current()) {
       if (needsReview) {
-        if (!current()) return undefined;
         const reviewed = await reviewScope(ctx, text, current, signal, question.material);
         if (!current() || !reviewed) return undefined;
       }

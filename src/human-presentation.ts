@@ -183,7 +183,14 @@ export function boardMaterial(decision: Readonly<DecisionRecord>): HumanMaterial
       title: "缺少结构化范围",
       markdown: "权限未知，需要完整替代请求；浏览不能取得权限。",
     });
-  return { context: decision.question, sections };
+  const summary =
+    spec?.kind === "authorization"
+      ? [`范围：${spec.scope}`, `禁止：${spec.prohibitions.join("；")}`]
+      : [
+          `影响：本次仅${spec?.kind === "information" ? "填写信息" : "选择方案"}，不新增执行权限。`,
+          `用途：${decision.whyUserOwned}`,
+        ];
+  return { context: decision.question, summary, sections };
 }
 
 function permissionMaterial(
@@ -214,6 +221,13 @@ export function preflightMaterial(
     return { context: state.goal, sections: [{ title: "尚无完整方案", markdown: state.goal }] };
   return {
     context: state.goal,
+    summary: [
+      `禁止：${proposal.prohibitions.join("；")}`,
+      ...proposal.permissions
+        .filter((p) => selectedIds.includes(p.id))
+        .map((p) => `${p.action}；对象：${p.target}；风险：${p.risks}`),
+      start ? "本次只确认首次启动，不扩大已有权限。" : "本次只确认范围，不会启动执行。",
+    ],
     sections: [
       { title: "目标与方案", markdown: `${state.goal}\n\n${proposal.summary}` },
       ...proposal.permissions.map((permission) =>

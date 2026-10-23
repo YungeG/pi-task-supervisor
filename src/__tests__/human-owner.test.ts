@@ -137,9 +137,24 @@ function fixture(board: TaskBoardSnapshot) {
   });
   mock.api.appendEntry("continuous-tasks:snapshot", board);
   setBoard(board);
-  vi.mocked(ctx.ui.select).mockResolvedValue("允许上述范围");
+  vi.mocked(ctx.ui.select).mockImplementation(async (_title, labels) => {
+    if (labels.includes("确认提交信息")) return "确认提交信息";
+    if (labels.includes("确认提交所选方案")) return "确认提交所选方案";
+    return "允许上述范围";
+  });
   Object.assign(ctx.ui, { input: vi.fn(async () => "42") });
+  let draftChoice = 1;
+  let informationOverride: string | undefined;
   const ui = installCustomUI(ctx, (d) => {
+    if (informationOverride !== undefined) {
+      d.press(informationOverride);
+      d.press("\r");
+      expect(d.render()).toContain("未保存");
+      d.press("\u001b");
+      return;
+    }
+    if (draftChoice > 1 && d.render().includes("需要你回应"))
+      for (let i = 0; i < draftChoice; i++) d.press("\u001b[B");
     d.reviewAll();
   });
   drivers.push(ui);
@@ -148,6 +163,12 @@ function fixture(board: TaskBoardSnapshot) {
     ctx,
     path,
     ui,
+    chooseDraft: (index: number) => {
+      draftChoice = index;
+    },
+    informationDraft: (value: string) => {
+      informationOverride = value;
+    },
     failWrites: (predicate: (kind: string) => boolean) => {
       fail = predicate;
     },
@@ -179,7 +200,8 @@ describe("board owner live publisher and carrier", () => {
     const result = await answerBoardDecision(test.api, test.ctx);
     test.ui.assertNoScriptErrors();
     expect(result.status).toBe("deferred");
-    expect(test.ui.rendered.join("\n")).toContain("格式化浏览");
+    expect(test.ui.rendered.join("\n")).not.toContain("格式化浏览");
+    expect(test.ui.rendered.join("\n")).toContain("m 材料");
     expect(test.ui.rendered.join("\n")).toContain("只读核对");
     expect(test.ui.reviewedMaterial.join("\n")).toContain("Only·local·tests");
     const title = vi.mocked(test.ctx.ui.select).mock.calls[0]?.[0] ?? "missing";
@@ -202,7 +224,7 @@ describe("board owner live publisher and carrier", () => {
     "delivers the saved %s value in the one tool result",
     async (kind) => {
       const test = fixture(baseBoard());
-      if (kind === "choice") vi.mocked(test.ctx.ui.select).mockResolvedValue("选项 2 · Option B");
+      if (kind === "choice") test.chooseDraft(2);
       const decision = waitingBoard(kind).decision!;
       const result = await createWorkflowGateTool(test.api).execute(
         "gate",
@@ -216,7 +238,7 @@ describe("board owner live publisher and carrier", () => {
       expect(result.content).toHaveLength(1);
       expect(test.ui.reviewedMaterial.join("")).toContain("User-owned·information");
       if (kind === "choice")
-        expect(vi.mocked(test.ctx.ui.select).mock.calls.at(-1)?.[1]).toContain("选项 2 · Option B");
+        expect(vi.mocked(test.ctx.ui.select).mock.calls.at(-1)?.[0]).toContain("Option B");
       const text = JSON.stringify(result.content);
       expect(text).toContain(kind === "choice" ? "Option B" : "42");
       expect(text).toContain("controlEntryId");
@@ -317,7 +339,7 @@ describe("board owner live publisher and carrier", () => {
     expect(restored.workflowStatus).toBe("active");
     expect(currentRuntime().journalFault).toMatch(/projection/i);
     expect(boardHumanContext(test.ctx)).toContain('"value":"42"');
-    expect(test.ctx.ui.input).toHaveBeenCalledTimes(1);
+    expect(test.ctx.ui.select).toHaveBeenCalledTimes(1);
     expect(test.sendMessage).not.toHaveBeenCalled();
   });
   it("repairs only the saved board cache without asking or dispatching again", async () => {
@@ -336,7 +358,7 @@ describe("board owner live publisher and carrier", () => {
     expect(getBoard().workflowStatus).toBe("active");
     expect(currentRuntime().boardRepair).toBeUndefined();
     expect(currentRuntime().journalFault).toBeUndefined();
-    expect(test.ctx.ui.input).toHaveBeenCalledTimes(1);
+    expect(test.ctx.ui.select).toHaveBeenCalledTimes(1);
     expect(test.sendMessage).not.toHaveBeenCalled();
   });
   it("makes board repair a no-op when exact C is already present", async () => {
@@ -431,12 +453,12 @@ describe("board owner live publisher and carrier", () => {
     async (reason) => {
       const test = fixture(waitingBoard());
       const abort = new AbortController();
-      vi.mocked(test.ctx.ui.input).mockImplementation(async () => {
+      vi.mocked(test.ctx.ui.select).mockImplementation(async () => {
         if (reason === "cancel") abort.abort();
         else if (reason === "pending input")
           vi.mocked(test.ctx.hasPendingMessages).mockReturnValue(true);
         else setBoard({ ...getBoard(), generation: 2 });
-        return "42";
+        return "确认提交信息";
       });
       expect((await answerBoardDecision(test.api, test.ctx, abort.signal)).status).toBe("deferred");
       expect(test.appendEntry.mock.calls.some(([kind]) => kind === "continuous-tasks:event")).toBe(
@@ -447,7 +469,7 @@ describe("board owner live publisher and carrier", () => {
   );
   it("does not save an invalid typed information value", async () => {
     const test = fixture(waitingBoard());
-    vi.mocked(test.ctx.ui.input).mockResolvedValue("not an integer");
+    test.informationDraft("not an integer");
     expect((await answerBoardDecision(test.api, test.ctx)).status).toBe("deferred");
     expect(getBoard().workflowStatus).toBe("waiting_for_decision");
     expect(test.appendEntry.mock.calls.some(([kind]) => kind === "continuous-tasks:event")).toBe(
@@ -457,6 +479,7 @@ describe("board owner live publisher and carrier", () => {
 
   it("records an actual authorization rejection once and never asks the terminal decision again", async () => {
     const test = fixture(waitingBoard("authorization"));
+    test.chooseDraft(2);
     vi.mocked(test.ctx.ui.select).mockResolvedValue("不允许");
     const rejected = await answerBoardDecision(test.api, test.ctx);
     expect(rejected).toMatchObject({
@@ -484,7 +507,7 @@ describe("board owner live publisher and carrier", () => {
     expect(test.appendEntry).toHaveBeenCalledTimes(count + 1);
     expect(test.appendEntry.mock.calls.at(-1)?.[0]).toBe("continuous-tasks:snapshot");
     expect(test.sendMessage).not.toHaveBeenCalled();
-    expect(test.ctx.ui.input).toHaveBeenCalledTimes(1);
+    expect(test.ctx.ui.select).toHaveBeenCalledTimes(1);
   });
 
   it("does not accept a no-op control append as a saved response", async () => {
@@ -507,7 +530,7 @@ describe("board owner live publisher and carrier", () => {
   });
   it("rejects a base changed on disk during the native callback", async () => {
     const test = fixture(waitingBoard());
-    vi.mocked(test.ctx.ui.input).mockImplementation(async () => {
+    vi.mocked(test.ctx.ui.select).mockImplementation(async () => {
       const entries = test.ctx.sessionManager.getBranch();
       const base = entries[0];
       if (!base || base.type !== "custom") throw new Error("Missing base fixture");
@@ -517,7 +540,7 @@ describe("board owner live publisher and carrier", () => {
         test.path,
         header + "\n" + entries.map((e) => JSON.stringify(e)).join("\n") + "\n",
       );
-      return "42";
+      return "确认提交信息";
     });
     await expect(answerBoardDecision(test.api, test.ctx)).rejects.toMatchObject({
       code: "READBACK_INVALID",
@@ -573,9 +596,7 @@ it.each(["Later", "稍后决定", "重新核对全文"])(
   async (value) => {
     const test = fixture(baseBoard());
     const decision = { ...waitingBoard("choice").decision!, options: [value, "Other value"] };
-    vi.mocked(test.ctx.ui.select).mockImplementationOnce(async (_title, labels) =>
-      labels.find((label) => label.startsWith("选项 1 · ")),
-    );
+    vi.mocked(test.ctx.ui.select).mockResolvedValueOnce("确认提交所选方案");
     const result = await createWorkflowGateTool(test.api).execute(
       "gate",
       {
@@ -588,7 +609,7 @@ it.each(["Later", "稍后决定", "重新核对全文"])(
       test.ctx,
     );
     test.ui.assertNoScriptErrors();
-    expect(vi.mocked(test.ctx.ui.select).mock.calls.at(-1)?.[1]).toContain(`选项 1 · ${value}`);
+    expect(vi.mocked(test.ctx.ui.select).mock.calls.at(-1)?.[0]).toContain(JSON.stringify(value));
     expect(result.isError).not.toBe(true);
     expect(
       result.content.map((part) => (part.type === "text" ? part.text : "")).join(""),

@@ -551,6 +551,13 @@ try {
           if (customMode === "scope") {
             for (let page = 0; page < 10000 && !completed; page++) {
               const header = render().split("\n")[0];
+              if (header.includes("需要你回应")) {
+                const card = render();
+                if (/→\s*稍后决定（不提交）/u.test(card)) press("\u001b[B");
+                if (card.split("\n").some(line => line.trim() === ">")) press("42");
+                press("\r");
+                continue;
+              }
               if (header !== "只读核对（非作答）" && header !== "格式化浏览（非核对、非作答）")
                 throw new Error("Expected actual formatted/original scope-review page");
               press("\r");

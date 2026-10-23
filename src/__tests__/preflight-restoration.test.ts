@@ -103,6 +103,7 @@ it("retains the used start request through later rejection and approval", async 
   const h = await proposed(true);
   await h.command("start");
   const started = state();
+  h.chooseDraft(2);
   vi.mocked(h.ctx.ui.select).mockResolvedValue("不允许");
   await approvePreflight(h.mock.api, h.ctx);
   vi.mocked(h.ctx.ui.select).mockResolvedValue("允许上述范围");
@@ -225,7 +226,7 @@ it("does not close a genuine deferred legacy permission question merely because 
   expect(currentPreflightRequestIssue(h.ctx, currentRuntime().preflight!)).toContain("unanswered");
   const writes = h.entries.length;
   const command = h.mock.registerCommand.mock.calls[0]![1];
-  vi.mocked(h.ctx.ui.select).mockResolvedValue("选项 1");
+  vi.mocked(h.ctx.ui.select).mockResolvedValue("确认提交所选方案");
   await command.handler("supervise Do not hide the legacy question", h.ctx);
   expect(h.entries).toHaveLength(writes);
   expect(currentRuntime().goal?.current).toBeUndefined();
@@ -334,6 +335,7 @@ it.each(["answer", "revoke"])(
       expect(currentPreflightRequestIssue(h.ctx, currentRuntime().preflight!)).toContain(
         "unanswered",
       );
+      h.chooseDraft(2);
       vi.mocked(h.ctx.ui.select).mockResolvedValue("不允许");
       const denied = await approvePreflight(h.mock.api, h.ctx, undefined, "all");
       expect(denied.confirmed?.kind).toBe("reject");
@@ -346,7 +348,7 @@ it.each(["answer", "revoke"])(
     h.mock.sendMessage.mockClear();
     restoreWithoutWrites(h);
     expect(currentPreflightRequestIssue(h.ctx, currentRuntime().preflight!)).toBeUndefined();
-    vi.mocked(h.ctx.ui.select).mockResolvedValue("选项 1");
+    vi.mocked(h.ctx.ui.select).mockResolvedValue("确认提交所选方案");
     const command = h.mock.registerCommand.mock.calls[0]![1];
     await command.handler("supervise After actual owner closure", h.ctx);
     expect(currentRuntime().goal?.current?.scope.goalRunId).toBeTruthy();

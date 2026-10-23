@@ -63,13 +63,22 @@ export function preflightLifecycle() {
     leaf = id;
     appendFileSync(path, JSON.stringify(entries.at(-1)) + "\n");
   });
+  let nextDraftChoice = 1;
   const ui = installCustomUI(h.ctx, (d) => {
+    const choice = nextDraftChoice;
+    nextDraftChoice = 1;
+    if (choice > 1 && d.render().includes("需要你回应"))
+      for (let i = 0; i < choice; i++) d.press("\u001b[B");
     d.reviewAll();
   });
   drivers.push(ui);
   const command = async (args: string) => {
     vi.mocked(h.ctx.ui.select).mockImplementation(async (_title, options) =>
-      options.includes("开始执行") ? "开始执行" : "允许上述范围",
+      options.includes("开始执行")
+        ? "开始执行"
+        : options.includes("确认提交所选方案")
+          ? "确认提交所选方案"
+          : "允许上述范围",
     );
     try {
       await h.command(args);
@@ -81,6 +90,9 @@ export function preflightLifecycle() {
     ...h,
     command,
     ui,
+    chooseDraft: (index: number) => {
+      nextDraftChoice = index;
+    },
     entries,
     path,
     syncJournal: () => {

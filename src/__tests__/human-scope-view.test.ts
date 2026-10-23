@@ -147,11 +147,11 @@ describe("createScopeReview", () => {
     [25.9, 8.9],
     [80, 24],
     [120, 60],
-  ])("bounds output at %s columns and %s rows, body at most 18 lines", (width, rows) => {
+  ])("bounds output at %s columns and %s rows, using available body height", (width, rows) => {
     const review = createScopeReview(threePages.repeat(100), environment(rows), vi.fn());
     const lines = review.render(width);
     expect(lines.length).toBeLessThanOrEqual(Math.floor(rows));
-    expect(body(lines).length).toBeLessThanOrEqual(18);
+    expect(body(lines).length).toBeLessThanOrEqual(Math.floor(rows) - 5);
     expect(lines.every((line) => visibleWidth(line) <= Math.floor(width))).toBe(true);
     review.dispose();
   });

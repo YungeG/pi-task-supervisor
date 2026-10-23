@@ -105,6 +105,7 @@ it.each([
     return;
   }
   const beforeAnswer = f.entries().length;
+  if (["读回丢失", "不允许", "队列变化", "Main繁忙"].includes(choice)) f.chooseDraft(2);
   const sends = f.sendMessage.mock.calls.length;
   if (choice === "读回丢失")
     f.fail((kind, data: any) =>
@@ -159,7 +160,7 @@ it.each([
   await f.fire("session_tree");
   expect(currentRuntime().goal?.current?.phase).toBe("stopped");
   expect(currentRuntime().supervisor).toBeUndefined();
-  vi.mocked(f.ctx.ui.select).mockResolvedValue("选项 1");
+  vi.mocked(f.ctx.ui.select).mockResolvedValue("确认提交所选方案");
   await f.command("supervise After actual owner closure");
   expect(currentRuntime().goal?.current?.scope.goalRunId).not.toBe(id);
 });
@@ -316,7 +317,7 @@ it.each(["started", "revoked"])(
     expect(currentRuntime().goal?.current?.phase).toBe("stopped");
     const state = structuredClone(currentRuntime().preflight);
     const writes = f.entries().length;
-    vi.mocked(f.ctx.ui.select).mockResolvedValue("选项 1");
+    vi.mocked(f.ctx.ui.select).mockResolvedValue("确认提交所选方案");
     await f.command("supervise Must not hide current request");
     expect(currentRuntime().goal?.current?.scope.goalRunId).toBe(id);
     expect(currentRuntime().preflight).toEqual(state);

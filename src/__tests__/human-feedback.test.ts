@@ -80,24 +80,32 @@ function harness() {
   const theme = createMockTheme();
   vi.mocked(theme.fg).mockImplementation((_color, text) => text);
   const keys = new KeybindingsManager(TUI_KEYBINDINGS);
-  let completed: unknown;
+  let completionDone = false;
   function drive(action: "review" | "cancel" = "review"): void {
     const component = components.at(-1)!;
-    for (let page = 0; page < 10000 && completed === undefined; page++) {
+    for (let page = 0; page < 10000 && !completionDone; page++) {
       const lines = component.render(control.width);
       rendered.push(lines);
+      if (action !== "cancel" && lines[0]?.includes("需要你回应")) {
+        if (lines.some((line) => /→\s*稍后决定（不提交）/u.test(line)))
+          component.handleInput?.("\u001b[B");
+        if (lines.some((line) => line.trim() === ">")) component.handleInput?.("42");
+        component.render(control.width);
+        component.handleInput?.("\r");
+        continue;
+      }
       // A tiny viewport is cancel-only. Leave it pending for explicit test input.
       if (action !== "cancel" && !lines[1]?.startsWith("第 ")) return;
       component.handleInput?.(action === "cancel" ? "\u001b" : "\r");
     }
-    if (completed === undefined) throw new Error("Review did not complete");
+    if (!completionDone) throw new Error("Review did not complete");
   }
   const custom = vi.fn(
     (factory: any) =>
       new Promise((resolve) => {
-        completed = undefined;
+        completionDone = false;
         const done = (value: unknown) => {
-          completed = value;
+          completionDone = true;
           resolve(value);
         };
         control.beforeFactory?.();
@@ -1316,6 +1324,60 @@ describe("original admission and opaque answer validation remain closed", () => 
 });
 
 describe("display-only context for formatted questions", () => {
+  it.each([false, true])(
+    "does not accept a forged card draft (factory callback=%s)",
+    async (useFactory) => {
+      const h = harness();
+      const fake = Object.freeze({ kind: "authorization", index: 1 });
+      const q = question({
+        material: { context: "scope", sections: [{ title: "scope", markdown: "read only" }] },
+      });
+      h.custom.mockImplementationOnce(async (factory: any) => {
+        if (useFactory) {
+          const component = factory(
+            { terminal: { rows: 30 }, requestRender: vi.fn() },
+            createMockTheme(),
+            new KeybindingsManager(TUI_KEYBINDINGS),
+            (_value: unknown) => {},
+          );
+          component.render(120);
+          component.done(fake);
+        }
+        return fake;
+      });
+      expect(await requestNativeAnswer(h.ctx, q, () => true)).toBeUndefined();
+      expect(h.ctx.ui.select).not.toHaveBeenCalled();
+      expect(h.ctx.ui.input).not.toHaveBeenCalled();
+    },
+  );
+  it.each(["authorization", "choice", "information"] as const)(
+    "starts %s with an actual formatted answer card, not the raw pager",
+    async (kind) => {
+      const h = harness();
+      h.setAction("hold");
+      const q = question({
+        kind,
+        title: "怎样处理候选？",
+        body: "## 关键范围\n\n- **只读审阅**\n- 不安装、不 reload",
+        options: kind === "choice" ? ["只读审阅", "补足材料"] : undefined,
+        material: { context: "候选决策", sections: [{ title: "范围", markdown: "只读审阅" }] },
+      });
+      const pending = requestNativeAnswer(h.ctx, q, () => true);
+      await vi.waitFor(() => {
+        expect(h.custom).toHaveBeenCalledOnce();
+      });
+      const first = h.rendered.at(-1)?.join("\n") ?? "";
+      expect(first).toContain("需要你回应");
+      expect(first).toContain("怎样处理候选？");
+      expect(first).toContain(kind === "information" ? "填写信息" : "稍后决定");
+      expect(first).not.toContain("##·关键范围");
+      expect(first).not.toContain("只读核对（非作答）");
+      expect(h.ctx.ui.select).not.toHaveBeenCalled();
+      expect(h.ctx.ui.input).not.toHaveBeenCalled();
+      h.drive("cancel");
+      expect(await pending).toBeUndefined();
+    },
+  );
   it("captures display material before asynchronous UI work and binds the original opaque answer", async () => {
     const h = harness();
     const material = {
@@ -1323,6 +1385,13 @@ describe("display-only context for formatted questions", () => {
       sections: [{ title: "原始栏目", markdown: "ORIGINAL_MATERIAL" }],
     };
     const q = question({ material });
+    h.control.afterFactory = () => {
+      const view = h.components.at(-1)!;
+      view.render(80);
+      view.handleInput?.("m");
+      h.rendered.push(view.render(80));
+      view.handleInput?.("\u001b");
+    };
     vi.mocked(h.ctx.ui.select).mockResolvedValueOnce("允许上述范围");
     const pending = requestNativeAnswer(h.ctx, q, () => true);
     material.context = "MUTATED_CONTEXT";
@@ -1349,6 +1418,8 @@ describe("display-only context for formatted questions", () => {
       expect(h.custom).toHaveBeenCalledOnce();
     });
     const view = h.components[0];
+    view?.handleInput?.("m");
+    h.rendered.push(view?.render(80) ?? []);
     view?.handleInput?.("\r");
     for (let i = 0; i < 100; i++) view?.handleInput?.("\r");
     expect(h.ctx.ui.select).not.toHaveBeenCalled();
@@ -1370,15 +1441,24 @@ describe("display-only context for formatted questions", () => {
         sections: [{ title: "信息要求", markdown: "日期 YYYY-MM-DD" }],
       },
     });
-    vi.mocked(h.ctx.ui.input).mockResolvedValueOnce(rejected).mockResolvedValueOnce("2024-02-29");
-    vi.mocked(h.ctx.ui.select).mockResolvedValueOnce("重新输入");
+    h.control.afterFactory = () => {
+      const view = h.components.at(-1)!;
+      view.render(80);
+      view.handleInput?.(rejected);
+      view.render(80);
+      view.handleInput?.("\r");
+      const cleared = view.render(80);
+      h.rendered.push(cleared);
+      expect(cleared.join("\n")).not.toContain(rejected);
+      view.handleInput?.("2024-02-29");
+      view.render(80);
+    };
+    vi.mocked(h.ctx.ui.select).mockResolvedValueOnce("确认提交信息");
     const answer = await requestNativeAnswer(h.ctx, q, () => true);
     expect(answer?.value).toBe("2024-02-29");
     expect(requireNativeAnswer(h.ctx, answer, q.frame)).toBe(answer);
-    for (const [title, placeholder] of vi.mocked(h.ctx.ui.input).mock.calls) {
-      expect(title).toContain("问题：文档标签日期");
-      expect(placeholder).toBeUndefined();
-    }
+    expect(h.ctx.ui.input).not.toHaveBeenCalled();
+    expect(vi.mocked(h.ctx.ui.select).mock.calls[0]?.[0]).toContain("问题：文档标签日期");
     const allUi = JSON.stringify([
       h.rendered,
       vi.mocked(h.ctx.ui.select).mock.calls,
@@ -1430,7 +1510,7 @@ describe("display-only context for formatted questions", () => {
     vi.mocked(h.ctx.ui.select).mockResolvedValueOnce("选项 2");
     expect(await requestNativeAnswer(h.ctx, q, () => true)).toBeUndefined();
     const [title, labels] = vi.mocked(h.ctx.ui.select).mock.calls[0] ?? ["", []];
-    expect(title.split("\n")).toHaveLength(2);
+    expect(title.split("\n")).toHaveLength(3);
     expect(title.split("\n").every((line) => visibleWidth(line) <= 64)).toBe(true);
     expect(title).not.toContain("\u202e");
     expect(new Set(labels).size).toBe(labels.length);
@@ -1449,10 +1529,18 @@ describe("display-only context for formatted questions", () => {
         sections: [{ title: "选项", markdown: "只读选项说明" }],
       },
     });
-    vi.mocked(h.ctx.ui.select).mockImplementationOnce(async (_title, labels) => labels[2]);
+    h.control.afterFactory = () => {
+      const view = h.components.at(-1)!;
+      view.render(80);
+      view.handleInput?.("\u001b[B");
+      view.render(80);
+      view.handleInput?.("\u001b[B");
+      h.rendered.push(view.render(80));
+    };
+    vi.mocked(h.ctx.ui.select).mockResolvedValueOnce("确认提交所选方案");
     const answer = await requestNativeAnswer(h.ctx, q, () => true);
     const labels = vi.mocked(h.ctx.ui.select).mock.calls[0]?.[1] ?? [];
-    expect(labels[2]).toBe('选项 2 · " 稍后决定 "');
+    expect(h.rendered.flat().join("\n")).toContain('选项 2 · " 稍后决定 "');
     expect(new Set(labels).size).toBe(labels.length);
     expect(answer?.value).toBe(" 稍后决定 ");
     expect(requireNativeAnswer(h.ctx, answer, q.frame)).toBe(answer);
@@ -1470,12 +1558,13 @@ describe("display-only context for formatted questions", () => {
     expect(await requestNativeAnswer(h.ctx, q, () => true)).toBeUndefined();
     const title = vi.mocked(h.ctx.ui.select).mock.calls[0]?.[0] ?? "missing";
     const lines = title.split("\n");
-    expect(lines).toHaveLength(2);
+    expect(lines).toHaveLength(3);
     expect(lines[0]).toBe("范围确认（全文已核对） — 请求 request");
     expect(lines[1]).toContain("核对本地代码范围");
     expect(visibleWidth(lines[1] ?? "")).toBeLessThanOrEqual(64);
     expect(lines[1]).not.toContain("\u001b");
     expect(h.rendered.flat().join("\n")).toContain("Full·original·body");
-    expect(h.rendered.flat().join("\n")).toContain("格式化浏览");
+    expect(h.rendered.flat().join("\n")).not.toContain("格式化浏览");
+    expect(h.rendered.flat().join("\n")).toContain("m 材料");
   });
 });

@@ -114,8 +114,13 @@ export async function goalFixture(
   const oldEntry = [...entries]
     .reverse()
     .find((e) => e.customType === "continuous-tasks:snapshot")!;
-  vi.mocked(ctx.ui.select).mockResolvedValue("选项 1");
+  vi.mocked(ctx.ui.select).mockResolvedValue("确认提交所选方案");
+  let nextDraftChoice = 1;
   const ui = installCustomUI(ctx, (driver) => {
+    const choice = nextDraftChoice;
+    nextDraftChoice = 1;
+    if (choice > 1 && driver.render().includes("需要你回应"))
+      for (let i = 0; i < choice; i++) driver.press("\u001b[B");
     driver.reviewAll();
   });
   mock.sendMessage.mockClear();
@@ -127,6 +132,9 @@ export async function goalFixture(
     old,
     oldEntry,
     ui,
+    chooseDraft: (index: number) => {
+      nextDraftChoice = index;
+    },
     command: (input: string) => command.handler(input, ctx),
     fire: (event: string, payload: unknown = {}) => getHandler(mock, event)(payload, ctx),
     entries: () => entries,

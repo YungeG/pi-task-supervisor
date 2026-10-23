@@ -1,5 +1,10 @@
 import type { ExtensionContext } from "@earendil-works/pi-coding-agent";
-import { KeybindingsManager, TUI_KEYBINDINGS, type Component } from "@earendil-works/pi-tui";
+import {
+  KeybindingsManager,
+  TUI_KEYBINDINGS,
+  stripTerminalSequences,
+  type Component,
+} from "@earendil-works/pi-tui";
 import { vi } from "vitest";
 import { createMockTheme } from "./mocks";
 
@@ -56,7 +61,16 @@ export function installCustomUI(ctx: ExtensionContext, script?: (driver: Driver)
       const before = doneCount;
       for (let page = 0; page < 10000; page++) {
         const lines = driver.render().split("\n");
-        if (!lines[1]?.startsWith("第 ")) throw new Error("Expected a real scope review page");
+        if (lines[0]?.includes("需要你回应")) {
+          const visible = lines.map(stripTerminalSequences);
+          if (visible.some((line) => /→\s*稍后决定（不提交）/u.test(line))) driver.press(DOWN);
+          if (visible.some((line) => line.trim() === ">")) driver.press("42");
+          driver.press(ENTER);
+          if (doneCount !== before) return;
+          continue;
+        }
+        if (!lines[1]?.startsWith("第 "))
+          throw new Error("Expected a real scope review page or decision card");
         // Formatted browsing is not exact-source review evidence.
         if (lines[0] === "只读核对（非作答）") reviewedMaterial.push(...lines.slice(3, -2));
         driver.press(ENTER);

@@ -3,10 +3,11 @@
 import argparse, errno, fcntl, hashlib, json, os, pathlib, pty, re, select, shutil, signal, struct, tempfile, termios, time, uuid
 
 parser = argparse.ArgumentParser()
-parser.add_argument('scenario', choices=['sequential', 'permissions', 'sdk-denial'])
+parser.add_argument('scenario', choices=['sequential', 'permissions', 'information', 'sdk-denial'])
 parser.add_argument('--source', type=pathlib.Path, default=pathlib.Path(__file__).resolve().parent.parent)
 parser.add_argument('--cli', type=pathlib.Path)
 parser.add_argument('--out', type=pathlib.Path)
+parser.add_argument('--decision-layouts', action='store_true', help='exercise optional Markdown reading and wide split without submitting')
 args = parser.parse_args()
 source = args.source.resolve()
 cli = (args.cli or source/'node_modules/@earendil-works/pi-coding-agent/dist/cli.js').resolve()
@@ -43,6 +44,7 @@ fcntl.ioctl(fd, termios.TIOCSWINSZ, struct.pack('HHHH', 42, 120, 0, 0))
 ansi = re.compile(rb'\x1b(?:\[[0-?]*[ -/]*[@-~]|\][^\x07]*(?:\x07|\x1b\\)|[@-Z\\-_])')
 data = bytearray(); transcript = sandbox/'terminal.log'; log = transcript.open('wb'); stage = 'startup'
 overall_deadline = time.monotonic()+150
+layout_checks = 0
 def text():
     return ansi.sub(b'', bytes(data)).decode('utf8', 'replace')
 def receive(pattern, timeout=40):
@@ -63,14 +65,34 @@ def send(value):
     data.clear(); os.write(fd, value.encode())
 def command(value):
     send(value+'\r')
+def card_layouts():
+    global layout_checks
+    send('\x1bOS'); receive('格式化浏览')
+    send('\x1b'); receive('A 会话卡')
+    send('\x1bOR'); receive('C 双栏')
+    send('\x1bOS'); receive('格式化浏览')
+    send('\x1b'); receive('C 双栏')
+    send('\x1bOR'); receive('A 会话卡')
+    layout_checks += 1
 def answer(kind):
     global stage
-    stage = 'native original-scope review '+kind
-    receive('只读核对|格式化浏览')
+    stage = 'native draft and scope review '+kind
+    receive('需要你回应|只读核对|格式化浏览')
+    if '需要你回应' in text():
+        if args.decision_layouts: card_layouts()
+        send('\x1b[B'); receive('→.*(?:允许上述范围|开始执行|选项 1)')
+        send('\r'); receive('只读核对')
+        for _ in range(128):
+            send('\r')
+            match=receive(r'(需要你回应)|(第\s*\d+/\d+\s*页)')
+            if match.group(1): break
+        else: raise AssertionError('native source review did not return to draft')
+        stage = 'explicit draft submit, then native final '+kind
+        send('\r'); receive('全文已核对')
+        send('\x1b[B\r')
+        return
     if '格式化浏览' in text():
         send('r'); receive('只读核对')
-    # A formatted/raw switch can keep an identical pager row, so native diff rendering
-    # legitimately omits it. The raw footer establishes the first shown page.
     receive(r'下一页:|继续作答:')
     for _ in range(128):
         send('\r')
@@ -134,6 +156,26 @@ if args.scenario == 'sdk-denial':
     raise SystemExit(0)
 try:
     receive('GOAL_NATIVE_READY'); initial = probe('initial'); assert initial['modelCalls']==0
+    if args.scenario == 'information':
+        stage = 'native same-screen information input'
+        command('/goal-native-information'); receive('需要你回应')
+        send('42'); receive('42')
+        send('\x1bOS'); receive('格式化浏览')
+        send('\x1b'); receive('A 会话卡')
+        send('\x1bOR'); receive('C 双栏')
+        send('\t'); receive('焦点：完整原文')
+        send('\r'); receive('完整原文已核对')
+        send('\r'); receive('补充信息（全文已核对）')
+        send('\x1b[B\r'); receive('GOAL_NATIVE_INFORMATION_SAVED')
+        final = probe('information-final')
+        controls=[row for row in final['entries'] if row.get('customType')=='continuous-tasks:event' and row['data'].get('type')=='resolve_decision']
+        assert len(controls)==1 and controls[0]['data']['answer']=='42' and controls[0]['data']['outcome']=='answer'
+        witnesses=[row for row in final['entries'] if row.get('customType')=='continuous-tasks:human-readback']
+        assert len(witnesses)==1 and witnesses[0]['data']['controlEntryId']==controls[0]['id']
+        assert final['modelCalls']==0 and sha(settings)==before and path.read_bytes().startswith(seed)
+        report={'result':'PASS','scenario':'information','source':str(source),'actualCli':str(cli),'nativeSourceMocked':False,'syntheticKeystrokes':True,'businessExecutionCertified':False,'typedInformation':'42','sameScreenInput':True,'readonlyReturnPreservedDraft':True,'wideSourceReview':True,'nativeFinalConfirmed':True,'settingsUnchanged':True,'originalHistoryBytesUnchanged':True,'probe':str(sandbox/'information-final.json'),'sessionFile':str(path),'transcript':str(transcript)}
+        (sandbox/'verified.json').write_text(json.dumps(report,indent=2)+'\n'); print(json.dumps(report),flush=True)
+        raise SystemExit(0)
     stage = 'native archive-and-plan'
     command('/task-supervisor supervise Owned native next goal'); answer('archive')
     if args.scenario == 'sequential':
@@ -170,7 +212,7 @@ try:
     verify_native_commits(final)
     raw = path.read_bytes(); assert raw.startswith(seed) and raw.endswith(b'\n')
     assert sha(settings)==before
-    report = {'result':'PASS','scenario':args.scenario,'source':str(source),'actualCli':str(cli),'nativeSourceMocked':False,'syntheticKeystrokes':True,'businessExecutionCertified':False,'settingsUnchanged':True,'originalHistoryBytesUnchanged':True,'probe':str(sandbox/'final.json'),'sessionFile':str(path),'transcript':str(transcript)}
+    report = {'result':'PASS','scenario':args.scenario,'source':str(source),'actualCli':str(cli),'nativeSourceMocked':False,'syntheticKeystrokes':True,'businessExecutionCertified':False,'decisionLayoutChecks':layout_checks,'settingsUnchanged':True,'originalHistoryBytesUnchanged':True,'probe':str(sandbox/'final.json'),'sessionFile':str(path),'transcript':str(transcript)}
     (sandbox/'verified.json').write_text(json.dumps(report,indent=2)+'\n')
     print(json.dumps(report), flush=True)
 finally:

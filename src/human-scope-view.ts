@@ -85,6 +85,14 @@ class ScopeReview implements Component {
     this.done(result);
   }
 
+  /** Theme the literal source without interpreting or hiding any original bytes. */
+  private bodyLine(line: string, first: boolean): string {
+    if (first || line.endsWith(":") || line.endsWith("："))
+      return this.env.theme.fg("mdHeading", line);
+    if (line.startsWith("```")) return this.env.theme.fg("mdCodeBlockBorder", line);
+    return line;
+  }
+
   render(width: number): string[] {
     if (this.closed) return [];
     width = dimension(width);
@@ -97,7 +105,7 @@ class ScopeReview implements Component {
     }
     if (!this.layout) {
       const lines = wrapTextWithAnsi(this.text, width);
-      const pageSize = Math.min(18, rows - 5);
+      const pageSize = rows - 5;
       this.layout = { width, rows, lines, pageSize, pages: Math.ceil(lines.length / pageSize) };
     }
     const { lines, pageSize, pages } = this.layout;
@@ -108,7 +116,9 @@ class ScopeReview implements Component {
       this.env.theme.fg("accent", "只读核对（非作答）"),
       chrome(`第 ${this.page + 1}/${pages} 页`),
       chrome("· 空格；\\ 转义"),
-      ...lines.slice(this.page * pageSize, (this.page + 1) * pageSize),
+      ...lines
+        .slice(this.page * pageSize, (this.page + 1) * pageSize)
+        .map((line, index) => this.bodyLine(line, this.page === 0 && index === 0)),
       chrome(`Esc 取消 | 回看: ${keyName("tui.select.up")}`),
       chrome(
         `${this.page === pages - 1 ? "继续作答" : "下一页"}: ${keyName("tui.select.confirm")}`,
@@ -164,6 +174,10 @@ export function createScopeReview(
   done: (result: ReviewResult) => void,
   material?: HumanMaterial,
 ): Component & { dispose(): void } {
-  const raw = new ScopeReview(text, env, done);
-  return material ? new MaterialReading(material, raw, env) : raw;
+  const raw = new ScopeReview(text, env, (result) => {
+    view?.dispose();
+    done(result);
+  });
+  const view = material ? new MaterialReading(material, raw, env) : undefined;
+  return view ?? raw;
 }

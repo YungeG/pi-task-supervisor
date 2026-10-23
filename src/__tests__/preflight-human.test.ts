@@ -114,10 +114,11 @@ it("attaches formatted reading and goal context without granting or skipping ori
   vi.mocked(h.ctx.ui.select).mockResolvedValue("稍后决定");
   await submitted(h);
   h.ui.assertNoScriptErrors();
-  expect(h.ui.rendered.join("\n")).toContain("格式化浏览");
+  expect(h.ui.rendered.join("\n")).not.toContain("格式化浏览");
+  expect(h.ui.rendered.join("\n")).toContain("m 材料");
   expect(h.ui.rendered.join("\n")).toContain("只读核对");
   const title = vi.mocked(h.ctx.ui.select).mock.calls[0]?.[0] ?? "missing";
-  expect(title.split("\n")).toHaveLength(2);
+  expect(title.split("\n")).toHaveLength(3);
   expect(title.split("\n")[1]).toContain("Local fixture");
   const original = h.ui.reviewedMaterial.join("").replaceAll("·", " ").replaceAll("\\\\", "\\");
   expect(original).toContain("未选择，本次不授权");
@@ -135,7 +136,7 @@ it("shows every permission limit and prohibition in structured native text rathe
   const material = h.ui.reviewedMaterial.join("").replaceAll("·", " ").replaceAll("\\\\", "\\");
   const title = vi.mocked(h.ctx.ui.select).mock.calls[0]?.[0] ?? "";
   expect(title).toContain("请求 ");
-  expect(title).toMatch(/^[^\r\n]+\n问题：[^\r\n]+$/u);
+  expect(title).toMatch(/^[^\r\n]+\n问题：[^\r\n]+\n草稿：[^\r\n]+$/u);
   for (const line of title.split("\n")) expect(visibleWidth(line)).toBeLessThanOrEqual(64);
   expect(material).toContain("目标：Local fixture");
   expect(material).toContain("本次允许");
@@ -186,7 +187,7 @@ it("preserves significant whitespace in the displayed scope instead of silently 
   const material = h.ui.reviewedMaterial.join("").replaceAll("·", " ").replaceAll("\\\\", "\\");
   const title = vi.mocked(h.ctx.ui.select).mock.calls[0]?.[0] ?? "";
   expect(title).toContain("请求 ");
-  expect(title).toMatch(/^[^\r\n]+\n问题：[^\r\n]+$/u);
+  expect(title).toMatch(/^[^\r\n]+\n问题：[^\r\n]+\n草稿：[^\r\n]+$/u);
   for (const line of title.split("\n")) expect(visibleWidth(line)).toBeLessThanOrEqual(64);
   expect(material).toContain('"source  files"');
   expect(material).toContain('"No publish\\nNo install"');
@@ -492,7 +493,7 @@ it("native no-ID first start confirms separately and dispatches once", async () 
   const [title, offered] = vi.mocked(h.ctx.ui.select).mock.calls.at(-1)!;
   expect(title).toContain("首次启动");
   expect(title).toContain("请求 ");
-  expect(title).toMatch(/^[^\r\n]+\n问题：[^\r\n]+$/u);
+  expect(title).toMatch(/^[^\r\n]+\n问题：[^\r\n]+\n草稿：[^\r\n]+$/u);
   for (const line of title.split("\n")) expect(visibleWidth(line)).toBeLessThanOrEqual(64);
   expect(offered).toContain("稍后启动");
   h.mock.sendMessage.mockClear();

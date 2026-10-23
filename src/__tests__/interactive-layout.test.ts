@@ -19,6 +19,8 @@ beforeEach(() => {
 
 function formattedPages(view: ReturnType<typeof createScopeReview>, width: number): string[][] {
   const pages: string[][] = [];
+  view.render(width);
+  view.handleInput?.("m");
   let previous = "";
   for (let i = 0; i < 200; i++) {
     const lines = view.render(width).map(stripTerminalSequences);
@@ -37,20 +39,15 @@ const material = {
 };
 
 describe("interactive material layout through the existing reader", () => {
-  it("formats code first but requires actual original-source rendering before review can complete", () => {
+  it("starts with canonical review and needs no mandatory formatted detour", () => {
     initTheme("dark", false);
     const done = vi.fn();
     const view = createScopeReview("ORIGINAL_REVIEW_SENTINEL", environment(), done, material);
     const first = view.render(80).map(stripTerminalSequences).join("\n");
-    expect(first).toContain("格式化浏览");
-    expect(first).toContain("  dryRun: true");
-    expect(first).not.toContain("ORIGINAL_REVIEW_SENTINEL");
-    expect(first).toContain("原文核对");
+    expect(first).not.toContain("格式化浏览");
+    expect(first).toContain("ORIGINAL_REVIEW_SENTINEL");
+    expect(first).toContain("m 材料");
     expect(done).not.toHaveBeenCalled();
-    view.handleInput?.("\r");
-    view.handleInput?.("\r");
-    expect(done).not.toHaveBeenCalled();
-    expect(view.render(80).join("\n")).toContain("ORIGINAL_REVIEW_SENTINEL");
     view.handleInput?.("\r");
     expect(done).toHaveBeenCalledExactlyOnceWith("reviewed");
     view.dispose();
@@ -138,8 +135,11 @@ describe("interactive material layout through the existing reader", () => {
     const done = vi.fn();
     const view = createScopeReview("RAW", environment(), done, material);
     view.render(80);
-    if (mode === "raw") {
-      view.handleInput?.("r");
+    if (mode === "formatted") {
+      view.handleInput?.("m");
+      view.render(80);
+      view.handleInput?.("\u001b");
+      expect(done).not.toHaveBeenCalled();
       view.render(80);
     }
     view.handleInput?.("\u001b");
@@ -220,6 +220,8 @@ describe("interactive material layout through the existing reader", () => {
     };
     const view = createScopeReview("RAW", environment(), vi.fn(), input);
     input.sections[0]!.markdown = "MUTATED_OWNER_VALUE";
+    view.render(80);
+    view.handleInput?.("m");
     const now = vi.spyOn(Date, "now").mockImplementation(() => {
       throw new Error("Deferred render read wall clock");
     });
@@ -268,6 +270,8 @@ describe("interactive material layout through the existing reader", () => {
       }),
     };
     const view = createScopeReview("RAW_REQUIRED", env, done, material);
+    view.render(80);
+    view.handleInput?.("m");
     const first = view.render(80).join("\n");
     expect(first).toContain("ctrl+x");
     expect(first).toContain("ctrl+p");
@@ -286,6 +290,8 @@ describe("interactive material layout through the existing reader", () => {
       context: "",
       sections: [],
     });
+    view.render(80);
+    view.handleInput?.("m");
     expect(view.render(80).join("\n")).toContain("未提供格式化材料");
     view.handleInput?.("\r");
     expect(done).not.toHaveBeenCalled();

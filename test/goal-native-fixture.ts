@@ -3,6 +3,8 @@ import { join } from "node:path";
 import { writeFileSync } from "node:fs";
 import { fauxProvider, fauxAssistantMessage, fauxToolCall } from "@earendil-works/pi-ai";
 import extension from "../src/index.ts";
+import { getBoardRef, setBoard } from "../src/state.ts";
+import { answerBoardDecision } from "../src/board-human.ts";
 
 const proposal = {
   summary: "Owned offline native lifecycle check; no business operations",
@@ -87,6 +89,20 @@ export default function goalNativeFixture(pi: any) {
     manager = ctx.sessionManager;
     idles++;
     ctx.ui.notify(`GOAL_NATIVE_IDLE_${idles}`, "info");
+  });
+  if (scenario === "information") pi.registerCommand("goal-native-information", {
+    description: "Owned offline information-card fixture; no business execution",
+    async handler(_args: string, ctx: any) {
+      const board = structuredClone(getBoardRef());
+      board.generation++;
+      board.workflowStatus = "waiting_for_decision";
+      board.decision = {id:"owned-information",taskId:"old-task",question:"填写候选观察天数",whyUserOwned:"只记录一个整数，不授权或执行任务。",createdAt:"2026-10-23T00:00:00.000Z",spec:{version:1,kind:"information",format:"integer"}};
+      pi.appendEntry("continuous-tasks:snapshot", board);
+      setBoard(board);
+      const result = await answerBoardDecision(pi, ctx);
+      if (result.status !== "answered" || result.confirmed?.value !== "42") throw new Error("Native information not saved exactly");
+      ctx.ui.notify("GOAL_NATIVE_INFORMATION_SAVED", "info");
+    },
   });
   pi.registerCommand("goal-native-probe", {
     description: "Read only owned offline fixture metadata",

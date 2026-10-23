@@ -15,12 +15,31 @@ import type { UiViewEnvironment } from "./ui-environment";
 /** Display-only data. It is never a request frame, proof, canonical answer or permission. */
 export interface HumanMaterial {
   readonly context: string;
+  /** Owner-derived decision summary; never substitutes for canonical review. */
+  readonly summary?: readonly string[];
   readonly sections: readonly Readonly<{ title: string; markdown: string }>[];
 }
 
 type Reader = Component & { dispose(): void };
 type Layout = { width: number; rows: number; pages: string[][] };
 type CodeRange = { start: number; end: number };
+type Surface = "card" | "material" | "split";
+const SPLIT_COLUMNS = 100;
+const NATIVE_ACTIONS = [
+  "tui.select.confirm",
+  "tui.select.cancel",
+  "tui.select.up",
+  "tui.select.down",
+  "tui.select.pageUp",
+  "tui.select.pageDown",
+] as const satisfies readonly Keybinding[];
+
+export function isNativeReadingAction(
+  keys: UiViewEnvironment["keybindings"],
+  data: string,
+): boolean {
+  return NATIVE_ACTIONS.some((action) => keys.matches(data, action));
+}
 
 function dimension(value: number): number {
   return Number.isFinite(value) ? Math.max(0, Math.floor(value)) : 0;
@@ -29,7 +48,7 @@ function escapePoint(char: string): string {
   return `\\u{${char.codePointAt(0)?.toString(16).toUpperCase()}}`;
 }
 
-/** Readability only: exact whitespace/control bytes still require the original reader. */
+/** Markdown is supplementary: canonical values remain in the original reader. */
 function safeText(text: string): string {
   const visible = Array.from(text, (char) => {
     if (char === "\n" || char === " ") return char;
@@ -75,8 +94,8 @@ function markdownTheme(env: UiViewEnvironment): MarkdownTheme {
   };
 }
 
-/** Capture native syntax output during preparation; later resize/render reads only this cache. */
-function preparedMarkdown(text: string, env: UiViewEnvironment): Markdown {
+/** Prepare syntax once, never invoke a highlighter or external work during render. */
+export function preparedMarkdown(text: string, env: UiViewEnvironment): Markdown {
   const syntax = new Map<string, readonly string[]>();
   let preparing = true;
   const theme: MarkdownTheme = {
@@ -132,12 +151,19 @@ function fittingLines(
   return crossing ? crossing.start - offset : count;
 }
 
-/** Formatted browsing cannot complete a review. Only the unchanged raw reader can do so. */
+/**
+ * A: canonical scope, once. B: optional Markdown reader. C: explicit wide view.
+ * Only `raw` owns review completion. Neither material navigation nor a preview
+ * can advance its coverage or produce an answer; native select/input follows it.
+ */
 export class MaterialReading implements Component {
   private readonly sections: Array<{ title: string; markdown: Markdown }>;
+  private readonly context: string;
   private layout: Layout | undefined;
+  private geometry: { width: number; rows: number } | undefined;
   private page = 0;
-  private rawMode = false;
+  private surface: Surface = "card";
+  private origin: "card" | "split" = "card";
   private shown = false;
   private closed = false;
 
@@ -145,7 +171,10 @@ export class MaterialReading implements Component {
     material: HumanMaterial,
     private readonly raw: Reader,
     private readonly env: UiViewEnvironment,
+    initialSurface: Surface = "card",
   ) {
+    this.surface = initialSurface;
+    this.context = material.context;
     this.sections = material.sections.map((section) => ({
       title: section.title,
       markdown: preparedMarkdown(section.markdown, env),
@@ -154,8 +183,10 @@ export class MaterialReading implements Component {
 
   invalidate(): void {
     this.layout = undefined;
+    this.geometry = undefined;
     this.page = 0;
     this.shown = false;
+    for (const section of this.sections) section.markdown.invalidate();
     this.raw.invalidate();
   }
   dispose(): void {
@@ -163,9 +194,14 @@ export class MaterialReading implements Component {
     this.invalidate();
     this.raw.dispose();
   }
-
   private keyName(action: Keybinding): string {
     return this.env.keybindings.getKeys(action).join("/") || "未绑定";
+  }
+  private nativeAction(data: string): boolean {
+    return isNativeReadingAction(this.env.keybindings, data);
+  }
+  private chrome(text: string, width: number): string {
+    return this.env.theme.fg("muted", materialLine(text, width));
   }
 
   private pages(width: number, capacity: number): string[][] {
@@ -191,8 +227,12 @@ export class MaterialReading implements Component {
           page = [];
           pages.push(page);
         }
-        const title = materialLine(`${section.title}${offset ? "（续）" : ""}`, width);
-        page.push(this.env.theme.fg("accent", this.env.theme.bold(title)));
+        page.push(
+          this.env.theme.fg(
+            "accent",
+            this.env.theme.bold(materialLine(`${section.title}${offset ? "（续）" : ""}`, width)),
+          ),
+        );
         const count = fittingLines(
           ranges,
           offset,
@@ -207,77 +247,129 @@ export class MaterialReading implements Component {
     return pages.filter((page) => page.length > 0);
   }
 
-  render(width: number): string[] {
-    if (this.closed) return [];
-    width = dimension(width);
-    const rows = dimension(this.env.rows());
-    if (this.layout && (this.layout.width !== width || this.layout.rows !== rows))
-      this.invalidate();
-    if (width < 24 || rows < 8) {
-      return width > 0 && rows > 0
-        ? [this.env.theme.fg("muted", truncateToWidth("Esc 取消", width, ""))]
-        : [];
-    }
-    this.layout ??= { width, rows, pages: this.pages(width, Math.min(18, rows - 5)) };
-    if (this.rawMode) return this.raw.render(width);
+  private material(width: number, rows: number, preview = false): string[] {
+    if (!this.layout || this.layout.width !== width || this.layout.rows !== rows)
+      this.layout = { width, rows, pages: this.pages(width, rows - 5) };
     const pages = this.layout.pages.length ? this.layout.pages : [["未提供格式化材料"]];
-    const chrome = (text: string) => this.env.theme.fg("muted", materialLine(text, width));
-    this.shown = true;
+    const page = preview ? 0 : Math.min(this.page, pages.length - 1);
+    if (!preview) this.page = page;
     return [
       this.env.theme.fg("accent", materialLine("格式化浏览（非核对、非作答）", width)),
-      chrome(`第 ${this.page + 1}/${pages.length} 页`),
-      chrome("接下来仍须核对完整原文"),
-      ...(pages[this.page] ?? []),
-      chrome(`Esc 取消 | ${this.keyName("tui.select.up")} 回看 | r 原文核对`),
-      chrome(
-        this.page === pages.length - 1
-          ? `${this.keyName("tui.select.confirm")} 原文核对`
-          : `${this.keyName("tui.select.confirm")} / ${this.keyName("tui.select.down")} 下一页`,
+      this.chrome(`第 ${page + 1}/${pages.length} 页`, width),
+      this.chrome(`问题：${this.context}`, width),
+      ...(pages[page] ?? []),
+      this.chrome(
+        preview ? "补充材料不代替左侧原文" : `Esc 返回 | ${this.keyName("tui.select.up")} 回看`,
+        width,
+      ),
+      this.chrome(
+        preview
+          ? this.nativeAction("m")
+            ? "补充材料仅供参考"
+            : "m 展开完整材料"
+          : `${this.keyName("tui.select.confirm")} 返回作答 | ${this.keyName("tui.select.down")} 下一页`,
+        width,
       ),
     ];
   }
 
-  private move(data: string): boolean {
-    const keys = this.env.keybindings;
-    if (matchesKey(data, Key.home)) this.page = 0;
-    else if (keys.matches(data, "tui.select.up") || keys.matches(data, "tui.select.pageUp"))
-      this.page = Math.max(0, this.page - 1);
-    else if (
-      keys.matches(data, "tui.select.confirm") ||
-      keys.matches(data, "tui.select.down") ||
-      keys.matches(data, "tui.select.pageDown") ||
-      matchesKey(data, Key.end)
-    )
-      this.page = Math.min(Math.max(0, (this.layout?.pages.length ?? 1) - 1), this.page + 1);
-    else return false;
-    return true;
+  private interactive(): boolean {
+    return Boolean(this.geometry && this.geometry.width >= 24 && dimension(this.env.rows()) >= 8);
+  }
+  private refresh(): void {
+    this.shown = false;
+    this.env.requestRender();
+  }
+  private card(width: number, split = false): string[] {
+    const lines = this.raw.render(width);
+    const hints: string[] = [];
+    if (!this.nativeAction("m")) hints.push("m 材料");
+    if (split && !this.nativeAction("\t")) hints.push("Tab 单栏");
+    else if (width >= SPLIT_COLUMNS && !this.nativeAction("\t")) hints.push("Tab 双栏");
+    if (hints.length && lines.length > 1)
+      lines[lines.length - 2] = this.chrome(
+        `Esc 取消 | ${hints.join(" | ")} | ${this.keyName("tui.select.up")} 回看`,
+        width,
+      );
+    return lines;
+  }
+  private split(width: number, rows: number): string[] {
+    const leftWidth = Math.floor((width - 3) / 2);
+    const left = this.card(leftWidth, true);
+    const right = this.material(width - leftWidth - 3, rows, true);
+    return Array.from({ length: Math.max(left.length, right.length) }, (_, index) => {
+      const line = left[index] ?? "";
+      return `${line}${" ".repeat(leftWidth - visibleWidth(line))} │ ${right[index] ?? ""}`;
+    });
   }
 
+  render(width: number): string[] {
+    if (this.closed) return [];
+    width = dimension(width);
+    const rows = dimension(this.env.rows());
+    if (this.geometry && (this.geometry.width !== width || this.geometry.rows !== rows))
+      this.invalidate();
+    this.geometry = { width, rows };
+    if (!this.interactive()) {
+      this.shown = false;
+      return width > 0 && rows > 0 ? [this.chrome("Esc 取消", width)] : [];
+    }
+    if (width < SPLIT_COLUMNS && this.surface === "split") this.surface = "card";
+    this.shown = true;
+    if (this.surface === "material") return this.material(width, rows);
+    return this.surface === "split" ? this.split(width, rows) : this.card(width);
+  }
+
+  /** Fixed display shortcuts never shadow a configured native action. */
+  private switchSurface(data: string): boolean {
+    if (this.nativeAction(data)) return false;
+    if (data === "m") {
+      if (this.surface === "material") this.surface = this.origin;
+      else {
+        this.origin = this.surface;
+        this.surface = "material";
+      }
+    } else if (data === "r" && this.surface === "material") this.surface = this.origin;
+    else if (
+      matchesKey(data, Key.tab) &&
+      this.surface !== "material" &&
+      (this.geometry?.width ?? 0) >= SPLIT_COLUMNS
+    ) {
+      this.surface = this.surface === "split" ? "card" : "split";
+      this.raw.invalidate();
+    } else return false;
+    this.refresh();
+    return true;
+  }
+  private moveMaterial(data: string): void {
+    const keys = this.env.keybindings;
+    const last = Math.max(0, (this.layout?.pages.length ?? 1) - 1);
+    if (keys.matches(data, "tui.select.confirm")) this.surface = this.origin;
+    else if (matchesKey(data, Key.home)) this.page = 0;
+    else if (matchesKey(data, Key.end)) this.page = last;
+    else if (keys.matches(data, "tui.select.up") || keys.matches(data, "tui.select.pageUp"))
+      this.page = Math.max(0, this.page - 1);
+    else if (keys.matches(data, "tui.select.down") || keys.matches(data, "tui.select.pageDown"))
+      this.page = Math.min(last, this.page + 1);
+    else return;
+    this.refresh();
+  }
   handleInput(data: string): void {
     if (this.closed) return;
-    const keys = this.env.keybindings;
-    if (matchesKey(data, Key.escape) || keys.matches(data, "tui.select.cancel")) {
-      this.raw.handleInput?.(data);
-      this.closed = true;
+    if (matchesKey(data, Key.escape) || this.env.keybindings.matches(data, "tui.select.cancel")) {
+      if (this.surface === "material" && this.interactive()) {
+        this.surface = this.origin;
+        this.refresh();
+      } else this.raw.handleInput?.(data);
       return;
     }
-    if (this.layout && this.layout.rows !== dimension(this.env.rows())) {
+    if (this.geometry && this.geometry.rows !== dimension(this.env.rows())) {
       this.invalidate();
       this.env.requestRender();
     }
-    if (!this.layout) return;
-    if (this.rawMode) {
-      this.raw.handleInput?.(data);
-      return;
-    }
-    if (!this.shown) return;
-    if (
-      data === "r" ||
-      (keys.matches(data, "tui.select.confirm") && this.page >= this.layout.pages.length - 1)
-    ) {
-      this.rawMode = true;
-    } else if (!this.move(data)) return;
-    this.shown = false;
-    this.env.requestRender();
+    if (!this.interactive() || !this.shown) return;
+    if (this.switchSurface(data)) return;
+    if (this.surface === "material") this.moveMaterial(data);
+    else this.raw.handleInput?.(data);
   }
 }

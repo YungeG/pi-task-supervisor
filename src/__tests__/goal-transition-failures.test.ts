@@ -206,7 +206,7 @@ it("rejects a changed owner source during native selection without writing archi
     board.pauseReason = "Changed by user";
     f.api.appendEntry("continuous-tasks:snapshot", board);
     setBoard(board);
-    return "选项 1";
+    return "确认提交所选方案";
   });
   expect((await requestGoalTransition(f.api, f.ctx, request)).status).toBe("deferred");
   expect(f.entries().some((e) => (e.data as { version?: number }).version === 5)).toBe(false);
