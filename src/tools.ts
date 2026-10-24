@@ -1,9 +1,10 @@
 import { Text } from "@earendil-works/pi-tui";
+import { safeTerminalText } from "./terminal-text";
 import { randomUUID } from "node:crypto";
 import { validDecisionSpec, type DecisionSpec } from "./decision-spec";
 import { answerBoardDecision, canReplaceBoardDecision } from "./board-human";
 import { currentRuntime } from "./runtime";
-import { goalLease, appendOwnerSnapshot } from "./goal-scope";
+import { goalLease } from "./goal-scope";
 import type {
   ToolDefinition,
   ExtensionAPI,
@@ -19,16 +20,18 @@ import {
   AdvanceTasksParams,
   WorkflowGateParams,
 } from "./schemas";
-import {
-  CUSTOM_EVENT_TYPE,
-  CUSTOM_SNAPSHOT_TYPE,
-  TERMINAL_STATUSES,
-  ACTIVE_STATUSES,
-} from "./types";
+import { TERMINAL_STATUSES, ACTIVE_STATUSES } from "./types";
 import type { AdvanceEdit, TaskBoardSnapshot, TaskEdit, TaskWorkflowEvent } from "./types";
 import { writeTasks, applyEdits, compileBoard, createEmptyBoard, claimReadyTasks } from "./engine";
 import { cloneBoard, getStatusCounts, isSafeBoundedText } from "./validation";
-import { getBoardRef, setBoard, persistEntries, updateUI, refreshUI } from "./state";
+import {
+  getBoardRef,
+  setBoard,
+  persistEntries,
+  persistTaskUpdate,
+  updateUI,
+  refreshUI,
+} from "./state";
 import { preflightNotice, preflightDetailText } from "./human-presentation";
 import { loadConfig, resolvePhasePrompt } from "./config";
 import { assertObservedEvidence, bindCompletion } from "./supervisor";
@@ -120,7 +123,7 @@ function assertBoardCurrent(
 // ── Shared Result Renderer ──
 
 function renderColoredBoardResult(text: string, _snapshot: TaskBoardSnapshot, theme: Theme): Text {
-  const lines = text.split("\n");
+  const lines = safeTerminalText(text).split("\n");
   const colored = lines
     .map((line) => {
       if (/^─── Phase \d+/.test(line)) {
@@ -170,14 +173,18 @@ export function createSubmitPreflightTool(
         | undefined;
       if (details?.error)
         return new Text(
-          theme.fg("error", `方案未提交：${details.error}\n${TASK_DETAILS_HINT}`),
+          theme.fg("error", safeTerminalText(`方案未提交：${details.error}\n${TASK_DETAILS_HINT}`)),
           0,
           0,
         );
       const notice = preflightNotice(details ?? {});
       const extra = options.expanded ? preflightDetailText(details ?? {}) : "";
       const message = `${extra ? `${notice.message}\n\n${extra}` : notice.message}\n${TASK_DETAILS_HINT}`;
-      return new Text(theme.fg(notice.level === "warning" ? "warning" : "text", message), 0, 0);
+      return new Text(
+        theme.fg(notice.level === "warning" ? "warning" : "text", safeTerminalText(message)),
+        0,
+        0,
+      );
     },
     async execute(_id, params, signal, _onUpdate, ctx) {
       try {
@@ -255,7 +262,6 @@ export function createWriteTasksTool(
           },
           now,
         );
-        setBoard(newBoard);
 
         const totalNewTasks = params.phases.reduce(
           (sum: number, p: { tasks: unknown[] }) => sum + p.tasks.length,
@@ -279,8 +285,8 @@ export function createWriteTasksTool(
               })),
           })),
         };
-        persistEntries(pi, event, newBoard);
-        updateUI(ctx, newBoard);
+        persistTaskUpdate(pi, [event], newBoard);
+        refreshUI(ctx);
 
         return makeSuccessResult(
           `Added ${totalNewTasks} task(s) to the board.\n\n${formatBoardText(newBoard)}`,
@@ -296,7 +302,7 @@ export function createWriteTasksTool(
       const totalTasks = phases ? phases.reduce((sum: number, p) => sum + p.tasks.length, 0) : 0;
       return new Text(
         theme.fg("toolTitle", theme.bold("write_tasks ")) +
-          theme.fg("muted", `(${totalTasks} items)`),
+          theme.fg("muted", safeTerminalText(`(${totalTasks} items)`)),
         0,
         0,
       );
@@ -304,9 +310,11 @@ export function createWriteTasksTool(
 
     renderResult(result, _options, theme) {
       const details = result.details as TaskToolDetails | undefined;
-      const text = result.content[0] && "text" in result.content[0] ? result.content[0].text : "";
+      const text = safeTerminalText(
+        result.content[0] && "text" in result.content[0] ? result.content[0].text : "",
+      );
       if (!details) return new Text(text, 0, 0);
-      if (details.error) return new Text(theme.fg("error", details.error), 0, 0);
+      if (details.error) return new Text(theme.fg("error", safeTerminalText(details.error)), 0, 0);
       return renderColoredBoardResult(text, details.snapshot, theme);
     },
   };
@@ -362,9 +370,8 @@ export function createEditTasksTool(
         await checkAndSetPhaseCompletion(beforePhases, newBoard);
         assertBoardCurrent(board, signal, enabled, lease);
 
-        setBoard(newBoard);
-
-        // Emit one event per edit with the correct type
+        const events: TaskWorkflowEvent[] = [];
+        // Emit one event per edit with the correct type.
         for (const edit of edits) {
           let event: TaskWorkflowEvent;
           if (edit.type === "data") {
@@ -378,10 +385,10 @@ export function createEditTasksTool(
           } else {
             event = { type: "abandon_task", id: edit.id };
           }
-          pi.appendEntry(CUSTOM_EVENT_TYPE, event);
+          events.push(event);
         }
-        appendOwnerSnapshot(pi, CUSTOM_SNAPSHOT_TYPE, newBoard);
-        updateUI(ctx, newBoard);
+        persistTaskUpdate(pi, events, newBoard);
+        refreshUI(ctx);
 
         const counts = getStatusCounts(newBoard);
         const summary = formatSummaryLine(newBoard, counts);
@@ -403,7 +410,7 @@ export function createEditTasksTool(
     renderCall(args, theme) {
       return new Text(
         theme.fg("toolTitle", theme.bold("edit_tasks ")) +
-          theme.fg("warning", `(${args.tasks.length} edits)`),
+          theme.fg("warning", safeTerminalText(`(${args.tasks.length} edits)`)),
         0,
         0,
       );
@@ -411,9 +418,11 @@ export function createEditTasksTool(
 
     renderResult(result, _options, theme) {
       const details = result.details as TaskToolDetails | undefined;
-      const text = result.content[0] && "text" in result.content[0] ? result.content[0].text : "";
+      const text = safeTerminalText(
+        result.content[0] && "text" in result.content[0] ? result.content[0].text : "",
+      );
       if (!details) return new Text(text, 0, 0);
-      if (details.error) return new Text(theme.fg("error", details.error), 0, 0);
+      if (details.error) return new Text(theme.fg("error", safeTerminalText(details.error)), 0, 0);
       return renderColoredBoardResult(text, details.snapshot, theme);
     },
   };
@@ -449,11 +458,9 @@ export function createCompileTasksTool(
         await checkAndSetPhaseCompletion(beforePhases, newBoard);
         assertBoardCurrent(board, signal, enabled, lease);
 
-        setBoard(newBoard);
-
         const event: TaskWorkflowEvent = { type: "compile_tasks" };
-        persistEntries(pi, event, newBoard);
-        updateUI(ctx, newBoard);
+        persistTaskUpdate(pi, [event], newBoard);
+        refreshUI(ctx);
 
         const counts = getStatusCounts(newBoard);
         const readyCount = counts.ready;
@@ -473,9 +480,11 @@ export function createCompileTasksTool(
 
     renderResult(result, _options, theme) {
       const details = result.details as TaskToolDetails | undefined;
-      const text = result.content[0] && "text" in result.content[0] ? result.content[0].text : "";
+      const text = safeTerminalText(
+        result.content[0] && "text" in result.content[0] ? result.content[0].text : "",
+      );
       if (!details) return new Text(text, 0, 0);
-      if (details.error) return new Text(theme.fg("error", details.error), 0, 0);
+      if (details.error) return new Text(theme.fg("error", safeTerminalText(details.error)), 0, 0);
       return renderColoredBoardResult(text, details.snapshot, theme);
     },
   };
@@ -507,13 +516,14 @@ export function createClearTasksTool(
 
       const emptyBoard = createEmptyBoard();
       emptyBoard.generation = board.generation + 1;
-      setBoard(emptyBoard);
-
       const event: TaskWorkflowEvent = { type: "clear_tasks" };
-      persistEntries(pi, event, emptyBoard);
-      updateUI(ctx, emptyBoard);
-
-      return makeSuccessResult("Board cleared.", emptyBoard);
+      try {
+        persistTaskUpdate(pi, [event], emptyBoard);
+        refreshUI(ctx);
+        return makeSuccessResult("Board cleared.", emptyBoard);
+      } catch (error) {
+        return makeErrorResult(error instanceof Error ? error.message : String(error), board);
+      }
     },
 
     renderCall(_args, theme) {
@@ -522,9 +532,11 @@ export function createClearTasksTool(
 
     renderResult(result, _options, theme) {
       const details = result.details as TaskToolDetails | undefined;
-      const text = result.content[0] && "text" in result.content[0] ? result.content[0].text : "";
+      const text = safeTerminalText(
+        result.content[0] && "text" in result.content[0] ? result.content[0].text : "",
+      );
       if (!details) return new Text(text, 0, 0);
-      if (details.error) return new Text(theme.fg("error", details.error), 0, 0);
+      if (details.error) return new Text(theme.fg("error", safeTerminalText(details.error)), 0, 0);
       return new Text(theme.fg("text", text), 0, 0);
     },
   };
@@ -575,14 +587,12 @@ export function createGetReadyTasksTool(
         }
 
         // Success: claimed tasks
-        setBoard(result.board);
-
         const event: TaskWorkflowEvent = {
           type: "claim_ready_tasks",
           ids: result.claimed.map((t) => t.id),
         };
-        persistEntries(pi, event, result.board);
-        updateUI(ctx, result.board);
+        persistTaskUpdate(pi, [event], result.board);
+        refreshUI(ctx);
 
         const claimedDetails = formatClaimedTaskDetails(result.claimed);
 
@@ -598,7 +608,7 @@ export function createGetReadyTasksTool(
     renderCall(args, theme) {
       return new Text(
         theme.fg("toolTitle", theme.bold("get_ready_tasks ")) +
-          theme.fg("muted", `(count: ${args.count})`),
+          theme.fg("muted", safeTerminalText(`(count: ${args.count})`)),
         0,
         0,
       );
@@ -606,9 +616,11 @@ export function createGetReadyTasksTool(
 
     renderResult(result, _options, theme) {
       const details = result.details as TaskToolDetails | undefined;
-      const text = result.content[0] && "text" in result.content[0] ? result.content[0].text : "";
+      const text = safeTerminalText(
+        result.content[0] && "text" in result.content[0] ? result.content[0].text : "",
+      );
       if (!details) return new Text(text, 0, 0);
-      if (details.error) return new Text(theme.fg("error", details.error), 0, 0);
+      if (details.error) return new Text(theme.fg("error", safeTerminalText(details.error)), 0, 0);
       return renderColoredBoardResult(text, details.snapshot, theme);
     },
   };
@@ -682,14 +694,11 @@ export function createAdvanceTasksTool(
         await checkAndSetPhaseCompletion(beforePhases, newBoard);
         assertBoardCurrent(board, signal, enabled, lease);
 
-        setBoard(newBoard);
-
-        for (const edit of edits) {
-          pi.appendEntry(CUSTOM_EVENT_TYPE, advanceEvent(edit, board, newBoard));
-        }
-        appendOwnerSnapshot(pi, CUSTOM_SNAPSHOT_TYPE, newBoard);
-        bindCompletion(pi, newBoard, ids);
-        updateUI(ctx, newBoard);
+        const events = edits.map((edit) => advanceEvent(edit, board, newBoard));
+        persistTaskUpdate(pi, events, newBoard, () => {
+          bindCompletion(pi, newBoard, ids);
+        });
+        refreshUI(ctx);
 
         const counts = getStatusCounts(newBoard);
         const allTerminal = newBoard.tasks.every((t) => TERMINAL_STATUSES.has(t.status));
@@ -710,7 +719,7 @@ export function createAdvanceTasksTool(
     renderCall(args, theme) {
       return new Text(
         theme.fg("toolTitle", theme.bold("advance_tasks ")) +
-          theme.fg("muted", `(${args.transitions.length} tasks)`),
+          theme.fg("muted", safeTerminalText(`(${args.transitions.length} tasks)`)),
         0,
         0,
       );
@@ -718,9 +727,11 @@ export function createAdvanceTasksTool(
 
     renderResult(result, _options, theme) {
       const details = result.details as TaskToolDetails | undefined;
-      const text = result.content[0] && "text" in result.content[0] ? result.content[0].text : "";
+      const text = safeTerminalText(
+        result.content[0] && "text" in result.content[0] ? result.content[0].text : "",
+      );
       if (!details) return new Text(text, 0, 0);
-      if (details.error) return new Text(theme.fg("error", details.error), 0, 0);
+      if (details.error) return new Text(theme.fg("error", safeTerminalText(details.error)), 0, 0);
       return renderColoredBoardResult(text, details.snapshot, theme);
     },
   };
@@ -929,9 +940,10 @@ export function createWorkflowGateTool(
       }
     },
 
-    renderCall(args, theme) {
+    renderCall(args: { action?: string }, theme) {
       return new Text(
-        theme.fg("toolTitle", theme.bold("workflow_gate ")) + theme.fg("muted", args.action),
+        theme.fg("toolTitle", theme.bold("workflow_gate ")) +
+          theme.fg("muted", safeTerminalText(args.action ?? "")),
         0,
         0,
       );
@@ -940,7 +952,11 @@ export function createWorkflowGateTool(
     renderResult(result, options, theme, context?: { readonly isError: boolean }) {
       const details = result.details as TaskToolDetails | undefined;
       if (details?.error)
-        return new Text(theme.fg("error", `${details.error}\n${TASK_DETAILS_HINT}`), 0, 0);
+        return new Text(
+          theme.fg("error", safeTerminalText(`${details.error}\n${TASK_DETAILS_HINT}`)),
+          0,
+          0,
+        );
       const snapshot = details?.snapshot;
       let message = snapshot
         ? "任务门槛已更新；回应不代表任务验收通过，其他权限和证据要求仍有效。"
@@ -957,7 +973,10 @@ export function createWorkflowGateTool(
       const text =
         options.expanded && snapshot ? `${message}\n\n${formatBoardText(snapshot)}` : message;
       return new Text(
-        theme.fg(context?.isError ? "warning" : "text", `${text}\n${TASK_DETAILS_HINT}`),
+        theme.fg(
+          context?.isError ? "warning" : "text",
+          safeTerminalText(`${text}\n${TASK_DETAILS_HINT}`),
+        ),
         0,
         0,
       );

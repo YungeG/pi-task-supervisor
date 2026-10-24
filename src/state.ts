@@ -1,5 +1,6 @@
 import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
-import type { LegacyTaskBoardSnapshot, TaskBoardSnapshot } from "./types";
+import { RestoreReadInvalidated, type RestoreJournalRead } from "./restore-journal";
+import type { LegacyTaskBoardSnapshot, TaskBoardSnapshot, TaskWorkflowEvent } from "./types";
 import { CUSTOM_EVENT_TYPE, CUSTOM_SNAPSHOT_TYPE, LEGACY_CUSTOM_SNAPSHOT_TYPE } from "./types";
 import { createEmptyBoard } from "./engine";
 import {
@@ -14,6 +15,7 @@ import { captureUiSummary } from "./ui-capture";
 import { formatStatusbar, formatLegacySupervisorStatus } from "./status-ui";
 
 import { currentRuntime, type TaskRuntime } from "./runtime";
+import { redact } from "./receipt-store";
 import { appendOwnerSnapshot, ownerSnapshot, selectedGoalEntries } from "./goal-scope";
 
 // ── State Accessors ──
@@ -42,6 +44,7 @@ export function resetState(): void {
   currentRuntime().supervisor = undefined;
   currentRuntime().receiptStore = undefined;
   currentRuntime().receiptIdentity = undefined;
+  currentRuntime().receiptPersistence = undefined;
   currentRuntime().preflight = undefined;
   currentRuntime().journalFault = undefined;
   currentRuntime().preflightRepair = undefined;
@@ -116,6 +119,31 @@ export function persistEntries(
   appendOwnerSnapshot(pi, CUSTOM_SNAPSHOT_TYPE, snapshot);
 }
 
+/** Publish a task update only after every synchronous owner write has returned. */
+export function persistTaskUpdate(
+  pi: ExtensionAPI,
+  events: readonly TaskWorkflowEvent[],
+  snapshot: TaskBoardSnapshot,
+  afterPersist?: () => void,
+): void {
+  const existingFault = currentRuntime().journalFault;
+  if (existingFault) throw new Error(existingFault);
+  if (!isValidSnapshotV2(snapshot)) throw new Error("Invalid candidate task-board snapshot");
+  try {
+    for (const event of events) pi.appendEntry(CUSTOM_EVENT_TYPE, event);
+    appendOwnerSnapshot(pi, CUSTOM_SNAPSHOT_TYPE, snapshot);
+    afterPersist?.();
+    setBoard(snapshot);
+  } catch (error) {
+    const runtime = currentRuntime();
+    runtime.journalFault ??=
+      "Task update persistence failed; inspect journal before further mutation or retry";
+    runtime.cancel();
+    const message = error instanceof Error ? redact(error.message) : runtime.journalFault;
+    throw new Error(message, { cause: error });
+  }
+}
+
 // ── UI Sync ──
 
 /** Optional view refresh must not turn a saved result into an owner failure. */
@@ -141,16 +169,21 @@ function legacyAttention(runtime: Readonly<TaskRuntime>, sessionId: string): str
 }
 
 /** Updates the persistent task widget and existing status bar. */
-export function updateUI(ctx: ExtensionContext, snapshot: Readonly<TaskBoardSnapshot>): void {
+export function updateUI(
+  ctx: ExtensionContext,
+  snapshot: Readonly<TaskBoardSnapshot>,
+  restoration?: RestoreJournalRead,
+): void {
   if (!ctx.hasUI) return;
   if (ctx.mode === "tui") {
     try {
-      const summary = captureUiSummary(ctx, snapshot);
+      const summary = captureUiSummary(ctx, snapshot, restoration);
       updateTaskWidget(ctx, snapshot, summary);
       ctx.ui.setStatus("til-done-active", undefined);
       ctx.ui.setStatus("continuous-supervisor", undefined);
       ctx.ui.setStatus("til-done", formatStatusbar(summary));
-    } catch {
+    } catch (error) {
+      if (restoration && error instanceof RestoreReadInvalidated) throw error;
       // Capture/transport is optional; never turn it into a durable journal fault.
       for (const key of ["til-done", "til-done-active", "continuous-supervisor"]) {
         try {

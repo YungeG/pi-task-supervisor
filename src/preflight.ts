@@ -1,3 +1,4 @@
+import { RestoreReadInvalidated, type RestoreJournalRead } from "./restore-journal";
 import { createHash, randomUUID } from "node:crypto";
 import { isDeepStrictEqual } from "node:util";
 import type {
@@ -678,6 +679,7 @@ function controlClosureIssue(
   ctx: ExtensionContext,
   state: PreflightState,
   beforeEntryId?: string,
+  restoration?: RestoreJournalRead,
 ): string | undefined {
   let controls: ReturnType<typeof currentControls>;
   try {
@@ -694,11 +696,12 @@ function controlClosureIssue(
   const control = latest.data;
   if ("version" in control) {
     try {
-      const proof = confirmedPreflightProof(ctx, control.humanInteraction.requestId);
-      const projected = verifiedPreflightProjection(ctx, proof);
+      const proof = confirmedPreflightProof(ctx, control.humanInteraction.requestId, restoration);
+      const projected = verifiedPreflightProjection(ctx, proof, true, restoration);
       if (proof.control.id !== latest.id || !same(projected.approval, approval))
         return "Invalid native preflight closure";
-    } catch {
+    } catch (error) {
+      if (error instanceof RestoreReadInvalidated) throw error;
       return "Invalid native preflight journal closure";
     }
   }
@@ -724,6 +727,7 @@ function approvalIssue(
   ctx: ExtensionContext,
   state: PreflightState,
   beforeEntryId?: string,
+  restoration?: RestoreJournalRead,
 ): string | undefined {
   const invalid = proposalIssue(state);
   if (invalid) return invalid;
@@ -734,7 +738,7 @@ function approvalIssue(
     return "Preflight approval is stale";
   if (!validSelection(state, approval.permissionIds))
     return "Invalid preflight permission selection";
-  const closure = controlClosureIssue(ctx, state, beforeEntryId);
+  const closure = controlClosureIssue(ctx, state, beforeEntryId, restoration);
   if (closure) return closure;
   const missing = missingRequired(state);
   return missing.length
@@ -828,6 +832,7 @@ function boundSupervisorGoalIssue(
 export function preflightAuthorizationIssue(
   ctx: ExtensionContext | undefined,
   binding: PreflightBinding,
+  restoration?: RestoreJournalRead,
 ): string | undefined {
   if (!ctx) return "Bound preflight requires a current-session verification context";
   if (currentRuntime().journalFault) return currentRuntime().journalFault;
@@ -840,7 +845,7 @@ export function preflightAuthorizationIssue(
     state.planDigest !== binding.planDigest
   )
     return "Bound preflight identity does not match";
-  const issue = approvalIssue(ctx, state);
+  const issue = approvalIssue(ctx, state, undefined, restoration);
   if (issue) return issue;
   const goalIssue = boundSupervisorGoalIssue(state, binding);
   if (goalIssue) return goalIssue;
@@ -889,9 +894,13 @@ function restoredSnapshot(data: unknown): PreflightState {
     throw new Error("Incomplete persisted preflight proposal");
   return structuredClone(data);
 }
-function confirmedPreflightProof(ctx: ExtensionContext, requestId: string): ConfirmedProof {
+function confirmedPreflightProof(
+  ctx: ExtensionContext,
+  requestId: string,
+  restoration?: RestoreJournalRead,
+): ConfirmedProof {
   const proof = findReadbackProof(
-    inspectSessionJournal(sessionJournalView(ctx)),
+    restoration ? restoration.require(ctx) : inspectSessionJournal(sessionJournalView(ctx)),
     "preflight",
     requestId,
   );
@@ -918,8 +927,11 @@ function initialStartupState(state: SupervisorState): boolean {
 function readPreflightStartup(
   ctx: ExtensionContext,
   proof: ConfirmedProof,
+  restoration?: RestoreJournalRead,
 ): SupervisorStartRecord | undefined {
-  const journal = inspectSessionJournal(sessionJournalView(ctx));
+  const journal = restoration
+    ? restoration.require(ctx)
+    : inspectSessionJournal(sessionJournalView(ctx));
   const witnessIndex = journal.branch.findIndex((n) => n.id === proof.witness.id);
   const first = journal.branch
     .slice(witnessIndex + 1)
@@ -932,7 +944,7 @@ function readPreflightStartup(
   const entry = ctx.sessionManager.getBranch().find((e) => e.id === first.id);
   if (!entry || entry.type !== "custom" || journalDigest(entry) !== first.digest)
     throw new Error("Invalid preflight startup record");
-  const { state } = readSupervisorStartRecord(ctx, first.id);
+  const { state } = readSupervisorStartRecord(ctx, first.id, restoration);
   const base = restoredSnapshot(proof.base.data);
   if (
     state.sessionId !== base.sessionId ||
@@ -947,20 +959,23 @@ function verifiedPreflightProjection(
   ctx: ExtensionContext,
   proof: ConfirmedProof,
   requireStartup = true,
+  restoration?: RestoreJournalRead,
 ): PreflightState {
   const base = restoredSnapshot(proof.base.data);
   const control = proof.control.data;
   if (!Check(NativePreflightControlSchema, control))
     throw new Error("Invalid native preflight control");
   if (control.kind !== "start") return projectPreflightPermissions(base, control, proof.control.id);
-  const issue = approvalIssue(ctx, base, proof.control.id);
+  const issue = approvalIssue(ctx, base, proof.control.id, restoration);
   if (issue) throw new Error(issue);
-  const journal = inspectSessionJournal(sessionJournalView(ctx));
+  const journal = restoration
+    ? restoration.require(ctx)
+    : inspectSessionJournal(sessionJournalView(ctx));
   const approval = journal.branch.find((n) => n.id === control.approvalControlEntryId);
   if (!approval || approval.digest !== control.approvalControlDigest)
     throw new Error("Preflight approval digest changed");
   const next = projectPreflightStart(base, control, proof.control.id);
-  if (requireStartup && !readPreflightStartup(ctx, proof))
+  if (requireStartup && !readPreflightStartup(ctx, proof, restoration))
     throw new Error(
       "Confirmed preflight start lacks Supervisor startup; unresolved hold, never retry",
     );
@@ -1304,18 +1319,19 @@ function foldPreflightControl(
   fold: PreflightFold,
   value: unknown,
   id: string,
+  restoration?: RestoreJournalRead,
 ): void {
   if (!Check(PreflightControlSchema, value) || !fold.state)
     throw new Error("Invalid preflight control journal");
   if (fold.legacyPending) throw new Error("Incomplete legacy preflight control cache");
   if ("version" in value) {
-    const proof = confirmedPreflightProof(ctx, value.humanInteraction.requestId);
+    const proof = confirmedPreflightProof(ctx, value.humanInteraction.requestId, restoration);
     if (proof.control.id !== id || !same(fold.state, ownerSnapshot(proof.base.data)))
       throw new Error("Preflight control base is stale");
     const request = fold.requests.get(value.humanInteraction.requestId);
     if (!request || request.retired || request.controlEntryId)
       throw new Error("Preflight request is retired or already finalized");
-    const projected = verifiedPreflightProjection(ctx, proof);
+    const projected = verifiedPreflightProjection(ctx, proof, true, restoration);
     request.controlEntryId = id;
     fold.nativeSeen = true;
     fold.state = projected;
@@ -1335,6 +1351,7 @@ function foldPreflightSnapshot(
   fold: PreflightFold,
   value: unknown,
   id: string,
+  restoration?: RestoreJournalRead,
 ): void {
   const next = restoredSnapshot(value);
   if (next.sessionId !== ctx.sessionManager.getSessionId())
@@ -1343,7 +1360,7 @@ function foldPreflightSnapshot(
   validateStartRetention(fold.state, next);
   validateSnapshotRequests(fold, next);
   if (next.approval) {
-    const issue = approvalIssue(ctx, next, id);
+    const issue = approvalIssue(ctx, next, id, restoration);
     if (issue && !issue.startsWith("Preflight missing required permissions:"))
       throw new Error(issue);
   } else if (["approved", "started"].includes(next.phase))
@@ -1360,8 +1377,11 @@ function foldPreflightSnapshot(
   fold.pending = undefined;
   fold.state = next;
 }
-function readPreflightFold(ctx: ExtensionContext): PreflightFold | undefined {
-  const persisted = inspectRestorableSession(ctx);
+function readPreflightFold(
+  ctx: ExtensionContext,
+  restoration?: RestoreJournalRead,
+): PreflightFold | undefined {
+  const persisted = restoration ? restoration.inspect(ctx) : inspectRestorableSession(ctx);
   const currentGoal = currentRuntime().goal?.current;
   const hasOwnerRecord = selectedGoalEntries(ctx.sessionManager.getBranch(), "preflight").some(
     (entry) =>
@@ -1384,18 +1404,19 @@ function readPreflightFold(ctx: ExtensionContext): PreflightFold | undefined {
     fold.nativeSeen = true;
   }
   for (const node of selectedGoalEntries(journal.branch, "preflight")) {
-    if (node.customType === PREFLIGHT_ENTRY) foldPreflightSnapshot(ctx, fold, node.data, node.id);
+    if (node.customType === PREFLIGHT_ENTRY)
+      foldPreflightSnapshot(ctx, fold, node.data, node.id, restoration);
     else if (node.customType === PREFLIGHT_CONTROL_ENTRY)
-      foldPreflightControl(ctx, fold, node.data, node.id);
+      foldPreflightControl(ctx, fold, node.data, node.id, restoration);
   }
   if (fold.legacyPending) throw new Error("Incomplete legacy preflight control persistence");
   return fold;
 }
-export function restorePreflight(ctx: ExtensionContext): void {
+export function restorePreflight(ctx: ExtensionContext, restoration?: RestoreJournalRead): void {
   const runtime = currentRuntime();
   runtime.preflight = undefined;
   runtime.preflightRepair = undefined;
-  const fold = readPreflightFold(ctx);
+  const fold = readPreflightFold(ctx, restoration);
   if (!fold) return;
   if (fold.pending) projectionPending(ctx, fold.pending.proof, fold.pending.projected);
   runtime.preflight =
@@ -1494,8 +1515,9 @@ export function unstartedPreflightStopIssue(
 export function preflightTaskIssue(
   ctx: ExtensionContext,
   binding?: PreflightBinding,
+  restoration?: RestoreJournalRead,
 ): string | undefined {
-  if (binding) return preflightAuthorizationIssue(ctx, binding);
+  if (binding) return preflightAuthorizationIssue(ctx, binding, restoration);
   const state = currentRuntime().preflight;
   if (!state || state.sessionId !== ctx.sessionManager.getSessionId()) return undefined;
   const current = currentRuntime().goal?.current;
@@ -1510,11 +1532,15 @@ export function preflightTaskIssue(
   // Stopping supervision does not detach the retained execution board from its grant.
   if (state.started) {
     if (!state.planId || !state.planDigest) return "Preflight startup association is incomplete";
-    return preflightAuthorizationIssue(ctx, {
-      preflightId: state.preflightId,
-      planId: state.planId,
-      planDigest: state.planDigest,
-    });
+    return preflightAuthorizationIssue(
+      ctx,
+      {
+        preflightId: state.preflightId,
+        planId: state.planId,
+        planDigest: state.planDigest,
+      },
+      restoration,
+    );
   }
   return state.phase !== "revoked"
     ? "Preflight planning/approval must finish and be explicitly started before execution task mutation"

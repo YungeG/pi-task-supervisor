@@ -57,6 +57,34 @@ describe("continuous task lifecycle events", () => {
     );
   });
 
+  it.each(["tui", "rpc"] as const)(
+    "physically checks a stable persisted owner-free journal once during %s restoration",
+    async (mode) => {
+      const dir = mkdtempSync(join(tmpdir(), "restore-one-read-"));
+      const path = join(dir, "synthetic.jsonl");
+      const h = lifecycle();
+      Object.assign(h.ctx, { mode });
+      const body = JSON.stringify({ type: "session", version: 3, id: "test-session" }) + "\n";
+      writeFileSync(path, body);
+      vi.mocked(h.ctx.sessionManager.getSessionFile).mockReturnValue(path);
+      vi.mocked(openSync).mockClear();
+      vi.mocked(readSync).mockClear();
+      try {
+        await h.fire("session_start");
+        expect(currentRuntime().journalFault).toBeUndefined();
+        expect(vi.mocked(openSync).mock.calls.filter((call) => call[0] === path)).toHaveLength(1);
+        const bytes = vi
+          .mocked(readSync)
+          .mock.results.reduce((sum, row) => sum + (row.type === "return" ? row.value : 0), 0);
+        expect(bytes).toBe(Buffer.byteLength(body));
+        expect(h.mock.appendEntry).not.toHaveBeenCalled();
+        expect(h.mock.sendUserMessage).not.toHaveBeenCalled();
+      } finally {
+        rmSync(dir, { recursive: true, force: true });
+      }
+    },
+  );
+
   it("VF4 profiles the complete small malformed-journal restore without replay", async () => {
     const dir = mkdtempSync(join(tmpdir(), "vf4-restore-"));
     const path = join(dir, "synthetic.jsonl");

@@ -346,6 +346,26 @@ function resetNonTerminalToDraft(tasks: TaskRecord[], now: string): void {
   }
 }
 
+function invalidateCompilation(board: TaskBoardSnapshot): void {
+  if (board.decision || ["paused", "waiting_for_decision"].includes(board.workflowStatus))
+    throw new Error("Resume or resolve the task-board gate before structural edits");
+  const titles = new Map(board.phases.map((phase) => [phase.phase, phase.title]));
+  board.workflowStatus = "inactive";
+  board.finalAcceptanceTaskId = undefined;
+  board.pendingPhasePrompt = undefined;
+  board.pauseReason = undefined;
+  board.phases = [...new Set(board.tasks.map((task) => task.phase))]
+    .sort((a, b) => a - b)
+    .map((phase) => ({ phase, status: "pending", title: titles.get(phase) }));
+}
+
+function boardCompleted(board: TaskBoardSnapshot): boolean {
+  const finalTask = board.tasks.find((task) => task.id === board.finalAcceptanceTaskId);
+  return (
+    finalTask?.status === "done" && board.tasks.every((task) => TERMINAL_STATUSES.has(task.status))
+  );
+}
+
 function applyStateEdits(
   edits: TaskEdit[],
   taskMap: Map<string, TaskRecord>,
@@ -381,12 +401,7 @@ function applyStateEdits(
   }
   if (needsRecompute) {
     recomputePhasesAndReadiness(board, oldBoard, now);
-    const finalTask = board.tasks.find((task) => task.id === board.finalAcceptanceTaskId);
-    board.workflowStatus =
-      finalTask?.status === "done" &&
-      board.tasks.every((task) => TERMINAL_STATUSES.has(task.status))
-        ? "completed"
-        : board.workflowStatus;
+    board.workflowStatus = boardCompleted(board) ? "completed" : board.workflowStatus;
   }
 }
 
@@ -415,6 +430,7 @@ export function applyEdits(
   if (structuralEdits.length > 0) {
     applyStructuralEdits(structuralEdits, taskMap, now);
     resetNonTerminalToDraft(result.tasks, now);
+    invalidateCompilation(result);
   }
 
   // Apply state edits (advance / abandon) with recompute
@@ -457,6 +473,18 @@ function assertFinalAcceptanceCoverage(
   }
 }
 
+function assertSchedulablePhases(tasks: readonly TaskRecord[]): void {
+  const taskMap = new Map(tasks.map((task) => [task.id, task]));
+  for (const task of tasks) {
+    if (TERMINAL_STATUSES.has(task.status)) continue;
+    for (const id of task.dependencies) {
+      const dependency = taskMap.get(id);
+      if (dependency && dependency.phase > task.phase && dependency.status !== "done")
+        throw new Error(`Task "${task.id}" depends on unfinished task "${id}" in a future phase`);
+    }
+  }
+}
+
 export function compileBoard(
   board: TaskBoardSnapshot,
   now: string,
@@ -489,6 +517,7 @@ export function compileBoard(
   if (cycle.length > 0) {
     throw new Error(`Dependency cycle detected: ${cycle.join(" → ")}`);
   }
+  assertSchedulablePhases(board.tasks);
 
   if (finalAcceptanceTaskId) {
     const finalAcceptanceTask = board.tasks.find((task) => task.id === finalAcceptanceTaskId);
@@ -516,7 +545,11 @@ export function compileBoard(
 
   recomputePhasesAndReadiness(result, board, now);
   result.finalAcceptanceTaskId = finalAcceptanceTaskId;
-  result.workflowStatus = finalAcceptanceTaskId ? "active" : "inactive";
+  result.workflowStatus = finalAcceptanceTaskId
+    ? boardCompleted(result)
+      ? "completed"
+      : "active"
+    : "inactive";
   result.generation = board.generation + 1;
   result.stagnantSettles = 0;
 

@@ -1,4 +1,5 @@
 import type { ExtensionContext } from "@earendil-works/pi-coding-agent";
+import type { RestoreJournalRead } from "./restore-journal";
 import { stripTerminalSequences } from "@earendil-works/pi-tui";
 import { currentRuntime } from "./runtime";
 import { goalControlIssue } from "./goal-scope";
@@ -50,7 +51,7 @@ function currentGoalFacts(): FlowFacts["goal"] {
     preflightPhase: runtime.preflight?.phase,
   };
 }
-export function flowFacts(ctx: ExtensionContext): FlowFacts {
+export function flowFacts(ctx: ExtensionContext, restoration?: RestoreJournalRead): FlowFacts {
   const runtime = currentRuntime();
   return {
     enabled: runtime.enabled,
@@ -67,6 +68,7 @@ export function flowFacts(ctx: ExtensionContext): FlowFacts {
     preflightIssue: preflightTaskIssue(
       ctx,
       runtime.supervisor?.status === "stopped" ? undefined : runtime.supervisor?.preflightBinding,
+      restoration,
     ),
     sessionId: ctx.sessionManager.getSessionId(),
     idle: ctx.isIdle(),

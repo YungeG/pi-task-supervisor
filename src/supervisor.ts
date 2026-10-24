@@ -1,3 +1,4 @@
+import type { RestoreJournalRead } from "./restore-journal";
 import { StringEnum, type AssistantMessage, type Usage } from "@earendil-works/pi-ai";
 import type {
   ExtensionAPI,
@@ -177,6 +178,8 @@ export function saveSupervisor(pi: ExtensionAPI, state = supervisorState()): voi
     throw new Error("Supervisor belongs to a different GoalRun");
   if (!store) {
     if (scope) throw new Error("Scoped Supervisor receipt ledger is unavailable");
+    if (currentRuntime().receiptPersistence !== "legacy-v1")
+      throw new Error("Supervisor receipt ledger is unavailable");
     pi.appendEntry(SUPERVISOR_ENTRY, structuredClone(state));
     return;
   }
@@ -200,8 +203,8 @@ export function saveSupervisor(pi: ExtensionAPI, state = supervisorState()): voi
   observeScopedSupervisorCheckpoint(value, id);
 }
 
-function updateSupervisorUI(ctx: ExtensionContext): void {
-  updateUI(ctx, getBoardRef());
+function updateSupervisorUI(ctx: ExtensionContext, restoration?: RestoreJournalRead): void {
+  updateUI(ctx, getBoardRef(), restoration);
 }
 
 export function supervisorNotice(pi: ExtensionAPI, ctx: ExtensionContext, reason: string): void {
@@ -325,6 +328,7 @@ export function startSupervisor(
     ctx.sessionManager.getSessionId(),
     currentGoalScope()?.goalRunId,
   );
+  currentRuntime().receiptPersistence = "ledger";
   currentRuntime().receiptIdentity = receiptScopeIdentity(
     currentRuntime().supervisor as SupervisorState,
   );
@@ -348,9 +352,10 @@ function restoreBoundPreflight(
   pi: ExtensionAPI,
   ctx: ExtensionContext,
   state: SupervisorState,
+  restoration?: RestoreJournalRead,
 ): void {
   if (!state.preflightBinding || state.status === "stopped") return;
-  const issue = preflightAuthorizationIssue(ctx, state.preflightBinding);
+  const issue = preflightAuthorizationIssue(ctx, state.preflightBinding, restoration);
   if (!issue) return;
   if (!currentRuntime().preflight?.started) throw new Error("Incomplete preflight startup journal");
   holdSupervisor(pi, ctx, "paused", issue, "authorization_revoked");
@@ -468,7 +473,7 @@ function observeSupervisorCheckpoint(
   }
   fold.state = next.state;
 }
-function readSupervisorHistory(ctx: ExtensionContext) {
+function readSupervisorHistory(ctx: ExtensionContext, restoration?: RestoreJournalRead) {
   const fold: SupervisorHistoryFold = {
     goals: new Map(),
     legacyScopes: new Map(),
@@ -487,7 +492,7 @@ function readSupervisorHistory(ctx: ExtensionContext) {
         e.data.version === 5,
     )
   )
-    readGoalJournal(ctx);
+    readGoalJournal(ctx, restoration?.inspect(ctx));
   for (const entry of branch) {
     if (consumeReceiptHistory(ctx, entry, fold.goals, fold.v2)) continue;
     if (entry.type === "custom" && entry.customType === SUPERVISOR_ENTRY)
@@ -527,9 +532,10 @@ function startupContext(ctx: ExtensionContext, entryId: string): ExtensionContex
 export function readSupervisorStartRecord(
   ctx: ExtensionContext,
   entryId: string,
+  restoration?: RestoreJournalRead,
 ): SupervisorStartRecord {
   const view = startupContext(ctx, entryId);
-  const history = readSupervisorHistory(view);
+  const history = readSupervisorHistory(view, restoration?.prefix(view, entryId));
   const state = history.state;
   if (!state) throw new Error("Missing Supervisor startup state");
   const store = history.ledger
@@ -599,6 +605,7 @@ function restoreReceiptViews(
 ): void {
   const { state, ledger, legacyV2, resolveV2 } = history;
   if (!state) return;
+  currentRuntime().receiptPersistence = ledger || legacyV2 ? "ledger" : "legacy-v1";
   if (ledger)
     currentRuntime().receiptStore = ReceiptStore.restore(
       pi,
@@ -616,7 +623,11 @@ function restoreReceiptViews(
   currentRuntime().receiptIdentity = receiptScopeIdentity(state);
   syncReceiptState(state);
 }
-function restoreJournalHold(ctx: ExtensionContext, state: SupervisorState | undefined): boolean {
+function restoreJournalHold(
+  ctx: ExtensionContext,
+  state: SupervisorState | undefined,
+  restoration?: RestoreJournalRead,
+): boolean {
   if (!state || !(currentRuntime().journalFault || currentRuntime().preflightRepair)) return false;
   if (["active", "reviewing"].includes(state.status) || state.pending) {
     state.status = "fault";
@@ -624,22 +635,30 @@ function restoreJournalHold(ctx: ExtensionContext, state: SupervisorState | unde
     state.reason ??= "Journal/preflight projection hold; no automatic replay";
     state.pending = false;
   }
-  updateSupervisorUI(ctx);
+  updateSupervisorUI(ctx, restoration);
   return true;
 }
-export function restoreSupervisor(pi: ExtensionAPI, ctx: ExtensionContext): void {
+export function restoreSupervisor(
+  pi: ExtensionAPI,
+  ctx: ExtensionContext,
+  restoration?: RestoreJournalRead,
+): void {
   currentRuntime().supervisor = undefined;
   currentRuntime().receiptStore = undefined;
   currentRuntime().receiptIdentity = undefined;
-  const history = readSupervisorHistory(ctx);
+  currentRuntime().receiptPersistence = undefined;
+  const initialLeaf = ctx.sessionManager.getLeafId();
+  const read = () => (ctx.sessionManager.getLeafId() === initialLeaf ? restoration : undefined);
+  const history = readSupervisorHistory(ctx, read());
   const state = history.state;
   currentRuntime().supervisor = state;
   restoreReceiptViews(pi, ctx, history);
-  if (restoreJournalHold(ctx, state)) return;
-  if (state) restoreBoundPreflight(pi, ctx, state);
+  if (restoreJournalHold(ctx, state, read())) return;
+  if (state) restoreBoundPreflight(pi, ctx, state, read());
   if (
     state?.status === "completed" &&
-    (state.acceptedDigest !== digest(getBoardRef()) || acceptanceError(getBoardRef(), state, ctx))
+    (state.acceptedDigest !== digest(getBoardRef()) ||
+      acceptanceError(getBoardRef(), state, ctx, read()))
   )
     holdSupervisor(
       pi,
@@ -657,7 +676,7 @@ export function restoreSupervisor(pi: ExtensionAPI, ctx: ExtensionContext): void
       "interrupted",
     );
   }
-  updateSupervisorUI(ctx);
+  updateSupervisorUI(ctx, read());
 }
 
 function receiptRecoveryStore(
@@ -668,6 +687,8 @@ function receiptRecoveryStore(
   const existing = currentRuntime().receiptStore;
   if (existing) return existing;
   if (!ctx) throw new Error("Receipt migration requires current session context");
+  if (currentRuntime().receiptPersistence !== "legacy-v1")
+    throw new Error("Supervisor receipt ledger is unavailable");
   // A human journal hold defers this write during restoration. Explicit recovery
   // must still retain the distinct saturation barrier before format migration.
   retainLegacyGap(pi, ctx, state);
@@ -682,6 +703,7 @@ function receiptRecoveryStore(
   if (!anchor) throw new Error("Legacy receipt migration needs its exact branch checkpoint");
   const store = ReceiptStore.migrate(pi, ctx, state, anchor.id);
   currentRuntime().receiptStore = store;
+  currentRuntime().receiptPersistence = "ledger";
   currentRuntime().receiptIdentity = receiptScopeIdentity(state);
   return store;
 }
@@ -900,9 +922,10 @@ function boardComplete(board: Readonly<TaskBoardSnapshot>): boolean {
 function supervisorAcceptanceIssue(
   state: SupervisorState,
   ctx?: ExtensionContext,
+  restoration?: RestoreJournalRead,
 ): string | undefined {
   const issue = state.preflightBinding
-    ? preflightAuthorizationIssue(ctx, state.preflightBinding)
+    ? preflightAuthorizationIssue(ctx, state.preflightBinding, restoration)
     : undefined;
   if (issue) return issue;
   return currentRuntime().receiptStore?.pendingCount
@@ -913,8 +936,9 @@ export function acceptanceError(
   board: Readonly<TaskBoardSnapshot>,
   state: SupervisorState,
   ctx?: ExtensionContext,
+  restoration?: RestoreJournalRead,
 ): string | undefined {
-  const scopeIssue = supervisorAcceptanceIssue(state, ctx);
+  const scopeIssue = supervisorAcceptanceIssue(state, ctx, restoration);
   if (scopeIssue) return scopeIssue;
   if (!boardComplete(board)) return "Task board and final acceptance are not complete";
   if (board.tasks.some((task) => task.status !== "done" || task.executionRef))

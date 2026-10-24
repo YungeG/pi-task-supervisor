@@ -1,4 +1,5 @@
 import type { ExtensionContext } from "@earendil-works/pi-coding-agent";
+import { RestoreReadInvalidated, type RestoreJournalRead } from "./restore-journal";
 import { stripTerminalSequences } from "@earendil-works/pi-tui";
 import { currentRuntime } from "./runtime";
 import { flowFacts, nextFlowStep, SUPERVISOR_LIMITS, type FlowFacts } from "./flow";
@@ -69,10 +70,15 @@ function assertIdentity(
   )
     throw new Error("UI-only identity-changed: reopen the read-only view");
 }
-function captureFacts(ctx: ExtensionContext, sessionId: string): FlowFacts {
+function captureFacts(
+  ctx: ExtensionContext,
+  sessionId: string,
+  restoration?: RestoreJournalRead,
+): FlowFacts {
   try {
-    return flowFacts(ctx);
-  } catch {
+    return flowFacts(ctx, restoration);
+  } catch (error) {
+    if (restoration && error instanceof RestoreReadInvalidated) throw error;
     // A presentation uncertainty is not a runtime journal fault.
     return {
       enabled: currentRuntime().enabled,
@@ -88,9 +94,10 @@ function summaryInput(
   board: Readonly<TaskBoardSnapshot>,
   scope: UiScope,
   receiptStore: ReceiptStore | undefined,
+  restoration?: RestoreJournalRead,
 ): UiSummaryInput {
   const runtime = currentRuntime();
-  const facts = captureFacts(ctx, scope.sessionId);
+  const facts = captureFacts(ctx, scope.sessionId, restoration);
   if (receiptStore && receiptStore.sessionId !== scope.sessionId)
     facts.receiptIssue = "回执身份需检查；回执计数未知（未水合或恢复）。";
   const supervisor = runtime.supervisor;
@@ -132,9 +139,12 @@ function summaryInput(
 export function captureUiSummary(
   ctx: ExtensionContext,
   board: Readonly<TaskBoardSnapshot>,
+  restoration?: RestoreJournalRead,
 ): UiSummary {
   const scope = scopeAt(ctx, board);
-  const summary = buildUiSummary(summaryInput(ctx, board, scope, currentRuntime().receiptStore));
+  const summary = buildUiSummary(
+    summaryInput(ctx, board, scope, currentRuntime().receiptStore, restoration),
+  );
   assertIdentity(ctx, board, scope);
   return summary;
 }
