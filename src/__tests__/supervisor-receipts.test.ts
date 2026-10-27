@@ -97,7 +97,11 @@ describe("original V2 receipt regressions across V3 integration", () => {
     expect(() => {
       assertObservedEvidence("t-1.1", proof("tool:read-499"));
     }).toThrow("fresh host receipt");
-    h.capture(event("validation", "bash"));
+    // Re-delivery is idempotent; readmission would be execution replay and is now rejected before start.
+    expect(() => {
+      prepareToolCapture(h.mock.api, { ...event("validation", "bash"), type: "tool_call" });
+    }).toThrow(/already has a confirmed receipt/);
+    observeTool(h.mock.api, event("validation", "bash"));
     expect(currentRuntime().receiptStore!.stats.count).toBe(501);
     expect(supervisorState()!.epoch).toBe(1);
   });

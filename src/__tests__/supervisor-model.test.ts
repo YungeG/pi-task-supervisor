@@ -128,7 +128,7 @@ describe("session-runtime advisor adapter", () => {
     }
   });
 
-  it("rejects oversized evidence packets visibly before making any model call", async () => {
+  it("rejects oversized required identity metadata visibly before making any model call", async () => {
     const h = lifecycle();
     const streamSimple = vi.fn();
     Object.assign(h.ctx, { modelRegistry: { find: () => h.ctx.model, streamSimple } });
@@ -137,7 +137,7 @@ describe("session-runtime advisor adapter", () => {
         tasks: Array.from({ length: 40 }, (_, index) => ({
           ...activeBoard().tasks[0]!,
           id: `t-1.${index + 1}`,
-          prompt: "x".repeat(2000),
+          title: "x".repeat(2000),
         })),
       }),
     );

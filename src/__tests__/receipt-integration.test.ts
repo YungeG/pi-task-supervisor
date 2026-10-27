@@ -613,8 +613,9 @@ describe("receipt integration safety and legacy formats", () => {
     h.restore();
     expect(supervisorState()).toMatchObject({ status: "fault", pending: false });
     expect(supervisorState()!.reason).toContain("Interrupted review/continuation");
-    // Reopen uses the checkpoint that actually committed, not the old runtime counters.
-    expect(supervisorState()!.reviews).toBe(0);
+    // Reopen consumes the committed modern checkpoint, preserving its spent budget.
+    expect(currentRuntime().receiptStore!.format).toBe(3);
+    expect(supervisorState()).toMatchObject({ reviews: 7, continuations: 3 });
     expect(h.mock.sendMessage.mock.calls.some(([, options]) => options?.triggerTurn === true)).toBe(
       false,
     );

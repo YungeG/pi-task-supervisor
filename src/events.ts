@@ -5,6 +5,20 @@ import type {
   ExtensionContext,
 } from "@earendil-works/pi-coding-agent";
 import type { ContinuousTasksConfig } from "./config";
+import { contractCompilationAdmission } from "./acceptance-runtime";
+import {
+  observeFinalValidation,
+  finalReviewWriteIssue,
+  interruptFinalReview,
+  restoreFinalReviewState,
+  registeredFinalValidation,
+} from "./final-review";
+import {
+  readControlJournal,
+  currentWorkOwner,
+  executionPersistenceIssue,
+  isExecutionRepairRequest,
+} from "./control-journal";
 import { createEmptyBoard } from "./engine";
 import {
   beginRestoreJournal,
@@ -14,7 +28,15 @@ import {
 import { formatJournalReadError } from "./human-journal";
 import { restoreBoardHuman, boardHumanContext, canReplaceBoardDecision } from "./board-human";
 import { claimedExecutionRefs, executionWaitTimer, waitForExecutions } from "./async-execution";
+import {
+  captureManagementSnapshot,
+  decideAdmission,
+  restoreManagement,
+  activeGoalContext,
+  materializeManagement,
+} from "./management-policy";
 import { currentRuntime } from "./runtime";
+import { existingExecutionMetadata } from "./execution-settlement";
 import { preflightContext, preflightTaskIssue, restorePreflight } from "./preflight";
 import { invalidateTaskWidget, TASK_WIDGET_KEY } from "./board-ui";
 import { closeReadOnlyView } from "./ui-view-lifecycle";
@@ -47,6 +69,23 @@ import {
 
 import { restoreGoalLifecycle, settleGoalPlanning } from "./goal-lifecycle";
 import { GoalToolLeases } from "./goal-tool-leases";
+import { finalizeCompletionIntentsAtBoundary } from "./completion-intents";
+import { commitTaskAdvance } from "./task-advance";
+import {
+  admitManagedInvocation,
+  allowManagedInvocation,
+  observeManagedInvocationResult,
+  observeManagedInvocationEnd,
+  sealManagedRootsAtBoundary,
+  invocationActivityIssue,
+} from "./invocation-runtime";
+import {
+  beginProgressCapture,
+  discardUnstartedProgress,
+  observeProgressFact,
+  flushProgressFactsAtBoundary,
+  progressSince,
+} from "./progress-facts";
 import {
   appendOwnerSnapshot,
   invalidateGoalCallbacks,
@@ -219,6 +258,34 @@ function holdBoundaryError(pi: ExtensionAPI, ctx: ExtensionContext, error: unkno
   else pauseBoard(pi, ctx, reason);
 }
 
+function invocationBoundaryNeeded(): boolean {
+  const runtime = currentRuntime();
+  return !!(
+    runtime.invocation?.attention ||
+    runtime.controlJournal?.invocations?.nodes.size ||
+    runtime.controlJournal?.completionIntents?.size
+  );
+}
+async function prepareInvocationBoundary(pi: ExtensionAPI, ctx: ExtensionContext): Promise<void> {
+  sealManagedRootsAtBoundary(pi, ctx);
+  const issue = invocationActivityIssue();
+  if (issue) throw new Error(issue);
+  await finalizeCompletionIntentsAtBoundary(pi, ctx, (edits) => commitTaskAdvance(pi, ctx, edits));
+}
+function boundaryAdmitted(
+  pi: ExtensionAPI,
+  event: AgentBeforeSettleEvent,
+  ctx: ExtensionContext,
+  busy: boolean,
+): boolean {
+  return (
+    decideAdmission(captureManagementSnapshot(ctx), { kind: "boundary" }).verdict !== "deny" &&
+    isSessionScopeEnabled() &&
+    !busy &&
+    !goalExecutionIssue(ctx) &&
+    boundaryAllowed(pi, event, ctx)
+  );
+}
 function makeController(pi: ExtensionAPI, configLoader: ConfigLoader, advisor?: Advisor): Control {
   let serial = 0;
   let inFlight: AbortController | undefined;
@@ -227,6 +294,9 @@ function makeController(pi: ExtensionAPI, configLoader: ConfigLoader, advisor?: 
   let waitTimer: ReturnType<typeof setTimeout> | undefined;
   const cancel = () => {
     currentRuntime().humanEpoch++;
+    interruptFinalReview();
+    currentRuntime().finalReviewAbort?.abort();
+    currentRuntime().finalReviewAbort = undefined;
     currentRuntime().humanAbort?.abort();
     currentRuntime().humanAbort = undefined;
     serial++;
@@ -243,9 +313,11 @@ function makeController(pi: ExtensionAPI, configLoader: ConfigLoader, advisor?: 
     if (board.workflowStatus !== "active") return undefined;
     const config = await configLoader();
     if (ticket !== serial || getBoardRef() !== board) return undefined;
-    const progress = digest(
+    const owner = currentWorkOwner(ctx.sessionManager.getSessionId());
+    const progress = digest([
       board.tasks.map((task) => [task.id, task.status, task.completionEvidence]),
-    );
+      owner ? progressSince({ owner }).keys : [],
+    ]);
     stagnant = lastProgress === progress ? stagnant + 1 : 0;
     lastProgress = progress;
     if (stagnant >= config.maxStagnantSettles) {
@@ -267,8 +339,7 @@ function makeController(pi: ExtensionAPI, configLoader: ConfigLoader, advisor?: 
     event: AgentBeforeSettleEvent,
     ctx: ExtensionContext,
   ): Promise<BoundaryResult | undefined> => {
-    if (!isSessionScopeEnabled() || inFlight || goalExecutionIssue(ctx)) return undefined;
-    if (!boundaryAllowed(pi, event, ctx)) return undefined;
+    if (!boundaryAdmitted(pi, event, ctx, inFlight !== undefined)) return undefined;
     const controller = new AbortController();
     inFlight = controller;
     const ticket = serial;
@@ -278,6 +349,13 @@ function makeController(pi: ExtensionAPI, configLoader: ConfigLoader, advisor?: 
     try {
       const state = supervisorState();
       if (permissionBlocked(pi, ctx)) return undefined;
+      if (invocationBoundaryNeeded()) {
+        await prepareInvocationBoundary(pi, ctx);
+        if (!current()) return undefined;
+      }
+      flushProgressFactsAtBoundary(pi, ctx);
+      if (executionPersistenceIssue(currentWorkOwner(ctx.sessionManager.getSessionId())))
+        return undefined;
       if (state && state.status !== "stopped") {
         if (
           claimedExecutionRefs(getBoardRef()).length &&
@@ -370,6 +448,20 @@ function reportRestoreFailure(
   );
 }
 
+function restoreSelectedManagement(
+  ctx: ExtensionContext,
+  board: ReturnType<typeof createEmptyBoard>,
+  read: RestoreJournalCycle["read"],
+): ReturnType<typeof createEmptyBoard> {
+  restoreManagement(ctx);
+  const runtime = currentRuntime(),
+    management = runtime.management;
+  if (management && management.activeWorkOwner?.kind !== "goal") runtime.finalReview = undefined;
+  if (management?.mode !== "tasks") return board;
+  const selected = restoreBoardHuman(ctx, reconstructState(ctx), read);
+  setBoard(selected);
+  return selected;
+}
 function retryRestoreRead(error: unknown, attempt: number): boolean {
   return (
     attempt === 0 &&
@@ -399,7 +491,15 @@ async function restoreSession(
     manager.getSessionId() !== sessionId
   )
     return;
+  runtime.sessionId = sessionId;
   runtime.goal = undefined;
+  runtime.controlJournal = undefined;
+  runtime.management = undefined;
+  runtime.progress = undefined;
+  runtime.invocation = undefined;
+  runtime.finalValidationIntents = undefined;
+  runtime.finalValidation = undefined;
+  runtime.finalReview = undefined;
   let board = createEmptyBoard();
   setBoard(board);
   currentRuntime().journalFault = undefined;
@@ -411,6 +511,7 @@ async function restoreSession(
   try {
     const active = beginRestoreJournal(ctx);
     cycle = active;
+    runtime.controlJournal = readControlJournal(ctx, active.read);
     restoreGoalLifecycle(pi, ctx, {
       read: active.read,
       install: (operation) => {
@@ -427,6 +528,8 @@ async function restoreSession(
     active.runSupervisorRestore(ctx, () => {
       restoreSupervisor(pi, ctx, active.read);
     });
+    restoreFinalReviewState(ctx);
+    board = restoreSelectedManagement(ctx, board, active.read);
     updateUI(ctx, board, active.read);
     active.assertCurrent(ctx);
     updateActiveTools(pi, isSessionScopeEnabled());
@@ -496,8 +599,18 @@ function registerSessionHandlers(pi: ExtensionAPI, control: Control): void {
     control.cancel();
     const state = supervisorState();
     if (state?.status === "reviewing") {
-      state.status = "active";
-      saveSupervisor(pi);
+      if (currentRuntime().finalReview?.attemptId && getBoardRef().workflowStatus === "completed")
+        holdSupervisor(
+          pi,
+          ctx,
+          "fault",
+          "Final review interrupted by input; inspect and retry-review without replaying work",
+          "interrupted",
+        );
+      else {
+        state.status = "active";
+        saveSupervisor(pi);
+      }
       updateUI(ctx, getBoardRef());
     }
   });
@@ -557,7 +670,9 @@ function taskControlIssue(ctx: ExtensionContext): string | undefined {
   if (["paused", "waiting_for_decision"].includes(getBoardRef().workflowStatus))
     return "Task-board gate must be resolved by its human command";
   const state = supervisorState();
-  return preflightTaskIssue(ctx, state?.status === "stopped" ? undefined : state?.preflightBinding);
+  return activeGoalContext()
+    ? preflightTaskIssue(ctx, state?.status === "stopped" ? undefined : state?.preflightBinding)
+    : undefined;
 }
 
 function decisionReplacementAllowed(toolName: string, input: Record<string, unknown>): boolean {
@@ -586,7 +701,7 @@ function scopedDecisionReplacement(
   ctx: ExtensionContext,
 ): boolean {
   if (!decisionReplacementAllowed(toolName, input) || goalControlIssue(ctx)) return false;
-  const phase = currentRuntime().goal?.current?.phase;
+  const phase = activeGoalContext() ? currentRuntime().goal?.current?.phase : undefined;
   return phase === undefined || !["stopped", "completed"].includes(phase);
 }
 function lifecycleToolRule(
@@ -595,12 +710,94 @@ function lifecycleToolRule(
   input: Record<string, unknown>,
   ctx: ExtensionContext,
 ): { handled: boolean; issue?: string } {
-  if (name === "submit_preflight") return { handled: true, issue: submissionGate(ctx) };
+  if (
+    name === "submit_preflight" ||
+    (name === "propose_contract" &&
+      currentRuntime().preflight &&
+      !currentRuntime().preflight?.started)
+  )
+    return { handled: true, issue: submissionGate(ctx) };
   const issue = goalExecutionIssue(ctx);
-  if (!TASK_TOOL_NAMES.includes(name))
-    return { handled: true, issue: issue && !goalReadOnlyTool(pi, name) ? issue : undefined };
+  if (!TASK_TOOL_NAMES.includes(name)) {
+    if (registeredFinalValidation(ctx, name, input)) return { handled: true };
+    const blocked =
+      issue ??
+      executionPersistenceIssue(currentWorkOwner(ctx.sessionManager.getSessionId())) ??
+      finalReviewWriteIssue(ctx);
+    return { handled: true, issue: !goalReadOnlyTool(pi, name) ? blocked : undefined };
+  }
   if (scopedDecisionReplacement(name, input, ctx)) return { handled: true };
+  if (issue && scopedExecutionMetadataRepair(name, input, ctx)) return { handled: false };
   return issue ? { handled: true, issue } : { handled: false };
+}
+function scopedExecutionMetadataRepair(
+  name: string,
+  input: Record<string, unknown>,
+  ctx: ExtensionContext,
+): boolean {
+  const state = supervisorState();
+  return (
+    currentRuntime().goal?.current?.phase === "fault" &&
+    !goalControlIssue(ctx) &&
+    state?.status === "fault" &&
+    state.holdCause === "interrupted" &&
+    isExecutionRepairRequest(name, input, currentWorkOwner(ctx.sessionManager.getSessionId()))
+  );
+}
+function executionTaskGate(
+  toolName: string,
+  input: Record<string, unknown>,
+  ctx: ExtensionContext,
+): { handled: boolean; issue?: string } {
+  const owner = currentWorkOwner(ctx.sessionManager.getSessionId());
+  const issue = executionPersistenceIssue(owner);
+  if (!issue) return { handled: false };
+  const state = supervisorState();
+  const repairable =
+    !state ||
+    state.status === "active" ||
+    (state.status === "fault" && state.holdCause === "interrupted");
+  return {
+    handled: true,
+    issue: repairable && isExecutionRepairRequest(toolName, input, owner) ? undefined : issue,
+  };
+}
+function managementToolRule(
+  pi: ExtensionAPI,
+  ctx: ExtensionContext,
+  toolName: string,
+  input: Record<string, unknown>,
+): { handled: boolean; issue?: string } {
+  const management = captureManagementSnapshot(ctx);
+  const metadataRepair = existingExecutionMetadata(ctx, toolName, input);
+  const controlRepair = scopedDecisionReplacement(toolName, input, ctx);
+  const validationCheck = toolName === "bash" && !!registeredFinalValidation(ctx, toolName, input);
+  const admission = decideAdmission(management, {
+    kind: "tool",
+    taskTool: TASK_TOOL_NAMES.includes(toolName),
+    preflightTool:
+      toolName === "submit_preflight" ||
+      (toolName === "propose_contract" &&
+        !!currentRuntime().preflight &&
+        !currentRuntime().preflight?.started),
+    readOnly: goalReadOnlyTool(pi, toolName),
+    metadataRepair,
+    validationCheck,
+    controlRepair,
+  });
+  if (admission.verdict === "deny") return { handled: true, issue: admission.reason };
+  const contractIssue = contractCompilationAdmission(
+    ctx,
+    toolName,
+    input,
+    goalReadOnlyTool(pi, toolName),
+  );
+  if (contractIssue) return { handled: true, issue: contractIssue };
+  return {
+    handled:
+      management.mode === "off" ||
+      (management.state === "stopping-with-attention" && (metadataRepair || controlRepair)),
+  };
 }
 function taskGate(
   pi: ExtensionAPI,
@@ -608,10 +805,16 @@ function taskGate(
   input: Record<string, unknown>,
   ctx: ExtensionContext,
 ): string | undefined {
+  const mode = managementToolRule(pi, ctx, toolName, input);
+  if (mode.handled) return mode.issue;
   const rule = lifecycleToolRule(pi, toolName, input, ctx);
   if (rule.handled) return rule.issue;
   const issue = taskControlIssue(ctx);
   if (issue) return issue;
+  const execution = executionTaskGate(toolName, input, ctx);
+  if (execution.handled) return execution.issue;
+  const finalReview = finalReviewWriteIssue(ctx);
+  if (finalReview) return finalReview;
   const state = supervisorState();
   if (!state || state.status === "stopped") return undefined;
   if (["paused", "fault", "reviewing", "completed"].includes(state.status))
@@ -680,6 +883,13 @@ function decisionWait(
     !state.pending
   );
 }
+function managementPlanningContext(ctx: ExtensionContext, supervised: boolean) {
+  const preflight = supervised ? preflightContext(ctx) : undefined;
+  const leading = supervised
+    ? beforePlanningContext(ctx, preflight)
+    : { handled: false, value: undefined };
+  return { preflight, leading };
+}
 function registerWorkHandlers(pi: ExtensionAPI, control: Control): void {
   const runs: string[] = [];
   const runScope = (ctx: ExtensionContext) =>
@@ -694,10 +904,11 @@ function registerWorkHandlers(pi: ExtensionAPI, control: Control): void {
     if (runs.length > 128) runs.shift();
   });
   pi.on("before_agent_start", (_event, ctx) => {
+    const management = captureManagementSnapshot(ctx);
+    if (decideAdmission(management, { kind: "context" }).verdict === "deny") return undefined;
     const board = getBoardRef();
     const state = supervisorState();
-    const preflight = preflightContext(ctx);
-    const leading = beforePlanningContext(ctx, preflight);
+    const { preflight, leading } = managementPlanningContext(ctx, management.mode === "supervised");
     if (leading.handled) return leading.value;
     if (
       !isSessionScopeEnabled() ||
@@ -754,14 +965,19 @@ function registerWorkHandlers(pi: ExtensionAPI, control: Control): void {
 function registerReceiptHandlers(pi: ExtensionAPI): void {
   const leases = new GoalToolLeases();
   pi.on("tool_call", (event, ctx) => {
-    const reason =
-      leases.begin(event.toolCallId, ctx, event.toolName) ??
-      taskGate(pi, event.toolName, event.input, ctx);
-    if (reason) return { block: true, reason };
     try {
-      prepareToolCapture(pi, event);
+      materializeManagement(pi, ctx);
+      const reason =
+        leases.begin(event.toolCallId, ctx, event.toolName) ??
+        taskGate(pi, event.toolName, event.input, ctx);
+      if (reason) return { block: true, reason };
+      admitManagedInvocation(pi, ctx, event);
+      beginProgressCapture(pi, ctx, event, goalReadOnlyTool(pi, event.toolName));
+      prepareToolCapture(pi, event, ctx);
       leases.allow(event.toolCallId);
+      allowManagedInvocation(event.toolCallId);
     } catch (error) {
+      discardUnstartedProgress(event.toolCallId);
       const reason = error instanceof Error ? error.message : "Receipt capture unavailable";
       const store = currentRuntime().receiptStore;
       if (store && !store.healthy) currentRuntime().journalFault = reason;
@@ -777,6 +993,7 @@ function registerReceiptHandlers(pi: ExtensionAPI): void {
   });
   pi.on("tool_result", (event, ctx) => {
     const scope = leases.result(event.toolCallId, ctx, event.toolName);
+    if (scope === "unmanaged") return undefined;
     if (scope === "historical")
       return {
         content: [
@@ -797,13 +1014,16 @@ function registerReceiptHandlers(pi: ExtensionAPI): void {
     const previousFault = currentRuntime().journalFault;
     try {
       const receipt = observeTool(pi, event);
+      observeManagedInvocationResult(ctx, event, receipt);
+      observeProgressFact(ctx, event, receipt);
+      const validationWarning = observeValidationSafely(pi, ctx, event, receipt, previousFault);
       if (receipt)
         return {
           content: [
             ...event.content,
             {
               type: "text" as const,
-              text: `Host evidence receipt: ${receipt.id}; epoch ${receipt.epoch}; observed exit_code ${receipt.exitCode ?? "unavailable"}. Use only fresh successful receipts captured during this task's review.`,
+              text: `Host evidence receipt: ${receipt.id}; epoch ${receipt.epoch}; observed exit_code ${receipt.exitCode ?? "unavailable"}. Use only fresh successful receipts captured during this task's review.${validationWarning ? ` Final validation applicability unavailable: ${validationWarning}; the host receipt itself remains recorded.` : ""}`,
             },
           ],
           ...(event.structuredContent === undefined
@@ -827,8 +1047,45 @@ function registerReceiptHandlers(pi: ExtensionAPI): void {
     }
     return undefined;
   });
+  pi.on("tool_execution_end", (event, ctx) => {
+    try {
+      observeManagedInvocationEnd(pi, ctx, event);
+    } catch (error) {
+      const reason = receiptFailure(pi, ctx, error, currentRuntime().journalFault);
+      const invocation = currentRuntime().invocation;
+      if (invocation) invocation.attention = reason;
+    }
+  });
 }
 
+function observeValidationSafely(
+  pi: ExtensionAPI,
+  ctx: ExtensionContext,
+  event: Parameters<typeof observeFinalValidation>[2],
+  receipt: Parameters<typeof observeFinalValidation>[3] | undefined,
+  previousFault: string | undefined,
+): string | undefined {
+  if (!receipt) {
+    currentRuntime().finalValidationIntents?.delete(event.toolCallId);
+    return undefined;
+  }
+  try {
+    observeFinalValidation(pi, ctx, event, receipt);
+    return undefined;
+  } catch (error) {
+    const runtime = currentRuntime();
+    if (runtime.journalFault) {
+      const state = supervisorState();
+      if (state) {
+        state.status = "fault";
+        state.pending = false;
+        state.acceptedDigest = undefined;
+      }
+      return runtime.journalFault;
+    }
+    return receiptFailure(pi, ctx, error, previousFault);
+  }
+}
 function receiptFailure(
   pi: ExtensionAPI,
   ctx: ExtensionContext,
@@ -860,6 +1117,7 @@ export function registerEventHandlers(
   advisor?: Advisor,
 ): void {
   const control = makeController(pi, configLoader, advisor);
+  currentRuntime().reviewAdvisor = advisor;
   currentRuntime().cancel = control.cancel;
   registerSessionHandlers(pi, control);
   registerWorkHandlers(pi, control);

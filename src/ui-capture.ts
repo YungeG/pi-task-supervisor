@@ -2,7 +2,13 @@ import type { ExtensionContext } from "@earendil-works/pi-coding-agent";
 import { RestoreReadInvalidated, type RestoreJournalRead } from "./restore-journal";
 import { stripTerminalSequences } from "@earendil-works/pi-tui";
 import { currentRuntime } from "./runtime";
-import { flowFacts, nextFlowStep, SUPERVISOR_LIMITS, type FlowFacts } from "./flow";
+import {
+  flowFacts,
+  nextFlowStep,
+  SUPERVISOR_LIMITS,
+  managementStatusLines,
+  type FlowFacts,
+} from "./flow";
 import { currentExecutionWait, type SupervisorState } from "./supervisor";
 import { inspectConfirmedPreflightProjection, type PreflightState } from "./preflight";
 import { readBoardHumanPresentation } from "./board-human";
@@ -187,6 +193,7 @@ function overview(
   ];
   const lines = [
     `只读捕获身份：\n${snapshot(input.scope)}`,
+    `管理状态（仅缓存；不重新核验）：\n${managementStatusLines(input.facts.management).join("\n")}`,
     `目标来源（原值）：\n${snapshot(goals)}`,
     `工作流：${input.board.workflowStatus}`,
     `全部阶段：\n${snapshot(input.board.phases)}`,

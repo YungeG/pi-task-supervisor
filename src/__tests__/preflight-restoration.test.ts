@@ -345,6 +345,9 @@ it.each(["answer", "revoke"])(
     expect(currentPreflightRequestIssue(h.ctx, currentRuntime().preflight!)).toBeUndefined();
     expect(currentRuntime().preflight?.started).toEqual(old.started);
     expect(readFileSync(h.path).subarray(0, before.length).equals(before)).toBe(true);
+    // Closing the original question is not itself a positive off/quiescence observation.
+    await h.command("disable");
+    expect(currentRuntime().management).toMatchObject({ mode: "off", state: "active" });
     h.mock.sendMessage.mockClear();
     restoreWithoutWrites(h);
     expect(currentPreflightRequestIssue(h.ctx, currentRuntime().preflight!)).toBeUndefined();

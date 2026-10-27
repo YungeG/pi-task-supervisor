@@ -107,7 +107,8 @@ function fixture() {
       board.tasks[0]!.status = "implementing";
       board.tasks[0]!.executionRef = { source: "pi-subagents", runId: "run-1" };
       setBoard(board);
-      await command.handler("supervise Finish authorized work", ctx);
+      // Exercise the explicit legacy execution-wait adapter; fresh supervise now plans.
+      await command.handler("supervise-legacy Finish authorized work", ctx);
       return board;
     },
     command: (args: string) => command.handler(args, ctx),

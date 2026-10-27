@@ -1,5 +1,6 @@
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import { registerCommands } from "./commands";
+import { createRunCheckTool, createProposeContractTool } from "./acceptance-tool";
 import { scopedAPI } from "./runtime";
 import { registerMessageRenderers } from "./renderers";
 import { registerEventHandlers } from "./events";
@@ -28,5 +29,7 @@ export default function (api: ExtensionAPI): void {
     pi.registerTool(createAdvanceTasksTool(pi));
     pi.registerTool(createWorkflowGateTool(pi));
     pi.registerTool(createSubmitPreflightTool(pi));
+    pi.registerTool(createRunCheckTool(pi));
+    pi.registerTool(createProposeContractTool(pi));
   });
 }

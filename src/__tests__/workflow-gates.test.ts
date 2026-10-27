@@ -1,6 +1,11 @@
 import { beforeEach, describe, expect, it } from "vitest";
 import { formatContinuePrompt } from "../formatting";
-import { createWorkflowGateTool } from "../tools";
+import { createWorkflowGateTool, createClearTasksTool } from "../tools";
+import { createEmptyBoard } from "../engine";
+import { executionActivityIssue, currentWorkOwner } from "../control-journal";
+import { executionAcceptanceIssue } from "../execution-settlement";
+import { lifecycle } from "./helpers/lifecycle";
+import { startSupervisor } from "../supervisor";
 import { getBoard, resetState, setBoard } from "../state";
 import { currentRuntime } from "../runtime";
 import type { TaskBoardSnapshot } from "../types";
@@ -70,6 +75,71 @@ describe("workflow_gate", () => {
       },
     });
     expect(getBoard().workflowStatus).toBe("waiting_for_decision");
+  });
+
+  it("keeps an unowned volatile execution barrier even when a fileless adapter loses its task fields", async () => {
+    const h = createMockAPI(),
+      ctx = createMockContext();
+    setBoard(board("implementing"));
+    const bound = await createWorkflowGateTool(h.api).execute(
+      "bind-volatile",
+      {
+        action: "bind_execution",
+        taskId: "t-1.1",
+        executionRef: { source: "workflow", runId: "unverified-memory-run" },
+      },
+      undefined,
+      undefined,
+      ctx,
+    );
+    expect(bound.isError).not.toBe(true);
+    setBoard(createEmptyBoard());
+    const cleared = await createClearTasksTool(h.api).execute(
+      "clear-lost-memory",
+      {},
+      undefined,
+      undefined,
+      ctx,
+    );
+    expect(cleared.isError).toBe(true);
+    expect(executionActivityIssue(ctx.sessionManager.getSessionId())).toBeDefined();
+    expect(executionActivityIssue("different-session")).toBeUndefined();
+    expect(currentRuntime().executionMemoryBindings).toMatchObject([
+      { sessionId: ctx.sessionManager.getSessionId(), owner: null },
+    ]);
+    expect(currentRuntime().supervisor).toBeUndefined();
+    expect(currentRuntime().goal).toBeUndefined();
+  });
+
+  it("keeps a fileless Goal-owned binding unverified rather than dropping it with task fields", async () => {
+    const h = lifecycle();
+    setBoard(board("implementing"));
+    startSupervisor(h.mock.api, h.ctx, "Synthetic volatile supervised work");
+    const owner = currentWorkOwner(h.ctx.sessionManager.getSessionId());
+    if (!owner) throw Error("Missing memory fixture owner");
+    const result = await createWorkflowGateTool(h.mock.api).execute(
+      "owned-volatile",
+      {
+        action: "bind_execution",
+        taskId: "t-1.1",
+        executionRef: { source: "pi-subagents", runId: "owned-volatile-run" },
+      },
+      undefined,
+      undefined,
+      h.ctx,
+    );
+    expect(result.isError).not.toBe(true);
+    setBoard(createEmptyBoard());
+    expect(executionAcceptanceIssue(owner)).toContain("unverified");
+    expect(executionActivityIssue(h.ctx.sessionManager.getSessionId())).toBeDefined();
+    const cleared = await createClearTasksTool(h.mock.api).execute(
+      "clear-volatile",
+      {},
+      undefined,
+      undefined,
+      h.ctx,
+    );
+    expect(cleared.isError).toBe(true);
   });
 
   it("holds all later mutations when a waiting proposal snapshot write fails", async () => {
@@ -148,7 +218,7 @@ describe("workflow_gate", () => {
     expect(result.details.error).toMatch(/Independent actionable tasks remain/);
   });
 
-  it("binds and clears an exact external execution receipt", async () => {
+  it("binds an exact external receipt but cannot clear it without an execution-owner transport", async () => {
     const mockAPI = createMockAPI();
     const tool = createWorkflowGateTool(mockAPI.api);
     setBoard(board("implementing"));
@@ -171,8 +241,8 @@ describe("workflow_gate", () => {
       undefined,
       createMockContext(),
     )) as { details: { snapshot: TaskBoardSnapshot; error?: string } };
-    expect(cleared.details.error).toBeUndefined();
-    expect(cleared.details.snapshot.tasks[0]!.executionRef).toBeUndefined();
+    expect(cleared.details.error).toContain("Execution-owner transport unavailable");
+    expect(cleared.details.snapshot.tasks[0]!.executionRef).toEqual(executionRef);
   });
 
   it("warns continuations to inspect an existing run instead of relaunching", () => {

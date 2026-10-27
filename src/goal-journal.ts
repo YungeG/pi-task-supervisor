@@ -1,5 +1,6 @@
 import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
 import { Check } from "typebox/value";
+import { readControlFences } from "./control-journal";
 import { createEmptyBoard } from "./engine";
 import type { TaskBoardSnapshot } from "./types";
 import { inspectRestorableSession, sessionJournalView } from "./human-control";
@@ -545,7 +546,10 @@ function validateClosedPreflight(current: GoalCurrent, node: JournalNode): void 
 }
 function validateOwnerAfterFence(runtime: GoalRuntime, node: JournalNode, seen: boolean): void {
   if (node.customType === GOAL_ENTRY) {
-    if (![1, 2, 3, 5].includes(node.wireVersion ?? -1)) fail("unsupported Supervisor wire version");
+    if (![1, 2, 3, 5, 6].includes(node.wireVersion ?? -1))
+      fail("unsupported Supervisor wire version");
+    // readControlFences validates the complete selected branch before this owner fold.
+    if (node.wireVersion === 6) return;
     if (seen && node.wireVersion !== 5)
       fail("Supervisor checkpoint downgraded after lifecycle fence");
     return;
@@ -572,6 +576,19 @@ function validateOwnerAfterFence(runtime: GoalRuntime, node: JournalNode, seen: 
   validateScopedOwner(current, node);
 }
 
+function passiveBoardSnapshot(
+  node: JournalNode,
+  passive: boolean,
+  pending: GoalRuntime["pending"],
+): boolean {
+  return (
+    passive &&
+    !pending &&
+    node.customType === "continuous-tasks:snapshot" &&
+    !isGoalCarrier(node.data) &&
+    isValidSnapshotV2(node.data)
+  );
+}
 /** Physical read-only fold. Native admission is never based on a substituted SessionManager. */
 export function readGoalJournal(
   ctx: ExtensionContext,
@@ -579,10 +596,21 @@ export function readGoalJournal(
 ): GoalRuntime | undefined {
   const journal = supplied ?? inspectRestorableSession(ctx);
   if (!journal) return undefined;
+  const control = readControlFences(journal);
+  const modeRecords = new Map(
+    (control.modeRecords ?? []).map((record) => [record.entryId, record.data]),
+  );
   const result: GoalRuntime = { sessionId: journal.sessionId, archives: [] };
-  let seen = false;
+  let seen = false,
+    passiveBoard = false;
   for (const [index, node] of journal.branch.entries()) {
     const data = node.data;
+    const mode = modeRecords.get(node.id);
+    if (mode) passiveBoard = ["off", "tasks"].includes(mode.mode);
+    // Only an already encountered, fully validated handoff makes a later bare
+    // board another context. No future mode record or pending transition can
+    // excuse a missing/foreign scoped carrier in the retained Goal history.
+    if (passiveBoardSnapshot(node, passiveBoard, result.pending)) continue;
     validateOwnerAfterFence(result, node, seen);
     if (node.customType === GOAL_ENTRY && node.wireVersion === 5) {
       if (!isGoalRecord(data) || data.sessionId !== journal.sessionId)

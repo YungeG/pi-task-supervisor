@@ -75,6 +75,33 @@ describe("ordinary supervised pause recovery", () => {
     );
   });
 
+  it.each([
+    [7, 4],
+    [40, 20],
+  ])(
+    "preserves same-Goal recovery budget reviews=%i continuations=%i instead of renewing it",
+    async (reviews, continuations) => {
+      const { mock, ctx, run } = setup();
+      Object.assign(supervisorState()!, { reviews, continuations, tokens: 800, cost: 0.25 });
+      holdSupervisor(mock.api, ctx, "fault", "Synthetic interrupted request", "run_failed");
+      const goalId = currentRuntime().receiptStore!.checkpoint().goalId;
+      mock.sendMessage.mockClear();
+      await run("recover");
+      expect(supervisorState()).toMatchObject({
+        status: "active",
+        reviews,
+        continuations,
+        tokens: 800,
+        cost: 0.25,
+      });
+      expect(currentRuntime().receiptStore!.checkpoint().goalId).toBe(goalId);
+      if (reviews === 40)
+        expect(
+          mock.sendMessage.mock.calls.filter(([, options]) => options?.triggerTurn),
+        ).toHaveLength(0);
+    },
+  );
+
   it("does not jointly resume a human pause with an unresolved host capture", async () => {
     const { run, fire } = setup();
     fire("tool_call", {

@@ -5,6 +5,7 @@ import type {
 } from "@earendil-works/pi-coding-agent";
 import type { RestoreJournalRead } from "./restore-journal";
 import { randomUUID } from "node:crypto";
+import { executionActivityIssue, executionOwnerSnapshot } from "./control-journal";
 
 export interface GoalRestoreOptions {
   read: RestoreJournalRead;
@@ -14,6 +15,7 @@ export interface GoalRestoreOptions {
 import { createEmptyBoard } from "./engine";
 import { getBoardRef } from "./state";
 import { currentRuntime } from "./runtime";
+import { adoptSupervisedMode, captureManagementSnapshot } from "./management-policy";
 import { isSafeBoundedText, isValidSnapshotV2 } from "./validation";
 import { hasActiveNativeQuestion, isTrustedLocalTui, requestNativeAnswer } from "./human-ui";
 import {
@@ -46,6 +48,8 @@ import {
   type GoalSeed,
   type GoalSource,
   type GoalSourceRef,
+  isGoalCarrier,
+  scopeEqual,
 } from "./goal-records";
 import { invalidateGoalCallbacks } from "./goal-scope";
 import { decodeSupervisorEntry } from "./supervisor";
@@ -84,6 +88,43 @@ function failure(message: string): never {
 function sourceNode(journal: SessionJournal, id: string): JournalNode {
   return journal.branch.find((node) => node.id === id) ?? failure("source anchor missing");
 }
+function passiveOwnerView(): boolean {
+  const mode = currentRuntime().management;
+  return !!mode && (mode.mode !== "supervised" || mode.activeWorkOwner?.kind !== "goal");
+}
+function retainedLegacyBoardRef(
+  journal: SessionJournal,
+  type: string,
+  current?: GoalCurrent,
+): GoalSourceRef | null | undefined {
+  if (current || !passiveOwnerView() || type !== "continuous-tasks:snapshot") return undefined;
+  const supervisor = journal.branch
+    .filter((node) => node.customType === GOAL_ENTRY && node.wireVersion !== 6)
+    .at(-1);
+  const retained = [...(currentRuntime().controlJournal?.modeRecords ?? [])]
+    .reverse()
+    .find(
+      (record) =>
+        record.data.originOwner?.kind === "goal" &&
+        record.data.mode === "off" &&
+        record.data.state === "active" &&
+        record.data.lastGoal?.sourceRef?.entryId === supervisor?.id,
+    );
+  if (!retained) return undefined;
+  return retained.data.boardRef
+    ? goalSourceRef(sourceNode(journal, retained.data.boardRef.entryId), "data")
+    : null;
+}
+function selectedSourceNode(
+  node: JournalNode,
+  type: string,
+  current: GoalCurrent | undefined,
+): boolean {
+  return (
+    !(current && passiveOwnerView() && type === "continuous-tasks:snapshot") ||
+    (isGoalCarrier(node.data) && scopeEqual(node.data, current.scope))
+  );
+}
 function latestRef(
   journal: SessionJournal,
   type: string,
@@ -96,9 +137,12 @@ function latestRef(
   const offset = base ? journal.branch.findIndex((n) => n.id === base) : -1;
   const types =
     type === "continuous-tasks:snapshot" && !current ? [type, "phased-tasks:snapshot"] : [type];
+  const retained = retainedLegacyBoardRef(journal, type, current);
+  if (retained !== undefined) return retained;
   const node = journal.branch
     .slice(offset + 1)
     .filter((n) => types.includes(n.customType ?? ""))
+    .filter((n) => selectedSourceNode(n, type, current))
     .at(-1);
   if (node)
     return goalSourceRef(
@@ -131,7 +175,9 @@ function sourceSupervisor(
     const head = sourceNode(journal, current.headEntryId);
     return { head, supervisor: current.supervisor ? goalSourceRef(head, "supervisor") : null };
   }
-  const legacy = journal.branch.filter((n) => n.customType === GOAL_ENTRY).at(-1);
+  const legacy = journal.branch
+    .filter((n) => n.customType === GOAL_ENTRY && n.wireVersion !== 6)
+    .at(-1);
   return {
     head:
       legacy ??
@@ -200,6 +246,52 @@ function capturedPreflight(
     failure("preflight cache/source changed");
   return value;
 }
+function passiveTaskRecord(journal: SessionJournal) {
+  const mode = currentRuntime().management?.record;
+  if (
+    !mode ||
+    mode.data.mode !== "tasks" ||
+    mode.data.activeWorkOwner?.kind !== "board" ||
+    !mode.data.boardRef
+  )
+    return undefined;
+  const node = journal.nodes.get(mode.entryId);
+  return node?.digest === mode.digest && journalDigest(node.data) === journalDigest(mode.data)
+    ? mode
+    : undefined;
+}
+function confirmedRetainedBoard(journal: SessionJournal, archived: GoalSourceRef | null): boolean {
+  const retained = [...(currentRuntime().controlJournal?.modeRecords ?? [])]
+    .reverse()
+    .find(
+      (record) =>
+        record.data.originOwner?.kind === "goal" &&
+        (archived
+          ? record.data.boardRef?.entryId === archived.entryId &&
+            record.data.boardRef.digest === archived.entryDigest
+          : record.data.mode === "off" && record.data.boardRef === null),
+    );
+  if (!retained) return false;
+  const node = journal.nodes.get(retained.entryId);
+  return (
+    node?.digest === retained.digest && journalDigest(node.data) === journalDigest(retained.data)
+  );
+}
+function passiveBoardCacheMatches(
+  journal: SessionJournal,
+  archived: GoalSourceRef | null,
+): boolean {
+  const mode = passiveTaskRecord(journal);
+  if (!mode || !confirmedRetainedBoard(journal, archived)) return false;
+  const index = journal.branch.findIndex((node) => node.id === mode.data.boardRef?.entryId);
+  if (index < 0) return false;
+  const snapshot = journal.branch
+    .slice(index)
+    .filter((node) => node.customType === "continuous-tasks:snapshot" && !isGoalCarrier(node.data))
+    .at(-1);
+  const active = snapshot && executionOwnerSnapshot(snapshot.data, mode.data.activeWorkOwner);
+  return !!active && journalDigest(active) === journalDigest(getBoardRef());
+}
 function captureSource(
   ctx: ExtensionContext,
   journal: SessionJournal,
@@ -210,7 +302,8 @@ function captureSource(
   const actualBoard = board ? sourceSnapshot(ctx, journal, board) : createEmptyBoard();
   if (
     (board && board.selector !== "legacy-board" && !isValidSnapshotV2(actualBoard)) ||
-    journalDigest(actualBoard) !== journalDigest(getBoardRef())
+    (journalDigest(actualBoard) !== journalDigest(getBoardRef()) &&
+      !passiveBoardCacheMatches(journal, board))
   )
     failure("board/cache identity changed");
   const preflight = latestRef(journal, "continuous-tasks:preflight", current);
@@ -257,6 +350,8 @@ function terminalIssue(ctx: ExtensionContext, view: GoalRuntime | undefined): st
     return "Explicitly stop the current goal before changing goals";
   if (view?.current && !["stopped", "completed"].includes(view.current.phase))
     return "Explicitly end the current GoalRun before changing goals";
+  const executionIssue = executionActivityIssue(ctx.sessionManager.getSessionId());
+  if (executionIssue) return executionIssue;
   if (board.tasks.some((t) => t.executionRef) || state?.externalWait)
     return "Inspect and close the existing external execution references; no automatic relaunch";
   return preflightTransitionIssue(ctx, view);
@@ -357,12 +452,12 @@ export function inspectGoalTransition(
     };
   }
 }
-function newSeed(ctx: ExtensionContext, goal: string): GoalSeed {
+function newSeed(ctx: ExtensionContext, goal: string, previousGeneration: number): GoalSeed {
   const preflightId = `pf-${randomUUID()}`;
   const model = ctx.model;
   if (!model) return failure("active model is unavailable");
   const board = createEmptyBoard();
-  board.generation = getBoardRef().generation + 1;
+  board.generation = previousGeneration + 1;
   return {
     goalRunId: `rg-${randomUUID()}`,
     goal,
@@ -520,7 +615,12 @@ function transitionChoice(ctx: ExtensionContext, request: GoalTransitionRequest)
   if (inspected.status === "pending") return pendingChoice(ctx, request);
   if (inspected.status !== "eligible" || !inspected.source)
     return failure(inspected.reason ?? "No terminal goal is ready for this transition");
-  return { source: inspected.source, seed: newSeed(ctx, inspected.goal) };
+  const archived = sourceBoard(
+    ctx,
+    inspectSessionJournal(sessionJournalView(ctx)),
+    inspected.source,
+  );
+  return { source: inspected.source, seed: newSeed(ctx, inspected.goal, archived.generation) };
 }
 function choiceIsCurrent(
   ctx: ExtensionContext,
@@ -551,9 +651,10 @@ function choiceIsCurrent(
 function archiveQuestion(
   choice: TransitionChoice,
   frame: ReturnType<typeof captureGoalReadbackFrame>,
+  ctx: ExtensionContext,
 ) {
   const runtime = currentRuntime();
-  const board = getBoardRef();
+  const board = sourceBoard(ctx, inspectSessionJournal(sessionJournalView(ctx)), choice.source);
   const oldGoal =
     runtime.goal?.current?.seed.goal ?? runtime.supervisor?.goal ?? "未记录监督目标（仅历史看板）";
   const counts = {
@@ -624,7 +725,12 @@ export async function requestGoalTransition(
     runtime.humanEpoch === epoch &&
     !signal?.aborted &&
     choiceIsCurrent(ctx, request, choice);
-  const answer = await requestNativeAnswer(ctx, archiveQuestion(choice, frame), current, signal);
+  const answer = await requestNativeAnswer(
+    ctx,
+    archiveQuestion(choice, frame, ctx),
+    current,
+    signal,
+  );
   if (!answer) return { status: "deferred" };
   if (answer.value !== "Archive and plan new goal") return { status: "cancelled" };
   try {
@@ -641,12 +747,16 @@ export async function requestGoalTransition(
       humanInteraction: frame,
       ...(choice.supersedes ? { supersedes: choice.supersedes } : {}),
     };
+    const priorManagement = captureManagementSnapshot(ctx);
     const proof = publishGoalReadbackControl(pi, ctx, answer, frame, body);
     appendObservedGoalCheckpoint(pi, ctx, makeCommit(body, proof.control, proof.witness));
     const view = readGoalJournal(ctx) ?? failure("committed goal selection missing");
     const selected = view.current;
     if (!selected) return failure("committed current goal missing");
     installGoalView(view);
+    // This path follows the actual native archive/planning answer, unlike raw
+    // restoration, which must never reactivate a detached historical owner.
+    adoptSupervisedMode(pi, ctx, priorManagement);
     return { status: "committed-planning", planning: goalPlanningRef(selected) };
   } catch (error) {
     const reason = error instanceof Error ? error.message : "Goal transition persistence uncertain";

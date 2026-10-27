@@ -153,7 +153,13 @@ it("retains exactly one start A/B/S when C fails and repairs only C", async () =
     startupPending: "projection",
     confirmed: { kind: "start" },
   });
-  expect(h.entries.filter((e) => e.customType === "continuous-tasks:supervisor")).toHaveLength(1);
+  expect(
+    h.entries.filter(
+      (e) =>
+        e.customType === "continuous-tasks:supervisor" &&
+        (e.data as { version?: number }).version !== 6,
+    ),
+  ).toHaveLength(1);
   const count = h.entries.length;
   h.mock.appendEntry.mockImplementation(append);
   repairPreflightProjection(h.mock.api, h.ctx);

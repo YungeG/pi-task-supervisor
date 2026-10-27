@@ -480,7 +480,11 @@ it("native no-ID first start confirms separately and dispatches once", async () 
   expect(currentRuntime().preflight?.approval?.permissionIds).toEqual(["A1"]);
   expect(h.ui.reviewedMaterial.length).toBeGreaterThan(0);
   expect(
-    h.entries.filter((entry) => entry.customType === "continuous-tasks:supervisor"),
+    h.entries.filter(
+      (entry) =>
+        entry.customType === "continuous-tasks:supervisor" &&
+        (entry.data as { version?: number }).version !== 6,
+    ),
   ).toHaveLength(0);
   vi.mocked(h.ctx.ui.select).mockResolvedValueOnce("稍后启动");
   const later = await startApprovedPreflight(h.mock.api, h.ctx);
@@ -488,7 +492,11 @@ it("native no-ID first start confirms separately and dispatches once", async () 
   expect(later.status).toBe("deferred");
   expect(currentRuntime().preflight?.started).toBeUndefined();
   expect(
-    h.entries.filter((entry) => entry.customType === "continuous-tasks:supervisor"),
+    h.entries.filter(
+      (entry) =>
+        entry.customType === "continuous-tasks:supervisor" &&
+        (entry.data as { version?: number }).version !== 6,
+    ),
   ).toHaveLength(0);
   const [title, offered] = vi.mocked(h.ctx.ui.select).mock.calls.at(-1)!;
   expect(title).toContain("首次启动");
@@ -503,7 +511,11 @@ it("native no-ID first start confirms separately and dispatches once", async () 
   expect(notices.some((message) => message.trim().startsWith("{"))).toBe(false);
   expect(notices.join("\n")).toContain("启动确认已保存");
   expect(
-    h.entries.find((entry) => entry.customType === "continuous-tasks:supervisor")?.data,
+    h.entries.find(
+      (entry) =>
+        entry.customType === "continuous-tasks:supervisor" &&
+        (entry.data as { version?: number }).version === 3,
+    )?.data,
   ).toMatchObject({
     version: 3,
     receipts: [],

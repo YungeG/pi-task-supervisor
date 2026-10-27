@@ -27,8 +27,8 @@ describe("index (default export)", () => {
 
     indexModule.default(mockObj.api);
 
-    // Seven legacy task tools plus one opt-in proposal-only tool.
-    expect(mockObj.registerTool).toHaveBeenCalledTimes(8);
+    // Original eight methods, independently gated check runner and untrusted proposal metadata.
+    expect(mockObj.registerTool).toHaveBeenCalledTimes(10);
     const toolNames = mockObj.registerTool.mock.calls.map(
       (call: unknown) => (call as [{ name: string }])[0].name,
     );
@@ -40,6 +40,8 @@ describe("index (default export)", () => {
     expect(toolNames).toContain("advance_tasks");
     expect(toolNames).toContain("workflow_gate");
     expect(toolNames).toContain("submit_preflight");
+    expect(toolNames).toContain("run_check");
+    expect(toolNames).toContain("propose_contract");
 
     expect(mockObj.registerCommand).toHaveBeenCalledTimes(2);
     expect(mockObj.registerCommand).toHaveBeenCalledWith(
@@ -52,7 +54,7 @@ describe("index (default export)", () => {
     );
 
     // Native continuation boundary plus notification-only abort reconciliation.
-    expect(mockObj.on).toHaveBeenCalledTimes(11);
+    expect(mockObj.on).toHaveBeenCalledTimes(12); // Original eleven hooks plus actual kernel-end observation.
     const eventNames = mockObj.on.mock.calls.map((call: unknown) => (call as [string, unknown])[0]);
     expect(eventNames).toContain("session_start");
     expect(eventNames).toContain("agent_start");

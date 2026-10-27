@@ -158,6 +158,10 @@ export class ReceiptStore {
   get epoch(): number {
     return this.meta.epoch;
   }
+  /** Cached identity only: safe for resident projections, never hydrates journal state. */
+  get ownerGoalId(): string {
+    return this.meta.goalId;
+  }
   get healthy(): boolean {
     return !this.failed;
   }
@@ -374,7 +378,10 @@ export class ReceiptStore {
   ): void {
     this.syncBranch();
     const id = `tool:${event.toolCallId}`;
-    if (this.index.has(id)) return;
+    if (this.index.has(id))
+      throw new Error(
+        "Tool call identity already has a confirmed receipt; do not execute or replay it",
+      );
     if (this.closed.has(id) || this.calls.has(id)) this.fail("Conflicting or closed tool capture");
     const capture: Capture = {
       id,

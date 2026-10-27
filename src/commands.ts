@@ -14,6 +14,19 @@ import {
   SUPERVISOR_LIMITS,
 } from "./flow";
 import { currentRuntime } from "./runtime";
+import { repairCompletionMetadata } from "./completion-intents";
+import { verifyManualCheck, reviewAcceptanceContract } from "./acceptance-runtime";
+import {
+  requestModeChange,
+  captureManagementSnapshot,
+  decideAdmission,
+  enableTasksMode,
+  adoptSupervisedMode,
+  enterPlanningMode,
+  assertPlanningAdmission,
+} from "./management-policy";
+import { retryFinalReview, pauseFaultedFinalReview, resumePausedFinalReview } from "./final-review";
+import { advisorUsageForCurrent, advisorUsageFor, type AdvisorUsage } from "./advisor-calls";
 import { loadConfig } from "./config";
 import {
   beginPreflight,
@@ -64,11 +77,20 @@ function continuationHeld(): boolean {
 }
 
 function continueNow(pi: ExtensionAPI, ctx: ExtensionCommandContext): void {
+  if (decideAdmission(captureManagementSnapshot(ctx), { kind: "boundary" }).verdict === "deny")
+    return;
   if (goalExecutionIssue(ctx)) return;
   const board = getBoardRef();
   const state = supervisorState();
   const facts = flowFacts(ctx);
-  if (facts.journalFault || facts.preflightIssue || facts.receiptIssue) return;
+  if (
+    !facts.idle ||
+    facts.pending ||
+    facts.journalFault ||
+    facts.preflightIssue ||
+    facts.receiptIssue
+  )
+    return;
   if (continuationHeld() || board.tasks.some((task) => task.executionRef)) return;
   if (["paused", "waiting_for_decision"].includes(board.workflowStatus)) return;
   if (state?.status !== "active" && !hasActionableTasks(board)) return;
@@ -84,6 +106,10 @@ function continueNow(pi: ExtensionAPI, ctx: ExtensionCommandContext): void {
 }
 
 function pause(pi: ExtensionAPI, ctx: ExtensionCommandContext, reason: string): void {
+  if (pauseFaultedFinalReview(pi, ctx, reason)) {
+    updateUI(ctx, getBoardRef());
+    return;
+  }
   const board = getBoardRef();
   if (board.workflowStatus !== "active") {
     if (supervisorState())
@@ -102,6 +128,10 @@ function pause(pi: ExtensionAPI, ctx: ExtensionCommandContext, reason: string): 
 }
 
 function resume(pi: ExtensionAPI, ctx: ExtensionCommandContext): void {
+  if (resumePausedFinalReview(pi, ctx)) {
+    updateUI(ctx, getBoardRef());
+    return;
+  }
   const board = getBoardRef();
   if (board.workflowStatus !== "paused") {
     notifyError(ctx, "Pi Task Supervisor is not paused");
@@ -142,7 +172,7 @@ function resume(pi: ExtensionAPI, ctx: ExtensionCommandContext): void {
         `Task board resumed only; Supervisor remains ${state.status}. ${
           state.status === "stopped" || board.tasks.length > SUPERVISOR_LIMITS.tasks
             ? "Stop/re-plan a valid goal; no automatic continuation."
-            : "Inspect existing work, then /task-supervisor recover (resets review/continuation limits)."
+            : "Inspect existing work, then /task-supervisor recover (preserves spent review/continuation budget)."
         }`,
         "info",
       );
@@ -183,12 +213,25 @@ async function resolveDecision(
   if (result.status === "approved" || result.status === "answered") continueNow(pi, ctx);
 }
 
+function statusAdvisorUsage(ctx: ExtensionCommandContext): AdvisorUsage | undefined {
+  try {
+    const selected = captureManagementSnapshot(ctx);
+    return selected.mode === "off" && selected.lastGoal?.owner
+      ? advisorUsageFor(selected.lastGoal.owner)
+      : advisorUsageForCurrent(ctx);
+  } catch {
+    return undefined;
+  } // Unknown ownership never becomes a claimed zero total.
+}
 function status(ctx: ExtensionCommandContext): void {
   const board = getBoardRef();
   ctx.ui.notify(
     [
       `${formatSummaryLine(board)}; ${board.workflowStatus}; generation ${board.generation}; stagnant ${board.stagnantSettles}`,
-      ...formatFlowStatus(board, supervisorState(), flowFacts(ctx)),
+      ...formatFlowStatus(board, supervisorState(), {
+        ...flowFacts(ctx),
+        advisorUsage: statusAdvisorUsage(ctx),
+      }),
       ...preflightStatusLines(ctx),
       ...(goalStatusText() ? [goalStatusText()] : []),
     ].join("\n"),
@@ -202,9 +245,11 @@ async function beginPlanning(
   goal: string,
 ): Promise<void> {
   await ctx.waitForIdle();
+  assertPlanningAdmission(ctx);
   beginPreflight(pi, ctx, goal);
   try {
     enableSessionScope(pi);
+    enterPlanningMode(pi, ctx);
     updateActiveTools(pi, true);
     refreshUI(ctx);
     const content = preflightContext(ctx);
@@ -239,6 +284,7 @@ async function startGoal(
     ctx.ui.notify(withTaskDetails(ctx, notice.message), notice.level);
     if (outcome.status === "started") {
       try {
+        adoptSupervisedMode(pi, ctx);
         const config = await loadConfig();
         if (config.receiptCache) currentRuntime().receiptStore?.configure(config.receiptCache);
         continueNow(pi, ctx);
@@ -252,6 +298,8 @@ async function startGoal(
     return;
   }
   startSupervisor(pi, ctx, goal);
+  enableSessionScope(pi);
+  adoptSupervisedMode(pi, ctx);
   const config = await loadConfig();
   if (config.receiptCache) currentRuntime().receiptStore?.configure(config.receiptCache);
   enableSessionScope(pi);
@@ -335,16 +383,81 @@ function repairCommand(pi: ExtensionAPI, ctx: ExtensionCommandContext, action: s
   status(ctx);
   return true;
 }
+async function legacySupervise(
+  pi: ExtensionAPI,
+  ctx: ExtensionCommandContext,
+  text: string,
+): Promise<void> {
+  if (currentRuntime().goal?.current)
+    throw new Error(
+      "Legacy shortcut cannot replace a scoped Goal; use explicit supervise planning",
+    );
+  await startGoal(pi, ctx, text);
+}
+async function verifyArtifactCommand(
+  pi: ExtensionAPI,
+  ctx: ExtensionCommandContext,
+  text: string,
+): Promise<void> {
+  if (!text) throw new Error("Usage: /task-supervisor verify-check <checkId>");
+  const result = await verifyManualCheck(pi, ctx, text);
+  refreshUI(ctx);
+  if (ctx.hasUI)
+    ctx.ui.notify(
+      result.status === "confirmed"
+        ? "已记录当前版本的正式人工条件回应；这不授予业务权限、不启动或恢复任务。"
+        : result.status === "unsupported"
+          ? "正式人工条件回应需要受信本机原生 TUI；聊天、SDK/复制的 UI 结果不作确认。"
+          : "人工条件仍未确认；没有自动重问、授权或继续任务。",
+      result.status === "confirmed" ? "info" : "warning",
+    );
+}
+async function evidenceMetadataCommand(
+  pi: ExtensionAPI,
+  ctx: ExtensionCommandContext,
+  action: string,
+  text: string,
+): Promise<boolean> {
+  if (action === "review-contract") {
+    if (!text) throw new Error("Usage: /task-supervisor review-contract <proposalId>");
+    const result = await reviewAcceptanceContract(pi, ctx, text);
+    refreshUI(ctx);
+    if (ctx.hasUI)
+      ctx.ui.notify(
+        result.status === "bound"
+          ? "验收条件与检查定义已绑定当前版本；没有新增权限、首次启动或产物接受。"
+          : `契约仍未绑定：${result.status}；不会自动执行或重问。`,
+        result.status === "bound" ? "info" : "warning",
+      );
+  } else if (action === "verify-check") await verifyArtifactCommand(pi, ctx, text);
+  else if (action === "repair-completion") {
+    repairCompletionMetadata(pi, ctx, text);
+    status(ctx);
+  } else if (action === "retry-review") {
+    await retryFinalReview(pi, ctx, text || undefined);
+    status(ctx);
+  } else return false;
+  return true;
+}
 async function supervisorCommand(
   pi: ExtensionAPI,
   ctx: ExtensionCommandContext,
   action: string,
   text: string,
 ): Promise<boolean> {
-  if (action === "supervise" || action === "start") {
+  if (action === "supervise") {
+    await beginPlanning(pi, ctx, text);
+    return true;
+  }
+  if (action === "supervise-legacy") {
+    await legacySupervise(pi, ctx, text);
+    return true;
+  }
+  if (action === "start") {
     await routeStart(pi, ctx, action, text);
     return true;
   }
+  if (await evidenceMetadataCommand(pi, ctx, action, text)) return true;
   if (action === "revoke") {
     await revokeGoal(pi, ctx, text);
     return true;
@@ -401,15 +514,13 @@ async function preflightCommand(
   return true;
 }
 
-function enableCommand(pi: ExtensionAPI, ctx: ExtensionCommandContext, action: string): boolean {
-  if (action !== "enable") return false;
-  if (isSessionScopeEnabled()) {
-    ctx.ui.notify("Pi Task Supervisor is already enabled for this session", "info");
-    return true;
-  }
-  enableSessionScope(pi);
-  ctx.ui.notify("Pi Task Supervisor enabled for this session", "info");
-  return true;
+function enableNotice(ctx: ExtensionCommandContext, already: boolean): void {
+  ctx.ui.notify(
+    already
+      ? "Pi Task Supervisor is already enabled for this session"
+      : "Pi Task Supervisor enabled for this session",
+    "info",
+  );
 }
 async function readOnlyCommand(
   ctx: ExtensionCommandContext,
@@ -430,6 +541,33 @@ async function readOnlyCommand(
   }
   return false;
 }
+async function ownerControlCommand(
+  pi: ExtensionAPI,
+  ctx: ExtensionCommandContext,
+  action: string,
+  text: string,
+): Promise<boolean> {
+  if (action === "enable") {
+    const before = captureManagementSnapshot(ctx);
+    await enableTasksMode(pi, ctx);
+    updateActiveTools(pi, isSessionScopeEnabled());
+    refreshUI(ctx);
+    enableNotice(ctx, before.mode === "tasks" && before.state === "active");
+    return true;
+  }
+  if (action === "disable" || action === "stop") {
+    await requestModeChange(pi, ctx, "off");
+    updateActiveTools(pi, isSessionScopeEnabled());
+    refreshUI(ctx);
+    status(ctx);
+    return true;
+  }
+  if (["approve", "start"].includes(action) && captureManagementSnapshot(ctx).mode !== "supervised")
+    throw new Error(
+      "Select a new supervised planning context; off/task-only mode cannot revive historical permission or first-start",
+    );
+  return routeGoalCommand(pi, ctx, action, text);
+}
 export function registerCommands(pi: ExtensionAPI): void {
   const command = {
     description: "Enable or control Pi Task Supervisor for this session",
@@ -438,7 +576,9 @@ export function registerCommands(pi: ExtensionAPI): void {
       try {
         if (await readOnlyCommand(ctx, action, [id, ...answerParts].filter(Boolean).join(" ")))
           return;
-        if (await routeGoalCommand(pi, ctx, action, [id, ...answerParts].filter(Boolean).join(" ")))
+        if (
+          await ownerControlCommand(pi, ctx, action, [id, ...answerParts].filter(Boolean).join(" "))
+        )
           return;
         if (repairCommand(pi, ctx, action)) return;
         if (currentRuntime().journalFault) throw new Error(currentRuntime().journalFault);
@@ -448,7 +588,6 @@ export function registerCommands(pi: ExtensionAPI): void {
           await supervisorCommand(pi, ctx, action, [id, ...answerParts].filter(Boolean).join(" "))
         )
           return;
-        if (enableCommand(pi, ctx, action)) return;
         if (!isSessionScopeEnabled()) {
           notifyError(ctx, "Pi Task Supervisor is disabled; run /task-supervisor enable");
           return;
@@ -467,7 +606,7 @@ export function registerCommands(pi: ExtensionAPI): void {
         }
         notifyError(
           ctx,
-          "Usage: /task-supervisor enable|preflight <goal>|approve [planId [all|none|IDs]]|start [planId]|decide|resolve [id] (native response, not chat approval)|repair-preflight|repair-decision|revoke <planId>|supervise <goal>|status|tasks|history [goalKey|page:offset] (read-only)|pause [reason]|resume|recover|stop",
+          "Usage: /task-supervisor enable|disable|preflight <goal>|approve [planId [all|none|IDs]]|start [planId]|decide|resolve [id] (native response, not chat approval)|repair-preflight|repair-decision|revoke <planId>|supervise <goal> (planning)|supervise-legacy <goal> (explicit compatibility)|status|tasks|history [goalKey|page:offset] (read-only)|pause [reason]|resume|recover|repair-completion <intentId> (confirmed metadata only, no replay)|verify-check <checkId> (native artifact response, no permission/start)|review-contract <proposalId> (native definition review)|retry-review [attemptId] (review/registered validation only)|stop",
         );
       } catch (error) {
         notifyError(

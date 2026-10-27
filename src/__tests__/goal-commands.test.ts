@@ -163,7 +163,10 @@ it("can explicitly end an approved but never-started planning goal without revok
   ).toHaveLength(controls);
   vi.mocked(f.ctx.ui.select).mockResolvedValue("确认提交所选方案");
   await f.command("supervise New goal after approved draft");
-  expect(currentRuntime().goal?.current?.seed.goal).toBe("New goal after approved draft");
+  expect(
+    currentRuntime().goal?.current?.seed.goal,
+    JSON.stringify(vi.mocked(f.ctx.ui.notify).mock.calls),
+  ).toBe("New goal after approved draft");
   expect(currentRuntime().preflight?.approval).toBeUndefined();
   expect(currentRuntime().preflight?.phase).toBe("planning");
 });

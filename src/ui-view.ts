@@ -258,13 +258,23 @@ function hasOnlyHistoricalPreflight(input: UiSummaryInput): boolean {
 }
 
 /** Explicit stop leaves history, not a resident work indicator. Independent attention stays visible. */
+function closedDetachedDecision(input: UiSummaryInput): boolean {
+  const mode = input.facts.management;
+  return (
+    mode?.mode === "off" &&
+    mode.source !== "legacy-compatible" &&
+    mode.state === "active" &&
+    input.board.decision?.response === "rejected"
+  );
+}
 function hasQuietBoard(input: UiSummaryInput): boolean {
   const { board, facts, repairs } = input;
+  const closedDecision = closedDetachedDecision(input);
   return (
-    !["active", "waiting_for_decision"].includes(board.workflowStatus) &&
+    (closedDecision || !["active", "waiting_for_decision"].includes(board.workflowStatus)) &&
     !board.tasks.some((task) => task.executionRef) &&
     ![
-      board.decision,
+      closedDecision ? undefined : board.decision,
       repairs?.board,
       repairs?.preflight,
       facts.journalFault,
@@ -276,6 +286,14 @@ function hasQuietBoard(input: UiSummaryInput): boolean {
 }
 function isQuietStoppedHistory(input: UiSummaryInput): boolean {
   if (!hasQuietBoard(input)) return false;
+  const management = input.facts.management;
+  if (
+    management?.mode === "off" &&
+    management.source !== "legacy-compatible" &&
+    management.state === "active" &&
+    !management.attention.length
+  )
+    return true;
   const goal = input.facts.goal;
   if (goal?.phase === "stopped" && goal.closedUnstarted && !goal.hasSupervisor)
     return input.board.tasks.length === 0;

@@ -296,8 +296,10 @@ describe("current-branch human control and persistence", () => {
     const state = supervisorState()!;
     const board = activeBoard();
     board.tasks[0]!.prompt = "界".repeat(22000);
-    expect(() => evidencePacket(h.ctx, board, state)).toThrow("64KB");
-    const packet = JSON.parse(evidencePacket(h.ctx, activeBoard(), state));
+    const bounded = evidencePacket(h.ctx, board, state);
+    expect(Buffer.byteLength(bounded)).toBeLessThanOrEqual(64000);
+    expect(JSON.parse(bounded).excerpts.shortened).toBe(true);
+    const packet = JSON.parse(bounded);
     expect(packet.preflight.approval.controlEntryId).toBe(
       currentRuntime().preflight!.approval!.controlEntryId,
     );

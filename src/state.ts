@@ -1,4 +1,5 @@
 import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
+import { assertExecutionTaskWrite, observeExecutionBoardBoundary } from "./control-journal";
 import { RestoreReadInvalidated, type RestoreJournalRead } from "./restore-journal";
 import type { LegacyTaskBoardSnapshot, TaskBoardSnapshot, TaskWorkflowEvent } from "./types";
 import { CUSTOM_EVENT_TYPE, CUSTOM_SNAPSHOT_TYPE, LEGACY_CUSTOM_SNAPSHOT_TYPE } from "./types";
@@ -15,8 +16,14 @@ import { captureUiSummary } from "./ui-capture";
 import { formatStatusbar, formatLegacySupervisorStatus } from "./status-ui";
 
 import { currentRuntime, type TaskRuntime } from "./runtime";
+import { managementBoardReplacement, completeManagementBoardUpdate } from "./management-policy";
 import { redact } from "./receipt-store";
-import { appendOwnerSnapshot, ownerSnapshot, selectedGoalEntries } from "./goal-scope";
+import {
+  appendOwnerSnapshot,
+  ownerSnapshot,
+  selectedGoalEntries,
+  currentGoalScope,
+} from "./goal-scope";
 
 // ── State Accessors ──
 
@@ -37,8 +44,19 @@ export function getBoardRef(): Readonly<TaskBoardSnapshot> {
 
 /** Resets all mutable state. For testing only. */
 export function resetState(): void {
+  currentRuntime().sessionId = undefined;
+  currentRuntime().executionMemoryBindings = undefined;
   currentRuntime().board = createEmptyBoard();
   currentRuntime().goal = undefined;
+  currentRuntime().controlJournal = undefined;
+  currentRuntime().management = undefined;
+  currentRuntime().finalValidationIntents = undefined;
+  currentRuntime().finalValidation = undefined;
+  currentRuntime().finalReview = undefined;
+  currentRuntime().progress = undefined;
+  currentRuntime().invocation = undefined;
+  currentRuntime().finalReviewAbort?.abort();
+  currentRuntime().finalReviewAbort = undefined;
   currentRuntime().goalEpoch++;
   currentRuntime().planningLease = undefined;
   currentRuntime().supervisor = undefined;
@@ -77,9 +95,12 @@ export function migrateLegacySnapshot(snapshot: LegacyTaskBoardSnapshot): TaskBo
  * Reads local version-2 snapshots and one-way migrates pinned upstream version-1 snapshots.
  * Empty history is inactive; recognized but invalid snapshots fail closed.
  */
+function selectedStateGoal() {
+  return currentGoalScope() ? currentRuntime().goal?.current : undefined;
+}
 export function reconstructState(ctx: ExtensionContext): TaskBoardSnapshot {
   const branch = ctx.sessionManager.getBranch();
-  const currentGoal = currentRuntime().goal?.current;
+  const currentGoal = selectedStateGoal();
   let latestV2: TaskBoardSnapshot | undefined = currentGoal
     ? cloneBoard(currentGoal.seed.board)
     : undefined;
@@ -115,6 +136,7 @@ export function persistEntries(
   event: unknown,
   snapshot: TaskBoardSnapshot,
 ): void {
+  assertExecutionTaskWrite([event], snapshot);
   pi.appendEntry(CUSTOM_EVENT_TYPE, event);
   appendOwnerSnapshot(pi, CUSTOM_SNAPSHOT_TYPE, snapshot);
 }
@@ -125,15 +147,21 @@ export function persistTaskUpdate(
   events: readonly TaskWorkflowEvent[],
   snapshot: TaskBoardSnapshot,
   afterPersist?: () => void,
+  ctx?: ExtensionContext,
 ): void {
+  if (managementBoardReplacement(events) && !ctx)
+    throw new Error("Managed board replacement requires its actual host context");
   const existingFault = currentRuntime().journalFault;
   if (existingFault) throw new Error(existingFault);
   if (!isValidSnapshotV2(snapshot)) throw new Error("Invalid candidate task-board snapshot");
+  assertExecutionTaskWrite(events, snapshot);
   try {
     for (const event of events) pi.appendEntry(CUSTOM_EVENT_TYPE, event);
     appendOwnerSnapshot(pi, CUSTOM_SNAPSHOT_TYPE, snapshot);
     afterPersist?.();
     setBoard(snapshot);
+    observeExecutionBoardBoundary(events);
+    if (ctx) completeManagementBoardUpdate(pi, ctx, events);
   } catch (error) {
     const runtime = currentRuntime();
     runtime.journalFault ??=

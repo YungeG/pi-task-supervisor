@@ -67,7 +67,7 @@ export const GetReadyTasksParams = Type.Object({
   count: Type.Integer({ description: "Number of tasks to claim (>= 1)", minimum: 1 }),
 });
 
-const EvidenceRefParams = Type.Object({
+export const EvidenceRefParams = Type.Object({
   kind: StringEnum(["command", "review", "artifact", "diff"] as const),
   label: Type.String({ minLength: 1, maxLength: 200 }),
   status: StringEnum(["passed", "fixed", "deferred"] as const),
@@ -76,7 +76,7 @@ const EvidenceRefParams = Type.Object({
   digest: Type.Optional(Type.String({ minLength: 1, maxLength: 200 })),
 });
 
-const CompletionEvidenceParams = Type.Object({
+export const CompletionEvidenceParams = Type.Object({
   summary: Type.String({ minLength: 1, maxLength: 1000 }),
   refs: Type.Array(EvidenceRefParams, { minItems: 1, maxItems: 20 }),
   residualRisks: Type.Optional(
@@ -94,8 +94,30 @@ export const AdvanceTasksParams = Type.Object({
   ),
 });
 
+export const ExecutionResolutionParams = Type.Object(
+  {
+    settlementId: Type.String({ minLength: 1, maxLength: 100 }),
+    resolutionKind: Type.Union([
+      Type.Literal("validated_repair"),
+      Type.Literal("superseded_success"),
+    ]),
+    validationRefs: Type.Array(Type.String({ minLength: 1, maxLength: 500 }), {
+      minItems: 1,
+      maxItems: 20,
+    }),
+    supersedingBindingId: Type.Optional(Type.String({ minLength: 1, maxLength: 100 })),
+  },
+  { additionalProperties: false },
+);
+
 export const WorkflowGateParams = Type.Object({
-  action: StringEnum(["wait_for_decision", "bind_execution", "clear_execution"] as const),
+  action: StringEnum([
+    "wait_for_decision",
+    "bind_execution",
+    "clear_execution",
+    "resolve_execution",
+  ] as const),
+  resolution: Type.Optional(ExecutionResolutionParams),
   taskId: Type.Optional(Type.String({ minLength: 1, maxLength: 100 })),
   decision: Type.Optional(
     Type.Object({

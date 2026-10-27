@@ -105,7 +105,8 @@ describe("supervisor stopping and recovery policy", () => {
     const h = lifecycle(advisor);
     await h.command("supervise Complete approved work");
     await h.command("stop");
-    expect(supervisorState()?.status).toBe("stopped");
+    expect(currentRuntime().supervisor?.status).toBe("stopped");
+    expect(supervisorState()).toBeUndefined();
     expect(getBoard().workflowStatus).toBe("paused");
     expect(await h.fire("agent_before_settle", BOUNDARY)).toBeUndefined();
     expect(advisor).not.toHaveBeenCalled();
@@ -150,7 +151,9 @@ describe("supervisor stopping and recovery policy", () => {
     }
     expect(await h.fire("agent_before_settle", BOUNDARY)).toBeUndefined();
     expect(supervisorState()).toMatchObject({ status: "paused", stagnant: 3 });
-    expect(advisor).toHaveBeenCalledTimes(3);
+    // Only the first semantic review calls Advisor; unchanged ready-loop handoffs are host mechanical.
+    expect(advisor).toHaveBeenCalledTimes(1);
+    expect(supervisorState()?.continuations).toBe(3);
   });
 
   it.each([{ reviews: 40 }, { continuations: 20 }])(
@@ -279,9 +282,17 @@ describe("supervisor stopping and recovery policy", () => {
   it("leaves malformed write parameters to host schema validation without crashing its gate", async () => {
     const h = lifecycle();
     await h.command("supervise Complete approved work");
-    for (const phases of [undefined, {}, [null, 7, {}, { tasks: {} }, { tasks: [] }]])
+    for (const [index, phases] of [
+      undefined,
+      {},
+      [null, 7, {}, { tasks: {} }, { tasks: [] }],
+    ].entries())
       expect(
-        await h.fire("tool_call", { toolName: "write_tasks", input: { mode: "append", phases } }),
+        await h.fire("tool_call", {
+          toolCallId: `schema-case-${index}`,
+          toolName: "write_tasks",
+          input: { mode: "append", phases },
+        }),
       ).toBeUndefined();
   });
 

@@ -83,7 +83,11 @@ export function lifecycle(advisor?: Advisor) {
       }
       return getHandler(mock, name)(event, ctx);
     },
-    command: (args: string) => command.handler(args, ctx),
+    // This harness exercises the explicit fileless legacy adapter. Fresh native
+    // supervise/planning behavior is covered by owned management/Goal fixtures.
+    command: (args: string) =>
+      command.handler(args.replace(/^supervise(?=\s|$)/, "supervise-legacy"), ctx),
+    nativeCommand: (args: string) => command.handler(args, ctx),
   };
 }
 export function deferred<T>() {

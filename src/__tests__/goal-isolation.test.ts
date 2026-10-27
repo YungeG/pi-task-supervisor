@@ -327,7 +327,7 @@ it("bounds callback identities and rejects duplicate/blocked calls without treat
   expect(book.begin("warm-call", f.ctx, "read")).toContain("already admitted");
   expect(book.result("warm-call", f.ctx, "read")).toBe("blocked");
   for (let i = 0; i < 512; i++) book.begin(`bounded-${i}`, f.ctx, "read");
-  expect(book.result("warm-call", f.ctx, "read")).toBe("current"); // Unmatched, not an invented historical identity.
+  expect(book.result("warm-call", f.ctx, "read")).toBe("blocked"); // Active capacity does not erase a confirmed admission denial.
   const foreign = {
     ...f.ctx,
     sessionManager: { ...f.ctx.sessionManager, getSessionId: () => "foreign" },
@@ -335,6 +335,21 @@ it("bounds callback identities and rejects duplicate/blocked calls without treat
   expect(book.result("bounded-511", foreign, "read")).toBe("historical");
 });
 
+it("keeps a live parent callback identity through more than 512 completed siblings", async () => {
+  const f = await goalFixture();
+  fixtures.push(f);
+  await start(f, "Owned callback parent retention");
+  const book = new GoalToolLeases();
+  expect(book.begin("opaque-parent", f.ctx, "codemode")).toBeUndefined();
+  book.allow("opaque-parent");
+  for (let i = 0; i < 1000; i++) {
+    const id = `opaque-child-${i}`;
+    expect(book.begin(id, f.ctx, "read")).toBeUndefined();
+    book.allow(id);
+    expect(book.result(id, f.ctx, "read")).toBe("current");
+  }
+  expect(book.result("opaque-parent", f.ctx, "codemode")).toBe("current");
+});
 it("does not classify an unknown result as historical when the physical source cannot be read", async () => {
   const f = await goalFixture();
   fixtures.push(f);

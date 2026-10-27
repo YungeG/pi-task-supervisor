@@ -22,6 +22,22 @@ afterEach(() => {
   }
   vi.restoreAllMocks();
 });
+function expectOnlyStopAttention(f: Awaited<ReturnType<typeof goalFixture>>, writes: number): void {
+  // P4 persists cancellation/attention, but must not answer, revoke, archive or
+  // close the original native question as a side effect of stop.
+  expect(f.entries().slice(writes)).toMatchObject([
+    {
+      customType: "continuous-tasks:control-facts",
+      data: {
+        kind: "session-mode-changed",
+        mode: "supervised",
+        state: "stopping-with-attention",
+        activeWorkOwner: { kind: "goal" },
+      },
+    },
+  ]);
+  expect(currentRuntime().management?.attention.some((item) => item.kind === "control")).toBe(true);
+}
 async function approved() {
   const f = await goalFixture();
   fixtures.push(f);
@@ -177,7 +193,7 @@ it("does not accept a revoked projection without its actual owner control", asyn
   const writes = f.entries().length;
   await f.command("stop");
   expect(currentRuntime().goal?.current?.phase).not.toBe("stopped");
-  expect(f.entries()).toHaveLength(writes);
+  expectOnlyStopAttention(f, writes);
 });
 
 it("does not let request-field removal erase a genuine unanswered permission request", async () => {
@@ -192,7 +208,7 @@ it("does not let request-field removal erase a genuine unanswered permission req
   const writes = f.entries().length;
   await f.command("stop");
   expect(currentRuntime().goal?.current?.phase).not.toBe("stopped");
-  expect(f.entries()).toHaveLength(writes);
+  expectOnlyStopAttention(f, writes);
 });
 
 it("retains the same identity when the original unanswered question is still genuinely open", async () => {
@@ -226,7 +242,7 @@ it("does not reuse a revoked unanswered question when the same permission select
   await f.command("stop");
   expect(currentRuntime().goal?.current?.phase).not.toBe("stopped");
   await f.command("supervise Must retain the repeated question");
-  expect(f.entries()).toHaveLength(writes);
+  expectOnlyStopAttention(f, writes);
   expect(currentPreflightRequestIssue(f.ctx, currentRuntime().preflight!)).toContain("unanswered");
 });
 
@@ -241,7 +257,7 @@ it("does not let an older revoke close a newer permission request, including aft
   const writes = f.entries().length;
   await f.command("stop");
   expect(currentRuntime().goal?.current?.phase).not.toBe("stopped");
-  expect(f.entries()).toHaveLength(writes);
+  expectOnlyStopAttention(f, writes);
   expect(currentRuntime().preflight).toEqual(state);
 });
 
@@ -293,7 +309,7 @@ it.each(["defer", "cancel", "no-TUI"])(
     const writes = f.entries().length;
     await f.command("stop");
     expect(currentRuntime().goal?.current?.phase).not.toBe("stopped");
-    expect(f.entries()).toHaveLength(writes);
+    expectOnlyStopAttention(f, writes);
     const final = currentRuntime().preflight;
     expect(final?.version === 2 && final.permissionRequest).toEqual(
       state.version === 2 && state.permissionRequest,
@@ -314,7 +330,11 @@ it.each(["started", "revoked"])(
     vi.mocked(f.ctx.ui.select).mockResolvedValue("稍后决定");
     await f.command("approve");
     await f.command("stop");
-    expect(currentRuntime().goal?.current?.phase).toBe("stopped");
+    expect(currentRuntime().goal?.current?.phase).toBe("fault");
+    expect(currentRuntime().management).toMatchObject({
+      mode: "supervised",
+      state: "stopping-with-attention",
+    });
     const state = structuredClone(currentRuntime().preflight);
     const writes = f.entries().length;
     vi.mocked(f.ctx.ui.select).mockResolvedValue("确认提交所选方案");
@@ -324,6 +344,37 @@ it.each(["started", "revoked"])(
     expect(f.entries()).toHaveLength(writes);
   },
 );
+
+it("can settle an original native question by denial after stop, then explicitly complete the same release", async () => {
+  const f = await approved();
+  vi.mocked(f.ctx.ui.select).mockResolvedValue("开始执行");
+  await f.command("start");
+  vi.mocked(f.ctx.ui.select).mockResolvedValue("稍后决定");
+  await f.command("approve");
+  const before = structuredClone(currentRuntime().preflight!);
+  await f.command("stop");
+  expect(currentRuntime().management?.state).toBe("stopping-with-attention");
+  expect(currentRuntime().supervisor?.status).toBe("fault");
+  f.chooseDraft(2);
+  vi.mocked(f.ctx.ui.select).mockResolvedValue("不允许");
+  await f.command("approve");
+  expect(currentPreflightRequestIssue(f.ctx, currentRuntime().preflight!)).toBeUndefined();
+  expect(currentRuntime().preflight?.approval).toBeUndefined();
+  expect(currentRuntime().management?.state).toBe("stopping-with-attention");
+  await f.command("disable");
+  expect(currentRuntime().management).toMatchObject({
+    mode: "off",
+    state: "active",
+    activeWorkOwner: null,
+  });
+  const final = currentRuntime().preflight!;
+  expect(final.version === 2 && before.version === 2 && final.permissionRequest?.id).toBe(
+    before.version === 2 && before.permissionRequest?.id,
+  );
+  const writes = f.entries().length;
+  await f.command("disable");
+  expect(f.entries()).toHaveLength(writes);
+});
 
 it("does not stop an approved unstarted goal while its newer native permission request is unanswered", async () => {
   const f = await approved();
@@ -340,7 +391,7 @@ it("does not stop an approved unstarted goal while its newer native permission r
   const writes = f.entries().length;
   await f.command("stop");
   expect(currentRuntime().goal?.current?.phase).not.toBe("stopped");
-  expect(f.entries()).toHaveLength(writes);
+  expectOnlyStopAttention(f, writes);
   expect(currentRuntime().preflight).toEqual(state);
   expect(currentRuntime().supervisor).toBeUndefined();
 });

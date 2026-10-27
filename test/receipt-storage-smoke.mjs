@@ -1,6 +1,7 @@
 import assert from "node:assert/strict";
 import { createHash } from "node:crypto";
-import { mkdtempSync, readFileSync, existsSync, rmSync } from "node:fs";
+import { execFileSync } from "node:child_process";
+import { mkdtempSync, readFileSync, writeFileSync, existsSync, rmSync } from "node:fs";
 import { tmpdir, homedir } from "node:os";
 import { dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -72,6 +73,10 @@ const bindings = () => ({
 
 try {
   process.env.PI_CODING_AGENT_DIR = sandbox;
+  // Explicit finite test inputs; SDK/session/cache files are runtime metadata, not artifacts.
+  execFileSync("git", ["init", "--quiet", sandbox], { timeout: 2000, stdio: "ignore" });
+  writeFileSync(join(sandbox, ".gitignore"), "*\n!.gitignore\n!review-input.txt\n");
+  writeFileSync(join(sandbox, "review-input.txt"), "Fixed owned receipt validation input\n");
   const manager = SessionManager.create(sandbox, join(sandbox, "sessions"));
   // A known historical fixture, not a claim that a business command ran in this process.
   manager.appendMessage(fauxAssistantMessage("Isolated historical receipt fixture."));
@@ -248,11 +253,10 @@ try {
     label: "Validate receipt fixture",
     description: "Pure isolated validation",
     parameters: Type.Object({}),
-    execute: async () => ({
-      content: [{ type: "text", text: "Fixture passed" }],
-      details: {},
-      structuredContent: { exit_code: 0 },
-    }),
+    execute: async () => {
+      assert.equal(readFileSync(join(sandbox, "review-input.txt"), "utf8"), "Fixed owned receipt validation input\n");
+      return { content: [{ type: "text", text: "Fixture passed" }], details: {}, structuredContent: { exit_code: 0 } };
+    },
   };
   async function open(sm, selected = extensionPath) {
     const created = await createAgentSession({
@@ -274,13 +278,31 @@ try {
   assert.equal(latest(manager).version, intent ? 3 : v2 ? 2 : 1);
   if (!intent && !v2 && legacyCount === 500) assert.equal(latest(manager).receiptGapEpoch, 5);
   if (intent) {
+    // P4 correctly refuses ordinary writes in a faulted managed Goal. Arm this
+    // crash fixture through actual explicit recovery first. A conservative
+    // host-context pending hold suppresses its automatic Main turn; it is a
+    // source-boundary simulation, not a claim that a real SDK queue exists.
+    const responsesBefore = faux.getPendingResponseCount();
+    const recover = session.extensionRunner.getCommand("task-supervisor");
+    assert(recover);
+    const nativeContext = session.extensionRunner.createCommandContext();
+    await recover.handler("recover", {
+      ...nativeContext,
+      hasPendingMessages: () => nativeContext.hasPendingMessages() || latest(manager)?.status === "active",
+    });
+    assert.equal(latest(manager)?.status, "active");
+    assert.equal(latest(manager).reviews, legacy.reviews);
+    assert.equal(latest(manager).continuations, legacy.continuations);
+    assert.equal(latest(manager).tokens, legacy.tokens);
+    assert.equal(latest(manager).cost, legacy.cost);
+    assert.equal(faux.getPendingResponseCount(), responsesBefore, "Arming recovery must not dispatch Main");
     const gate = await session.extensionRunner.emitToolCall({
       type: "tool_call",
       toolName: "write",
       toolCallId: "interrupted-fixture-write",
       input: { path: "not-executed" },
     });
-    assert(!gate?.block);
+    assert(!gate?.block, JSON.stringify(gate));
     const record = manager
       .getBranch()
       .findLast((e) => e.type === "custom" && e.customType === RECEIPTS);
@@ -358,6 +380,8 @@ try {
       legacyReaderRefusedV3: Boolean(process.env.PI_SUPERVISOR_OLD_ENTRY),
       realSettingsUntouched: true,
       uiStubNotRealTerminal: true,
+      intentArmedByExplicitRecovery: intent,
+      intentArmingPendingHoldSimulated: intent,
     }),
   );
 } finally {

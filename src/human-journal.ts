@@ -1,4 +1,5 @@
 import { Type, type Static } from "typebox";
+import { isReceiptLedgerRecord, digest as receiptDigest, type HostReceipt } from "./receipt-store";
 import { Check } from "typebox/value";
 import { createHash } from "node:crypto";
 import { closeSync, constants, fstatSync, openSync, readSync } from "node:fs";
@@ -9,6 +10,33 @@ export interface SessionJournalView {
   sessionId: string;
   leafId: string | null;
 }
+export interface JournalReceiptProof {
+  kind: "intent" | "receipt";
+  sessionId: string;
+  goalId: string;
+  sequence: number;
+  ledgerEpoch: number;
+  captureId: string;
+  captureDigest: string;
+  inputDigest?: string;
+  receipt?: Pick<
+    HostReceipt,
+    "id" | "tool" | "epoch" | "ok" | "exitCode" | "eligible" | "reviews" | "digest"
+  >;
+}
+export interface JournalSupervisorProof {
+  sessionId: string;
+  goalText?: string;
+  preflightId?: string;
+  goalKey?: string;
+  lifecycleCommitId?: string;
+  epoch: number;
+  reviews: number;
+  status: string;
+  bindingsDigest: string;
+  taskBindings?: Array<{ taskId: string; digest: string; refsDigest: string }>;
+  authorityDigest?: string;
+}
 export interface JournalNode {
   id: string;
   parentId: string | null;
@@ -18,13 +46,17 @@ export interface JournalNode {
   digest: string;
   wireVersion?: number;
   toolCallIds?: string[];
-  toolCalls?: Array<{ id: string; name?: string }>;
+  toolCalls?: Array<{ id: string; name?: string; inputDigest?: string }>;
+  toolResultProof?: { id: string; tool: string; ok: boolean; exitCode?: number };
   toolCallsIncomplete?: true;
   receiptGoalId?: string;
   receiptSessionId?: string;
+  receiptProof?: JournalReceiptProof;
+  supervisorProof?: JournalSupervisorProof;
 }
 export interface SessionJournal {
   sessionId: string;
+  cwd?: string;
   nodes: ReadonlyMap<string, JournalNode>;
   branch: readonly JournalNode[];
 }
@@ -165,6 +197,9 @@ const RETAINED = new Set([
   "continuous-tasks:human-readback",
   "continuous-tasks:snapshot",
   "continuous-tasks:preflight",
+  "continuous-tasks:control-facts",
+  "continuous-tasks:acceptance-facts",
+  "continuous-tasks:acceptance-proposal",
 ]);
 export interface JournalLimits {
   maxBytes: number;
@@ -185,6 +220,7 @@ function validateLimits(limits: JournalLimits): void {
 function retainedData(value: Record<string, unknown>): boolean {
   if (typeof value.customType === "string" && RETAINED.has(value.customType)) return true;
   if (value.customType !== "continuous-tasks:supervisor" || !record(value.data)) return false;
+  if (value.data.version === 6) return true;
   return (
     value.data.version === 5 &&
     value.data.protocol === "goal-lifecycle-v1" &&
@@ -192,23 +228,159 @@ function retainedData(value: Record<string, unknown>): boolean {
   );
 }
 
+function receiptProof(data: unknown): JournalReceiptProof | undefined {
+  if (!isReceiptLedgerRecord(data) || data.kind === "close_unknown") return undefined;
+  const proof: JournalReceiptProof = {
+    kind: data.kind,
+    sessionId: data.sessionId,
+    goalId: data.goalId,
+    sequence: data.sequence,
+    ledgerEpoch: data.epoch,
+    captureId: data.capture.id,
+    captureDigest: receiptDigest(data.capture),
+  };
+  if (data.kind === "receipt") {
+    const { id, tool, epoch, ok, exitCode, eligible, reviews, digest } = data.receipt;
+    proof.inputDigest = receiptDigest(data.receipt.input);
+    proof.receipt = { id, tool, epoch, ok, exitCode, eligible, reviews, digest };
+  }
+  return proof;
+}
+function supervisorIdentity(
+  data: Record<string, unknown>,
+  payload: Record<string, unknown>,
+): Pick<JournalSupervisorProof, "goalKey" | "lifecycleCommitId"> {
+  const ledger = record(payload.receiptLedger) ? payload.receiptLedger : undefined;
+  const scope = data.version === 5 && record(data.scope) ? data.scope : undefined;
+  const goalKey = scope?.goalRunId ?? ledger?.goalId;
+  return {
+    ...(typeof goalKey === "string" ? { goalKey } : {}),
+    ...(typeof scope?.lifecycleCommitId === "string"
+      ? { lifecycleCommitId: scope.lifecycleCommitId }
+      : {}),
+  };
+}
+function taskBindingMetadata(bindings: unknown[]): JournalSupervisorProof["taskBindings"] {
+  if (bindings.length > 100) return undefined;
+  const result: NonNullable<JournalSupervisorProof["taskBindings"]> = [];
+  for (const value of bindings) {
+    if (
+      !record(value) ||
+      typeof value.taskId !== "string" ||
+      value.taskId.length > 100 ||
+      typeof value.digest !== "string" ||
+      !/^[a-f0-9]{64}$/.test(value.digest) ||
+      !Array.isArray(value.refs) ||
+      value.refs.length > 20 ||
+      !value.refs.every((ref) => typeof ref === "string" && ref.length <= 300)
+    )
+      return undefined;
+    result.push({
+      taskId: value.taskId,
+      digest: value.digest,
+      refsDigest: receiptDigest(value.refs),
+    });
+  }
+  return result;
+}
+function supervisorPreflightProof(
+  payload: Record<string, unknown>,
+): Pick<JournalSupervisorProof, "preflightId"> {
+  return record(payload.preflightBinding) &&
+    typeof payload.preflightBinding.preflightId === "string" &&
+    payload.preflightBinding.preflightId.length <= 200
+    ? { preflightId: payload.preflightBinding.preflightId }
+    : {};
+}
+function supervisorProof(data: unknown): JournalSupervisorProof | undefined {
+  if (!record(data)) return undefined;
+  const scoped = data.version === 5 && record(data.scope) && record(data.supervisor);
+  const payload = scoped ? data.supervisor : data;
+  if (
+    !record(payload) ||
+    typeof payload.sessionId !== "string" ||
+    typeof payload.epoch !== "number" ||
+    typeof payload.reviews !== "number" ||
+    typeof payload.status !== "string" ||
+    !Array.isArray(payload.bindings)
+  )
+    return undefined;
+  return {
+    sessionId: payload.sessionId,
+    ...(typeof payload.goal === "string" && Buffer.byteLength(payload.goal) <= 4000
+      ? { goalText: payload.goal }
+      : {}),
+    ...supervisorPreflightProof(payload),
+    ...supervisorIdentity(data, payload),
+    epoch: payload.epoch,
+    reviews: payload.reviews,
+    status: payload.status,
+    bindingsDigest: journalDigest(payload.bindings),
+    taskBindings: taskBindingMetadata(payload.bindings),
+    authorityDigest: journalDigest([
+      "host-authority-v1",
+      payload.goal,
+      payload.model,
+      payload.preflightBinding ?? null,
+    ]),
+  };
+}
 function ownerMetadata(
   value: Record<string, unknown>,
-): Pick<JournalNode, "wireVersion" | "receiptGoalId" | "receiptSessionId"> {
+): Pick<
+  JournalNode,
+  "wireVersion" | "receiptGoalId" | "receiptSessionId" | "receiptProof" | "supervisorProof"
+> {
   const data = value.data;
   if (value.customType === "continuous-tasks:supervisor")
-    return { wireVersion: record(data) && typeof data.version === "number" ? data.version : -1 };
+    return {
+      wireVersion: record(data) && typeof data.version === "number" ? data.version : -1,
+      supervisorProof: supervisorProof(data),
+    };
   if (value.customType === "continuous-tasks:receipt-ledger" && record(data))
     return {
       receiptGoalId: typeof data.goalId === "string" ? data.goalId : undefined,
       receiptSessionId: typeof data.sessionId === "string" ? data.sessionId : undefined,
+      receiptProof: receiptProof(data),
     };
   return {};
 }
 
+function nativeBoundedName(value: unknown, limit: number): value is string {
+  return typeof value === "string" && value.length > 0 && value.length <= limit;
+}
+function nativeToolResult(
+  value: Record<string, unknown>,
+): Pick<JournalNode, "toolResultProof"> | undefined {
+  const message = value.message;
+  if (
+    value.type === "message" &&
+    record(message) &&
+    message.role === "toolResult" &&
+    nativeBoundedName(message.toolCallId, 2000) &&
+    nativeBoundedName(message.toolName, 200)
+  ) {
+    const structured = message.structuredContent;
+    return {
+      toolResultProof: {
+        id: message.toolCallId,
+        tool: message.toolName,
+        ok:
+          message.isError === false &&
+          (!record(structured) || !("exit_code" in structured) || structured.exit_code === 0),
+        ...(record(structured) && Number.isInteger(structured.exit_code)
+          ? { exitCode: structured.exit_code as number }
+          : {}),
+      },
+    };
+  }
+  return undefined;
+}
 function nativeToolCalls(
   value: Record<string, unknown>,
-): Pick<JournalNode, "toolCalls" | "toolCallsIncomplete"> {
+): Pick<JournalNode, "toolCalls" | "toolCallsIncomplete" | "toolResultProof"> {
+  const result = nativeToolResult(value);
+  if (result) return result;
   const message = value.message;
   if (value.type !== "message" || !record(message) || message.role !== "assistant") return {};
   // Uninspected content is not evidence that no duplicate call exists.
@@ -223,6 +395,9 @@ function nativeToolCalls(
         ? [
             {
               id: block.id,
+              inputDigest: record(block.arguments)
+                ? journalDigest(JSON.stringify(block.arguments))
+                : undefined,
               name:
                 typeof block.name === "string" && block.name.length > 0 && block.name.length <= 200
                   ? block.name
@@ -234,6 +409,100 @@ function nativeToolCalls(
   };
 }
 
+const decodedNodeCache = new Map<string, { node: JournalNode; bytes: number }>();
+const DECODE_CACHE_ENTRIES = 8192,
+  DECODE_CACHE_BYTES = 32 * 1024 * 1024;
+let decodedNodeBytes = 0,
+  decodedNodes = 0;
+/** Pure decoding diagnostics, never source/owner/permission or persistence evidence. */
+export function journalDecodeStats() {
+  return { entries: decodedNodeCache.size, bytes: decodedNodeBytes, decodedNodes };
+}
+function freezeDecodedNode(node: JournalNode): JournalNode {
+  const stack: object[] = [node],
+    seen = new WeakSet();
+  while (stack.length) {
+    const value = stack.pop();
+    if (!value || seen.has(value)) continue;
+    seen.add(value);
+    for (const child of Object.values(value as Record<string, unknown>))
+      if (child !== null && typeof child === "object") stack.push(child);
+    Object.freeze(value);
+  }
+  return node;
+}
+function rememberDecodedNode(key: string, node: JournalNode): void {
+  const bytes = Buffer.byteLength(JSON.stringify(node)) + key.length;
+  if (bytes > DECODE_CACHE_BYTES) return;
+  while (
+    decodedNodeCache.size >= DECODE_CACHE_ENTRIES ||
+    decodedNodeBytes + bytes > DECODE_CACHE_BYTES
+  ) {
+    const first = decodedNodeCache.entries().next().value;
+    if (!first) break;
+    decodedNodeCache.delete(first[0]);
+    decodedNodeBytes -= first[1].bytes;
+  }
+  decodedNodeCache.set(key, { node: freezeDecodedNode(structuredClone(node)), bytes });
+  decodedNodeBytes += bytes;
+}
+function isolatedDecodedNode(source: JournalNode): JournalNode {
+  const node = { ...source };
+  for (const [key, original] of Object.entries(source)) {
+    if (original === null || typeof original !== "object") continue;
+    let copied = false,
+      value: unknown;
+    Object.defineProperty(node, key, {
+      enumerable: true,
+      configurable: true,
+      get() {
+        if (!copied) {
+          value = structuredClone(original);
+          copied = true;
+        }
+        return value;
+      },
+      set(replacement: unknown) {
+        value = replacement;
+        copied = true;
+      },
+    });
+  }
+  return node;
+}
+function parseNativeLine(
+  text: string,
+  nodes: Map<string, JournalNode>,
+  entries: number,
+  maxEntries: number,
+  immutable: boolean,
+): void {
+  if (entries > maxEntries)
+    fail("JOURNAL_LIMIT", { metric: "entries", observed: entries, limit: maxEntries });
+  const key = createHash("sha256").update(text).digest("hex"),
+    cached = decodedNodeCache.get(key);
+  if (cached) {
+    if (nodes.has(cached.node.id)) fail("JOURNAL_INVALID");
+    decodedNodeCache.delete(key);
+    decodedNodeCache.set(key, cached);
+    const node = immutable ? cached.node : isolatedDecodedNode(cached.node);
+    nodes.set(node.id, node);
+    return;
+  }
+  let value: unknown;
+  try {
+    value = JSON.parse(text) as unknown;
+  } catch {
+    return fail("JOURNAL_INVALID");
+  }
+  if (!record(value)) fail("JOURNAL_INVALID");
+  const node = parseEntry(value, nodes, entries, maxEntries);
+  decodedNodes = Math.min(Number.MAX_SAFE_INTEGER, decodedNodes + 1);
+  if (node) {
+    rememberDecodedNode(key, node);
+    if (immutable) nodes.set(node.id, decodedNodeCache.get(key)?.node ?? freezeDecodedNode(node));
+  }
+}
 function parseEntry(
   value: Record<string, unknown>,
   nodes: Map<string, JournalNode>,
@@ -331,6 +600,7 @@ function buildBranch(nodes: Map<string, JournalNode>, leafId: string | null): Jo
 export function inspectSessionJournal(
   view: SessionJournalView,
   limits: JournalLimits = LIMITS,
+  immutable = false,
 ): SessionJournal {
   if (!view.path) fail("JOURNAL_UNAVAILABLE");
   validateLimits(limits);
@@ -342,9 +612,15 @@ export function inspectSessionJournal(
   }
   const nodes = new Map<string, JournalNode>();
   let headerSeen = false;
+  let cwd: string | undefined;
   let entries = 0;
   function consume(text: string): void {
     if (!text) fail("JOURNAL_INVALID");
+    if (headerSeen) {
+      entries++;
+      parseNativeLine(text, nodes, entries, limits.maxEntries, immutable);
+      return;
+    }
     let value: unknown;
     try {
       value = JSON.parse(text) as unknown;
@@ -352,14 +628,16 @@ export function inspectSessionJournal(
       return fail("JOURNAL_INVALID");
     }
     if (!record(value)) fail("JOURNAL_INVALID");
-    if (!headerSeen) {
-      if (value.type !== "session" || value.version !== 3 || value.id !== view.sessionId)
-        fail("JOURNAL_INVALID");
-      headerSeen = true;
-      return;
-    }
-    entries++;
-    parseEntry(value, nodes, entries, limits.maxEntries);
+    if (value.type !== "session" || value.version !== 3 || value.id !== view.sessionId)
+      fail("JOURNAL_INVALID");
+    if (
+      typeof value.cwd === "string" &&
+      value.cwd &&
+      Buffer.byteLength(value.cwd) <= 4096 &&
+      !/[\p{Cc}\p{Cf}\p{Cs}]/u.test(value.cwd)
+    )
+      cwd = value.cwd;
+    headerSeen = true;
   }
   try {
     readAllLines(fd, limits, consume, () => headerSeen);
@@ -370,7 +648,7 @@ export function inspectSessionJournal(
     closeSync(fd);
   }
   const branch = buildBranch(nodes, view.leafId);
-  return { sessionId: view.sessionId, nodes, branch };
+  return { sessionId: view.sessionId, ...(cwd ? { cwd } : {}), nodes, branch };
 }
 
 function frame(value: unknown): value is ReadbackFrame {

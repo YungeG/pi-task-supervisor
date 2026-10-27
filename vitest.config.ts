@@ -4,6 +4,8 @@ export default defineConfig({
   test: {
     include: ["src/**/*.test.ts"],
     setupFiles: ["src/__tests__/setup.ts"],
+    // Bound native Session fixture WIP; keep every scenario, timeout and coverage gate.
+    maxWorkers: 4,
     coverage: {
       provider: "v8",
       reporter: ["text", "lcov"],

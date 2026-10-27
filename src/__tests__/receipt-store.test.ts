@@ -5,6 +5,7 @@ import { beforeEach, describe, expect, it, vi } from "vitest";
 import { registerEventHandlers } from "../events";
 import { getBoard, resetState, setBoard } from "../state";
 import { currentRuntime } from "../runtime";
+import { setSessionScopeEnabled } from "../scope";
 import {
   assertObservedEvidence,
   holdSupervisor,
@@ -30,6 +31,8 @@ function fixture() {
     manager.appendCustomEntry(type, structuredClone(data));
   });
   registerEventHandlers(mock.api);
+  // Match the explicit legacy command adapter, which opts into managed capture.
+  setSessionScopeEnabled(true);
   startSupervisor(mock.api, ctx, "Retain long-running host evidence");
   const event = (id: string, overrides: Partial<ToolResultEvent> = {}): ToolResultEvent => ({
     type: "tool_result",
@@ -456,7 +459,7 @@ describe("long-running host receipt lifecycle", () => {
         epoch: count === 500 ? 6 : 5,
         tokens: 123,
         cost: 0.25,
-        reviews: 0,
+        reviews: 7, // Same-Goal migration cannot replenish spent review slots.
       });
       expect(() => {
         assertObservedEvidence("t-1.1", proof("tool:legacy-0"));
@@ -571,13 +574,29 @@ describe("long-running host receipt lifecycle", () => {
     currentRuntime().receiptStore!.configure({ maxEntries: 1, maxBytes: 16_384 });
     h.capture("one");
     h.capture("two");
-    h.capture("one");
+    // Duplicate result delivery is idempotent; it is not admission to replay the tool.
+    h.finish("one");
     expect(currentRuntime().receiptStore!.stats.count).toBe(2);
-    h.capture("one", { content: [{ type: "text", text: "conflicting body" }] });
+    h.finish("one", { content: [{ type: "text", text: "conflicting body" }] });
     expect(currentRuntime().journalFault).toContain("Conflicting duplicate");
     expect(currentRuntime().receiptStore!.stats.count).toBe(2);
   });
 
+  it("rejects readmission of an already recorded tool before execution without rewriting its receipt", () => {
+    const h = fixture();
+    h.capture("recorded-id");
+    const store = currentRuntime().receiptStore;
+    if (!store) throw Error("Store missing");
+    expect(() => {
+      store.prepareToolCapture(
+        { type: "tool_call", toolName: "bash", toolCallId: "recorded-id", input: {} },
+        [],
+        false,
+      );
+    }).toThrow(/confirmed receipt/);
+    expect(store.healthy).toBe(true);
+    expect(store.stats.count).toBe(1);
+  });
   it("does not let a checkpoint redefine the user goal under the same ledger identity", () => {
     const h = fixture();
     h.capture("one");

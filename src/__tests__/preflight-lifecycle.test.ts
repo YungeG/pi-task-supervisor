@@ -42,7 +42,8 @@ describe("preflight lifecycle authorization boundary", () => {
     const id = currentRuntime().preflight!.planId;
     await h.command(`revoke ${id}`);
     await h.command("stop");
-    expect(supervisorState()?.status).toBe("stopped");
+    expect(currentRuntime().supervisor?.status).toBe("stopped");
+    expect(supervisorState()).toBeUndefined();
     await h.command("resume");
     expect(getBoard().workflowStatus).toBe("paused");
     expect(h.fire("tool_call", { toolName: "get_ready_tasks", input: {} })).toMatchObject({
@@ -57,18 +58,38 @@ describe("preflight lifecycle authorization boundary", () => {
       block: true,
     });
   });
-  it("keeps stopped board control usable only after exact human reapproval without restarting supervision", async () => {
+  it("rejects old-plan reapproval/resume after stop and requires an independent new task-only context", async () => {
     const h = await started();
     setBoard(activeBoard());
     const id = currentRuntime().preflight!.planId;
     await h.command(`revoke ${id}`);
     await h.command("stop");
+    const retained = structuredClone(currentRuntime().preflight);
     await h.command(`approve ${id} A1`);
+    expect(currentRuntime().preflight).toEqual(retained);
     h.mock.sendMessage.mockClear();
     await h.command("resume");
-    expect(getBoard().workflowStatus).toBe("active");
-    expect(supervisorState()?.status).toBe("stopped");
-    expect(h.fire("tool_call", { toolName: "get_ready_tasks", input: {} })).toBeUndefined();
+    expect(getBoard().workflowStatus).toBe("paused");
+    expect(currentRuntime().supervisor?.status).toBe("stopped");
+    expect(supervisorState()).toBeUndefined();
+    expect(
+      h.fire("tool_call", {
+        toolCallId: "old-plan-cannot-claim",
+        toolName: "get_ready_tasks",
+        input: {},
+      }),
+    ).toMatchObject({ block: true });
+    await h.command("enable");
+    expect(currentRuntime().management?.mode).toBe("tasks");
+    expect(getBoard().tasks).toHaveLength(0);
+    expect(currentRuntime().preflight).toEqual(retained);
+    expect(
+      h.fire("tool_call", {
+        toolCallId: "new-board-not-old-grant",
+        toolName: "get_ready_tasks",
+        input: {},
+      }),
+    ).toBeUndefined();
     expect(h.mock.sendMessage.mock.calls.filter(([, options]) => options.triggerTurn)).toHaveLength(
       0,
     );

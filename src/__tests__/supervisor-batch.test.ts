@@ -1,5 +1,6 @@
 import { fauxAssistantMessage } from "@earendil-works/pi-ai";
 import { beforeEach, describe, expect, it, vi } from "vitest";
+import { currentRuntime } from "../runtime";
 import { setSessionScopeEnabled } from "../scope";
 import { getBoard, resetState, setBoard } from "../state";
 import { supervisorState, type Advice } from "../supervisor";
@@ -14,8 +15,22 @@ const legacyGuide: Advice = {
   evidenceRefs: ["tool:batch-validation"],
 };
 
-async function completeFirstBatch(advice: Advice) {
+async function completeFirstBatch(advice: Advice, third = false) {
   const h = lifecycle();
+  if (third) {
+    const board = getBoard();
+    board.tasks.push({
+      ...board.tasks[1]!,
+      id: "t-3.1",
+      title: "Third",
+      phase: 3,
+      dependencies: ["t-2.1"],
+      status: "configured",
+    });
+    board.phases.push({ phase: 3, title: "Third", status: "pending" });
+    board.finalAcceptanceTaskId = "t-3.1";
+    setBoard(board);
+  }
   const streamSimple = vi.fn((_model: unknown, _context: { messages: { content: string }[] }) => ({
     result: async () => fauxAssistantMessage(JSON.stringify(advice)),
   }));
@@ -83,6 +98,7 @@ async function completeFirstBatch(advice: Advice) {
     tasks: [
       { id: "t-1.1", status: "done" },
       { id: "t-2.1", status: "ready" },
+      ...(third ? [{ id: "t-3.1", status: "configured" }] : []),
     ],
   });
   return { ...h, streamSimple, claim };
@@ -95,7 +111,149 @@ describe("host-controlled batch continuation", () => {
     setBoard(activeBoard());
   });
 
-  it("rejects current-batch advice at the next-batch checkpoint instead of forwarding contradictory stop text", async () => {
+  it("corrects one legal batch-action mismatch within the same budget and never forwards its prose", async () => {
+    const h = await completeFirstBatch(legacyGuide);
+    h.streamSimple
+      .mockImplementationOnce(() => ({
+        result: async () => fauxAssistantMessage(JSON.stringify(legacyGuide)),
+      }))
+      .mockImplementationOnce(() => ({
+        result: async () =>
+          fauxAssistantMessage(
+            JSON.stringify({ ...legacyGuide, action: "next_batch", taskIds: ["t-2.1"] }),
+          ),
+      }));
+    h.mock.sendMessage.mockClear();
+    const result = await h.fire("agent_before_settle", BOUNDARY);
+    expect(result).toMatchObject({
+      continue: true,
+      entries: [{ details: { action: "next_batch" } }],
+    });
+    expect(JSON.stringify(result)).not.toContain(stopMessage);
+    expect(h.streamSimple).toHaveBeenCalledTimes(2);
+    // Fileless compatibility has no durable extra-call ledger, so its second call consumes another review slot.
+    expect(supervisorState()).toMatchObject({ status: "active", reviews: 2, continuations: 1 });
+  });
+
+  it("does not hand off a done-looking batch after its native completion bindings disappear", async () => {
+    const h = await completeFirstBatch({
+      ...legacyGuide,
+      action: "next_batch",
+      taskIds: ["t-2.1"],
+    });
+    const state = supervisorState();
+    if (!state) throw Error("Supervisor missing");
+    state.bindings = [];
+    expect(await h.fire("agent_before_settle", BOUNDARY)).toBeUndefined();
+    expect(h.streamSimple).not.toHaveBeenCalled();
+    expect(supervisorState()).toMatchObject({
+      status: "fault",
+      continuations: 0,
+      reason: expect.stringContaining("completed-task bindings"),
+    });
+  });
+  it("does not buy an action correction after the original review budget is spent", async () => {
+    const h = await completeFirstBatch(legacyGuide);
+    const state = supervisorState();
+    if (!state) throw Error("Supervisor missing");
+    state.reviews = 39;
+    expect(await h.fire("agent_before_settle", BOUNDARY)).toBeUndefined();
+    expect(h.streamSimple).toHaveBeenCalledOnce();
+    expect(supervisorState()).toMatchObject({
+      status: "paused",
+      holdCause: "budget_exhausted",
+      reviews: 40,
+      continuations: 0,
+    });
+  });
+  it("does not correct another semantic violation hidden behind a wrong batch action", async () => {
+    const h = await completeFirstBatch({ ...legacyGuide, detailIds: ["invented-detail"] });
+    expect(await h.fire("agent_before_settle", BOUNDARY)).toBeUndefined();
+    expect(h.streamSimple).toHaveBeenCalledOnce();
+    expect(supervisorState()).toMatchObject({ status: "fault", continuations: 0 });
+  });
+  it("discards a wrong action if its captured board facts changed before the response", async () => {
+    const h = await completeFirstBatch(legacyGuide);
+    h.streamSimple.mockImplementationOnce(() => ({
+      result: async () => {
+        const board = getBoard();
+        board.generation++;
+        setBoard(board);
+        return fauxAssistantMessage(JSON.stringify(legacyGuide));
+      },
+    }));
+    expect(await h.fire("agent_before_settle", BOUNDARY)).toBeUndefined();
+    expect(h.streamSimple).toHaveBeenCalledOnce();
+    expect(supervisorState()?.continuations).toBe(0);
+  });
+  it("hands off a later mechanically ready batch without another provider call after its unchanged plan was reviewed", async () => {
+    const h = await completeFirstBatch(
+      { ...legacyGuide, action: "next_batch", taskIds: ["t-2.1"] },
+      true,
+    );
+    expect(await h.fire("agent_before_settle", BOUNDARY)).toMatchObject({ continue: true });
+    await h.claim.execute("claim-second", { count: 1 }, undefined, undefined, h.ctx);
+    const advance = createAdvanceTasksTool(h.mock.api);
+    expect(
+      (
+        await advance.execute(
+          "review-second",
+          { transitions: [{ id: "t-2.1" }] },
+          undefined,
+          undefined,
+          h.ctx,
+        )
+      ).isError,
+    ).not.toBe(true);
+    await h.fire("tool_result", {
+      type: "tool_result",
+      toolName: "bash",
+      toolCallId: "second-proof",
+      input: { command: "synthetic second validation" },
+      content: [{ type: "text", text: "passed" }],
+      structuredContent: { exit_code: 0 },
+      isError: false,
+    });
+    expect(
+      (
+        await advance.execute(
+          "finish-second",
+          {
+            transitions: [
+              {
+                id: "t-2.1",
+                evidence: {
+                  summary: "Second verified",
+                  refs: [
+                    {
+                      kind: "command",
+                      label: "second",
+                      status: "passed",
+                      ref: "tool:second-proof",
+                      exitCode: 0,
+                    },
+                  ],
+                },
+              },
+            ],
+          },
+          undefined,
+          undefined,
+          h.ctx,
+        )
+      ).isError,
+    ).not.toBe(true);
+    const result = await h.fire("agent_before_settle", BOUNDARY);
+    expect(result).toMatchObject({
+      continue: true,
+      entries: [{ details: { action: "next_batch" } }],
+    });
+    expect(JSON.stringify(result)).toContain("t-3.1");
+    expect(h.streamSimple).toHaveBeenCalledOnce();
+    expect(supervisorState()).toMatchObject({ reviews: 1, continuations: 2 });
+  });
+
+  it("blocks a repeated batch-action mismatch after one correction without forwarding contradictory stop text", async () => {
     const h = await completeFirstBatch(legacyGuide);
     h.mock.sendMessage.mockClear();
     expect(await h.fire("agent_before_settle", BOUNDARY)).toBeUndefined();
@@ -108,7 +266,7 @@ describe("host-controlled batch continuation", () => {
     });
     expect(getBoard().tasks[1]!.status).toBe("ready");
     expect(await h.fire("agent_before_settle", BOUNDARY)).toBeUndefined();
-    expect(h.streamSimple).toHaveBeenCalledOnce();
+    expect(h.streamSimple).toHaveBeenCalledTimes(2);
     expect(JSON.stringify(h.mock.sendMessage.mock.calls)).not.toContain(stopMessage);
   });
 
@@ -219,7 +377,8 @@ describe("host-controlled batch continuation", () => {
       await h.command(command);
       expect(await h.fire("agent_before_settle", BOUNDARY)).toBeUndefined();
       expect(h.streamSimple).not.toHaveBeenCalled();
-      expect(supervisorState()!.continuations).toBe(0);
+      expect(currentRuntime().supervisor!.continuations).toBe(0);
+      if (command === "stop") expect(supervisorState()).toBeUndefined();
       expect(getBoard().workflowStatus).toBe("paused");
     },
   );

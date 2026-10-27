@@ -1,19 +1,27 @@
 import { createHash } from "node:crypto";
+import { execFileSync } from "node:child_process";
 import { existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { homedir, tmpdir } from "node:os";
 import { dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import { fauxAssistantMessage, fauxProvider, fauxToolCall } from "@earendil-works/pi-ai";
 import { Type } from "typebox";
-import { KeybindingsManager, TUI_KEYBINDINGS, stripTerminalSequences, visibleWidth } from "@earendil-works/pi-tui";
+import {
+  KeybindingsManager,
+  TUI_KEYBINDINGS,
+  stripTerminalSequences,
+  visibleWidth,
+} from "@earendil-works/pi-tui";
 
+const progressTasks = process.argv.includes("--progress-tasks");
 const longReceipts = process.argv.includes("--long-receipts");
 const receiptReadCount = longReceipts ? Number(process.env.PI_RECEIPT_SMOKE_COUNT ?? 1000) : 0;
 if (!Number.isSafeInteger(receiptReadCount) || receiptReadCount < 0 || receiptReadCount > 1000)
   throw new Error("Invalid bounded smoke read count");
 const batchContinuation = process.argv.includes("--batch-continuation");
 const batchStopAdvice = "本批已经完成。现在整体暂停，不领取下一批任务，等待用户确认。";
-const preflight = process.argv.includes("--preflight");
+const freshSupervise = process.argv.includes("--fresh-supervise");
+const preflight = process.argv.includes("--preflight") || freshSupervise;
 const asyncExecution = process.argv.includes("--async-execution");
 const compaction = process.argv.includes("--compaction");
 const nativeAbort = process.argv.includes("--native-abort");
@@ -86,9 +94,12 @@ const sandbox = mkdtempSync(join(tmpdir(), "pi-task-supervisor-smoke-"));
 const realSettings = join(homedir(), ".pi", "agent", "settings.json");
 const previousAgentDir = process.env.PI_CODING_AGENT_DIR;
 const previousArgv = process.argv;
-const ttyDescriptors = [process.stdin, process.stdout].map((stream) => Object.getOwnPropertyDescriptor(stream, "isTTY"));
+const ttyDescriptors = [process.stdin, process.stdout].map((stream) =>
+  Object.getOwnPropertyDescriptor(stream, "isTTY"),
+);
 let preflightApprovalEnabled = false;
 let session;
+let fixturePassed=false;
 
 function digest(path) {
   return existsSync(path)
@@ -105,7 +116,10 @@ function latestSupervisor(manager) {
   const state = [...branch]
     .reverse()
     .find(
-      (entry) => entry.type === "custom" && entry.customType === "continuous-tasks:supervisor",
+      (entry) =>
+        entry.type === "custom" &&
+        entry.customType === "continuous-tasks:supervisor" &&
+        !(entry.data?.version === 6 && entry.data.protocol === "task-supervisor-control-v1"),
     )?.data;
   if (state?.version !== 3) return state;
   // Inspection only. The extension validates actual ledger/checkpoint closure on recovery.
@@ -159,7 +173,7 @@ function advisory(action, taskIds = ["t-2.1"]) {
               : "Claim the next approved batch and collect fresh host validation during review."
             : "All approved work has host validation.",
         taskIds,
-        evidenceRefs: action === "next_batch" ? [] : ["tool:final-validation"],
+        evidenceRefs: action === "next_batch" ? [] : [preflight ? "tool:contract-validation" : "tool:final-validation"],
       }),
     );
   };
@@ -211,7 +225,7 @@ async function loadExtension(settingsManager) {
     settingsManager,
     eventBus: smokeEventBus,
     additionalExtensionPaths: [
-      extensionPath,
+      preflight ? join(packageRoot,"test","acceptance-smoke-extension.ts") : extensionPath,
       ...(compaction || interruptCompaction ? [join(sandbox, "compact-fixture.mjs")] : []),
       ...(asyncExecution ? [join(sandbox, "async-fixture.mjs")] : []),
     ],
@@ -248,11 +262,25 @@ try {
   if (preflight) {
     // Explicit source-boundary mechanism simulation only, NOT a real CLI/human positive.
     // The separate real double-TTY SDK-negative and actual CLI/PTY tests stay unchanged.
-    const sdkRoot = dirname(dirname(fileURLToPath(import.meta.resolve("@earendil-works/pi-coding-agent"))));
+    const sdkRoot = dirname(
+      dirname(fileURLToPath(import.meta.resolve("@earendil-works/pi-coding-agent"))),
+    );
     process.argv = [process.execPath, join(sdkRoot, "dist", "cli.js"), ...previousArgv.slice(2)];
-    for (const stream of [process.stdin, process.stdout]) Object.defineProperty(stream, "isTTY", { configurable: true, value: true });
-    console.log("PREFLIGHT SDK SOURCE-BOUNDARY SIMULATION (argv/TTY/UI mocked; not native CLI or human proof)");
+    for (const stream of [process.stdin, process.stdout])
+      Object.defineProperty(stream, "isTTY", { configurable: true, value: true });
+    console.log(
+      "PREFLIGHT SDK SOURCE-BOUNDARY SIMULATION (argv/TTY/UI mocked; not native CLI or human proof)",
+    );
   }
+  // A real, owned finite workspace; generated SDK/session metadata is not a work artifact.
+  // Only these explicitly declared fixture sources belong to this smoke's minimal scope.
+  execFileSync("git", ["init", "--quiet", sandbox], { timeout: 2000, stdio: "ignore" });
+  writeFileSync(
+    join(sandbox, ".gitignore"),
+    "*\n!.gitignore\n!continuous-tasks.json\n!compact-fixture.mjs\n!async-fixture.mjs\n!review-input.txt\n"+(preflight?"!acceptance-check.mjs\n":""),
+  );
+  writeFileSync(join(sandbox, "review-input.txt"), "Fixed owned smoke validation input\n");
+  if(preflight)writeFileSync(join(sandbox,"acceptance-check.mjs"),"import assert from 'node:assert/strict';import{readFileSync}from'node:fs';assert.equal(readFileSync(new URL('./review-input.txt',import.meta.url),'utf8'),'Fixed owned smoke validation input\\n');console.log(JSON.stringify({protocol:'check-result-v1',tests:1,passed:1,failed:0,skipped:0,requiredCases:{'smoke-input':'passed'},skippedIds:[]}));\n");
   const sessionManager = SessionManager.create(sandbox, join(sandbox, "sessions"));
   writeFileSync(
     join(sandbox, "continuous-tasks.json"),
@@ -288,25 +316,34 @@ try {
       join(sandbox, "async-fixture.mjs"),
       `
       export default function(pi) {
-        let ctx; let state = "running";
+        // Protocol simulation only; actual executor/process qualification is a separate probe.
+        let ctx; let state = "running"; let closedAt;
+        const runId = "smoke-run-1", instanceId = "smoke-process-1";
         pi.on("session_start", (_event, context) => { ctx = context; });
         pi.events.on("subagents:rpc:v1:request", (request) => {
+          const processTerminal = {
+            version: 1, runId, runnerProcessInstanceId: instanceId,
+            state: closedAt === undefined ? "pending" : "observed",
+            ...(closedAt === undefined ? {} : { observedAt: closedAt }),
+            instances: closedAt === undefined ? [] : [{ kind: "runner", processInstanceId: instanceId, closeObservedAt: closedAt, exitCode: 0, signal: null }],
+            resumeDisposition: "unavailable",
+          };
           const data = request.method === "ping" ? {
-            version: 1,
+            version: 1, methods: ["ping", "status"],
             session: { sessionId: ctx.sessionManager.getSessionId(), sessionFile: ctx.sessionManager.getSessionFile() ?? null },
             events: { asyncComplete: "subagent:async-complete" },
-            capabilities: { asyncStatusSnapshot: { kind: "pi-subagents.async-status-snapshot", version: 1 } },
-          } : { asyncSnapshot: {
+            capabilities: { asyncStatusSnapshot: { kind: "pi-subagents.async-status-snapshot", version: 1 }, processTerminalProof: { version: 1, lifecycleArtifactVersion: 3 } },
+          } : { details: { runId, lifecycleStatus: { processTerminal } }, asyncSnapshot: {
             kind: "pi-subagents.async-status-snapshot", version: 1, generatedAt: Date.now(),
             omitted: { runs: 0, children: 0, byteLimitExceeded: false },
-            runs: [{ id: "smoke-run-1", kind: "subagent", state }],
+            runs: [{ id: runId, kind: "subagent", state }],
           } };
           pi.events.emit("subagents:rpc:v1:reply:" + request.requestId, {
             version: 1, requestId: request.requestId, method: request.method, success: true, data,
           });
         });
         pi.events.on("smoke:complete", () => {
-          state = "complete";
+          closedAt = Date.now(); state = "complete";
           pi.events.emit("subagent:async-complete", {
             sessionId: ctx.sessionManager.getSessionFile() ?? ctx.sessionManager.getSessionId(),
             runId: "smoke-run-1", success: true,
@@ -359,11 +396,34 @@ try {
     label: "Validate Smoke",
     description: "Deterministic local smoke validation only; no shell or network execution",
     parameters: Type.Object({}),
-    execute: async () => ({
-      content: [{ type: "text", text: "Faux host validation passed" }],
-      details: {},
-      structuredContent: { exit_code: 0 },
-    }),
+    execute: async () => {
+      if (
+        readFileSync(join(sandbox, "review-input.txt"), "utf8") !==
+        "Fixed owned smoke validation input\n"
+      )
+        throw new Error("Owned smoke input did not match the fixed validation premise");
+      return {
+        content: [{ type: "text", text: "Faux host validation passed" }],
+        details: {},
+        structuredContent: { exit_code: 0 },
+      };
+    },
+  };
+  const progressTool = {
+    name: "edit_smoke_progress",
+    label: "Owned task-only edit",
+    description: "Finite owned input edit; not a validation or user approval",
+    parameters: Type.Object({ value: Type.Integer({ minimum: 1, maximum: 4 }) }),
+    execute: async (_id, args) => {
+      writeFileSync(
+        join(sandbox, "review-input.txt"),
+        `Task-only actual implementation ${args.value}\n`,
+      );
+      return {
+        content: [{ type: "text", text: "Owned finite input changed" }],
+        structuredContent: { exit_code: 0 },
+      };
+    },
   };
   const readTool = {
     name: "read",
@@ -423,8 +483,16 @@ try {
     }),
     tool("compile_tasks", { finalAcceptanceTaskId: "t-2.1" }),
     fauxAssistantMessage("Implementation phase prepared; ending this turn."),
-    ...(supervised ? [interruptCompaction ? interruptedAdvisory : advisory("next_batch", ["t-1.1"])] : []),
+    ...(supervised
+      ? [interruptCompaction ? interruptedAdvisory : advisory("next_batch", ["t-1.1"])]
+      : []),
     tool("get_ready_tasks", { count: 1 }),
+    ...(progressTasks
+      ? [1, 2, 3, 4].flatMap((value) => [
+          tool("edit_smoke_progress", { value }),
+          fauxAssistantMessage("Actual finite change; task remains implementing."),
+        ])
+      : []),
     ...(asyncExecution
       ? [
           tool("workflow_gate", {
@@ -440,7 +508,25 @@ try {
           }),
         ]
       : []),
-    tool("advance_tasks", { transitions: [{ id: "t-1.1" }] }),
+    () => {
+      if (asyncExecution) {
+        const facts = sessionManager
+          .getBranch()
+          .filter(
+            (entry) =>
+              entry.type === "custom" && entry.customType === "continuous-tasks:control-facts",
+          );
+        const settled = facts.findLast((entry) => entry.data.kind === "execution-settlement");
+        if (
+          latestSnapshot(sessionManager)?.tasks[0]?.executionRef ||
+          settled?.data.outcome !== "success"
+        )
+          throw new Error(
+            "Async smoke cannot continue validation without its confirmed terminal settlement and cleared reference",
+          );
+      }
+      return tool("advance_tasks", { transitions: [{ id: "t-1.1" }] });
+    },
     ...(supervised ? [tool("validate_smoke", {}, "implementation-validation")] : []),
     ...Array.from({ length: receiptReadCount }, (_, i) => tool("read", {}, `history-${i}`)),
     tool("advance_tasks", {
@@ -451,14 +537,17 @@ try {
           compaction
             ? compactionStop
             : fauxAssistantMessage("First batch verified; yielding to the next-batch checkpoint."),
-          advisory("next_batch"),
+          // P5: the unchanged qualified plan hands off mechanically; no reserved Advisor response.
         ]
       : []),
     (context) => {
       if (batchContinuation) {
-        const next = sessionManager.getBranch().findLast(
-          (entry) => entry.type === "custom_message" && entry.customType === "continuous-tasks:continue",
-        );
+        const next = sessionManager
+          .getBranch()
+          .findLast(
+            (entry) =>
+              entry.type === "custom_message" && entry.customType === "continuous-tasks:continue",
+          );
         const board = latestSnapshot(sessionManager);
         const state = latestSupervisor(sessionManager);
         if (
@@ -472,13 +561,16 @@ try {
           state.continuations !== 2 ||
           state.stagnant !== 0
         )
-          throw new Error("Batch handoff forwarded contradictory prose, lost host control, or spun without progress");
+          throw new Error(
+            "Batch handoff forwarded contradictory prose, lost host control, or spun without progress",
+          );
       }
       return tool("get_ready_tasks", { count: 1 });
     },
     tool("advance_tasks", { transitions: [{ id: "t-2.1" }] }),
     ...(supervised ? [tool("validate_smoke", {}, "final-validation")] : []),
-    tool("advance_tasks", { transitions: [{ id: "t-2.1", evidence: proof("final-validation") }] }),
+    ...(preflight?[tool("run_check",{checkId:"fixed-input"},"contract-validation")]:[]),
+    tool("advance_tasks", { transitions: [{ id: "t-2.1", evidence: proof(preflight?"contract-validation":"final-validation") }] }),
     fauxAssistantMessage("All approved phases are complete."),
     ...(supervised ? [advisory("accept")] : []),
   ]);
@@ -497,7 +589,11 @@ try {
     settingsManager,
     sessionManager,
     noTools: "builtin",
-    customTools: supervised ? [validationTool, ...(longReceipts ? [readTool] : [])] : [],
+    customTools: supervised
+      ? [validationTool, ...(longReceipts ? [readTool] : [])]
+      : progressTasks
+        ? [progressTool]
+        : [],
   });
   if (created.extensionsResult.errors.length > 0) {
     throw new Error(`Extension load failed: ${JSON.stringify(created.extensionsResult.errors)}`);
@@ -522,7 +618,8 @@ try {
       taskDetails = message;
     },
     async select(_title, options) {
-      if (preflight && options.includes("允许上述范围") && options.includes("稍后决定")) return preflightApprovalEnabled ? "允许上述范围" : "稍后决定";
+      if (preflight && options.includes("允许上述范围") && options.includes("稍后决定"))
+        return preflightApprovalEnabled ? "允许上述范围" : "稍后决定";
       if (preflight && options.includes("开始执行")) return "开始执行";
       return options[0];
     },
@@ -532,9 +629,13 @@ try {
           let completed = false;
           let originalRendered = false;
           const component = factory(
-            { terminal: { rows: 40 }, requestRender() {} }, widgetThemes[0],
+            { terminal: { rows: 40 }, requestRender() {} },
+            widgetThemes[0],
             new KeybindingsManager(TUI_KEYBINDINGS),
-            (value) => { completed = true; resolveCustom(value); },
+            (value) => {
+              completed = true;
+              resolveCustom(value);
+            },
           );
           const render = (width = 120) => {
             const lines = component.render(width).map(stripTerminalSequences);
@@ -546,7 +647,10 @@ try {
             } else boardMaterial.push(lines.join("\n"));
             return lines.join("\n");
           };
-          const press = (key) => { component.handleInput(key); return render(); };
+          const press = (key) => {
+            component.handleInput(key);
+            return render();
+          };
           render();
           if (customMode === "scope") {
             for (let page = 0; page < 10000 && !completed; page++) {
@@ -554,7 +658,7 @@ try {
               if (header.includes("需要你回应")) {
                 const card = render();
                 if (/→\s*稍后决定（不提交）/u.test(card)) press("\u001b[B");
-                if (card.split("\n").some(line => line.trim() === ">")) press("42");
+                if (card.split("\n").some((line) => line.trim() === ">")) press("42");
                 press("\r");
                 continue;
               }
@@ -562,25 +666,39 @@ try {
                 throw new Error("Expected actual formatted/original scope-review page");
               press("\r");
             }
-            if (!originalRendered) throw new Error("Formatted browsing cannot replace original review");
+            if (!originalRendered)
+              throw new Error("Formatted browsing cannot replace original review");
           } else {
             const detail = () => {
               press("\r");
               let previous = render();
               for (let line = 0; line < 10000; line++) {
                 const next = press("\u001b[B");
-                if (next === previous) { press("\u001b"); return; }
+                if (next === previous) {
+                  press("\u001b");
+                  return;
+                }
                 previous = next;
               }
               throw new Error("Read-only detail never reached its end");
             };
             // The three fixed routes remain stable; phase headings are now selectable.
-            for (let item = 1; item <= 2; item++) { press("\u001b[B"); detail(); }
+            for (let item = 1; item <= 2; item++) {
+              press("\u001b[B");
+              detail();
+            }
             for (const id of ["t-1.1", "t-2.1"]) {
               let found = false;
               for (let step = 0; step < 250; step++) {
-                const selected = render(80).split("\n").find((line) => line.startsWith("→ ")) ?? "";
-                if (selected.includes(` · ${id} `)) { detail(); found = true; break; }
+                const selected =
+                  render(80)
+                    .split("\n")
+                    .find((line) => line.startsWith("→ ")) ?? "";
+                if (selected.includes(` · ${id} `)) {
+                  detail();
+                  found = true;
+                  break;
+                }
                 if (selected.startsWith("→ ▸")) press("\r");
                 press("\u001b[B");
               }
@@ -597,34 +715,40 @@ try {
     },
     setWidget(key, content, options) {
       try {
-      if (key !== "continuous-tasks:board") throw new Error(`Unexpected widget: ${key}`);
-      widgetLines = [];
-      if (content) {
-        if (typeof content !== "function" || options?.placement !== "aboveEditor")
-          throw new Error("Widget did not use the bounded above-editor component");
-        for (const theme of widgetThemes) {
-          const component = content(undefined, theme);
-          for (const width of [0, 1, 2, 35, 72, 120]) {
-            const lines = component.render(width);
-            if (
-              lines.length > 8 ||
-              lines.some(
-                (line) =>
-                  visibleWidth(line) > width || /\p{Cc}/u.test(stripTerminalSequences(line)),
+        if (key !== "continuous-tasks:board") throw new Error(`Unexpected widget: ${key}`);
+        widgetLines = [];
+        if (content) {
+          if (typeof content !== "function" || options?.placement !== "aboveEditor")
+            throw new Error("Widget did not use the bounded above-editor component");
+          for (const theme of widgetThemes) {
+            const component = content(undefined, theme);
+            for (const width of [0, 1, 2, 35, 72, 120]) {
+              const lines = component.render(width);
+              if (
+                lines.length > 8 ||
+                lines.some(
+                  (line) =>
+                    visibleWidth(line) > width || /\p{Cc}/u.test(stripTerminalSequences(line)),
+                )
               )
-            )
-              throw new Error(`Widget exceeded terminal width/row limits in ${theme.name}`);
+                throw new Error(`Widget exceeded terminal width/row limits in ${theme.name}`);
+            }
+            const plain = component.render(72).map(stripTerminalSequences);
+            if (widgetLines.length && JSON.stringify(plain) !== JSON.stringify(widgetLines))
+              throw new Error("Theme changed task-board content or alignment");
+            widgetLines = plain;
           }
-          const plain = component.render(72).map(stripTerminalSequences);
-          if (widgetLines.length && JSON.stringify(plain) !== JSON.stringify(widgetLines))
-            throw new Error("Theme changed task-board content or alignment");
-          widgetLines = plain;
         }
+        widgetHistory.push([...widgetLines]);
+        if (
+          latestSupervisor(sessionManager)?.status === "reviewing" &&
+          widgetLines.some((line) => line.includes("监督检查中") || line.includes("宿主工作中"))
+        )
+          reviewedWidgetPublication = true;
+      } catch (error) {
+        uiScriptErrors.push(error);
+        throw error;
       }
-      widgetHistory.push([...widgetLines]);
-      if (latestSupervisor(sessionManager)?.status === "reviewing" && widgetLines.some((line) =>
-        line.includes("监督检查中") || line.includes("宿主工作中"))) reviewedWidgetPublication = true;
-      } catch (error) { uiScriptErrors.push(error); throw error; }
     },
   };
   const uiBindings = {
@@ -673,7 +797,7 @@ try {
 
   if (preflight) {
     await enableCommand.handler(
-      `preflight ${goal}`,
+      `${freshSupervise ? "supervise" : "preflight"} ${goal}`,
       session.extensionRunner.createCommandContext(),
     );
     await waitUntil(
@@ -708,10 +832,15 @@ try {
     );
   } else
     await enableCommand.handler(
-      supervised ? `supervise ${goal}` : "enable",
+      supervised ? `supervise-legacy ${goal}` : "enable",
       session.extensionRunner.createCommandContext(),
     );
-  await legacyCommand.handler("enable", session.extensionRunner.createCommandContext());
+  // enable now explicitly selects task-only mode; it cannot be an idempotent
+  // alias probe while supervised. Exercise the legacy command name read-only there.
+  await legacyCommand.handler(
+    supervised ? "status" : "enable",
+    session.extensionRunner.createCommandContext(),
+  );
   if (!supervised) await session.prompt("Start the approved task supervisor board.");
   if (interruptCompaction) {
     await waitUntil(() => interruptedReviewStarted, "supervisor review start");
@@ -778,7 +907,7 @@ try {
       waiting.continuations !== 1 ||
       waiting.stagnant !== 0 ||
       advisoryChecks !== 1 ||
-      agentStarts !== 2
+      agentStarts !== (preflight ? 3 : 2)
     )
       throw new Error("Async waiting repeated advisor calls, spent budget, or faulted settlement");
     if (latestSnapshot(sessionManager)?.tasks[0]?.executionRef?.runId !== "smoke-run-1")
@@ -803,10 +932,7 @@ try {
     widgetLines.some((line) => line.includes("任务已完成记录 ·") || line.includes("已放弃记录 ·"))
   )
     throw new Error("Widget missed lifecycle progress or failed to fold completed tasks");
-  if (
-    supervised &&
-    !reviewedWidgetPublication
-  )
+  if (supervised && !reviewedWidgetPublication)
     throw new Error("Widget did not update for a supervisor-only review transition");
   const branchBeforeList = JSON.stringify(sessionManager.getBranch());
   const startsBeforeList = agentStarts;
@@ -826,6 +952,10 @@ try {
     throw new Error("Full task list lost evidence, changed history, or started Main");
 
   const branch = sessionManager.getBranch();
+  if(preflight){
+    const facts=branch.filter(entry=>entry.type==="custom"&&entry.customType==="continuous-tasks:acceptance-facts"),bound=facts.findLast(entry=>entry.data.kind==="acceptance-contract-bound"),start=facts.find(entry=>entry.data.kind==="acceptance-check-started"&&entry.data.callId==="contract-validation"),observed=facts.find(entry=>entry.data.kind==="acceptance-check-observed"&&entry.data.startedRef.entryId===start?.id);
+    if(bound?.data.authority.kind!=="recognized-host"||!start||!observed||observed.data.closed!==true||observed.data.exitCode!==0||observed.data.termination!=="exited"||!Number.isSafeInteger(observed.data.pid)||observed.data.pid<=0||observed.data.result?.tests!==1||observed.data.result?.requiredCases?.["smoke-input"]!=="passed"||!observed.data.invocation.args.includes(join(sandbox,"acceptance-check.mjs")))throw Error("Preflight smoke lacks actual source-bound fixed-specification contract/check");
+  }
   const userMessages = branch.filter(
     (entry) => entry.type === "message" && entry.message.role === "user",
   );
@@ -838,14 +968,20 @@ try {
 
   if (extensionErrors.length > 0)
     throw new Error(`Extension errors: ${JSON.stringify(extensionErrors)}`);
-  if (agentStarts !== (preflight ? 3 : compaction || batchContinuation || asyncExecution ? 3 : 2))
+  if (
+    agentStarts !==
+    (progressTasks ? 6 : preflight ? (asyncExecution ? 4 : 3) : compaction || batchContinuation || asyncExecution ? 3 : 2)
+  )
     throw new Error(`Unexpected agent run count: ${agentStarts}`);
   if (completedCompactions !== ((compaction || interruptCompaction) && !ordinaryPause ? 1 : 0))
     throw new Error("Unexpected automatic compaction count");
   if (faux.getPendingResponseCount() !== 0) throw new Error("Faux responses were not exhausted");
   if (userMessages.length !== (supervised ? 0 : 1))
     throw new Error("Auto-continuation forged a user message");
-  if (continuationMessages.length !== (compaction || batchContinuation || nativeAbort ? 3 : supervised ? 2 : 1)) {
+  if (
+    continuationMessages.length !==
+    (progressTasks ? 5 : compaction || batchContinuation || nativeAbort ? 3 : supervised ? 2 : 1)
+  ) {
     throw new Error(`Unexpected hidden continuation count: ${continuationMessages.length}`);
   }
   if (
@@ -863,6 +999,7 @@ try {
     "edit_tasks",
     "compile_tasks",
     "get_ready_tasks",
+    ...(progressTasks ? Array.from({ length: 4 }, () => "edit_smoke_progress") : []),
     ...(asyncExecution ? ["workflow_gate", "workflow_gate"] : []),
     "advance_tasks",
     ...(supervised ? ["validate_smoke"] : []),
@@ -871,6 +1008,7 @@ try {
     "get_ready_tasks",
     "advance_tasks",
     ...(supervised ? ["validate_smoke"] : []),
+    ...(preflight?["run_check"]:[]),
     "advance_tasks",
   ];
   if (JSON.stringify(toolSequence) !== JSON.stringify(expectedTools)) {
@@ -884,14 +1022,86 @@ try {
     const state = latestSupervisor(sessionManager);
     if (
       state?.status !== "completed" ||
-      state.reviews !== (compaction || batchContinuation ? 3 : nativeAbort ? 1 : 2) ||
-      state.continuations !== (compaction || batchContinuation ? 2 : interruptCompaction ? 0 : 1) ||
-      state.receipts.length !== 2 + receiptReadCount ||
+      state.reviews !== 2 ||
+      state.continuations !==
+        (compaction || batchContinuation ? 2 : interruptCompaction && !nativeAbort ? 0 : 1) ||
+      state.receipts.length !== 2 + receiptReadCount + (preflight?1:0) ||
       state.bindings.length !== 2
     )
       throw new Error(`Incorrect supervisor completion: ${JSON.stringify(state)}`);
+    if (compaction || batchContinuation) {
+      const calls = branch.filter(
+        (entry) =>
+          entry.type === "custom" &&
+          entry.customType === "continuous-tasks:control-facts" &&
+          entry.data.kind === "advisor-call-started",
+      );
+      const plans = branch.filter(
+        (entry) =>
+          entry.type === "custom" &&
+          entry.customType === "continuous-tasks:control-facts" &&
+          entry.data.kind === "batch-advice-observed" &&
+          entry.data.valid,
+      );
+      if (calls.length !== 2 || plans.length !== 1)
+        throw new Error(
+          "Mechanical batch handoff lost its qualified plan or charged another Advisor call",
+        );
+    }
+    if (nativeAbort) {
+      const starts = sessionManager
+        .getBranch()
+        .filter(
+          (entry) =>
+            entry.type === "custom" &&
+            entry.customType === "continuous-tasks:control-facts" &&
+            entry.data.kind === "advisor-call-started",
+        );
+      if (JSON.stringify(starts.map((entry) => entry.data.budgetSlot)) !== JSON.stringify([1, 2]))
+        throw new Error(
+          "Native abort recovery reused or discarded an already-consumed Advisor budget slot",
+        );
+    }
   }
 
+  if (progressTasks) {
+    const progress = branch.filter(
+      (entry) =>
+        entry.type === "custom" &&
+        entry.customType === "continuous-tasks:control-facts" &&
+        entry.data.kind === "progress-observed",
+    );
+    if (
+      progress.length !== 4 ||
+      progress.some(
+        (entry) =>
+          entry.data.owner.kind !== "board" ||
+          entry.data.sourceKind !== "native-result" ||
+          entry.data.result !== "changed",
+      )
+    )
+      throw new Error("Actual SDK task-only result progress was not durably qualified");
+    if (process.env.P5_TASKS_PREFIX) {
+      const prefix = process.env.P5_TASKS_PREFIX;
+      if (!/^p5-[A-Za-z0-9_-]{1,60}$/.test(prefix))
+        throw Error("Invalid owned P5 task fixture prefix");
+      const artifacts = resolve(packageRoot, "../control-remediation-artifacts");
+      const fixture = join(artifacts, `${prefix}-fixture.jsonl`);
+      const bytes = readFileSync(sessionManager.getSessionFile());
+      writeFileSync(fixture, bytes, { flag: "wx" });
+      writeFileSync(
+        join(artifacts, `${prefix}-input.json`),
+        JSON.stringify({
+          sessionFile: fixture,
+          sha256: createHash("sha256").update(bytes).digest("hex"),
+          changedFacts: 4,
+          ownerKind: "board",
+          productionHumanProof: false,
+        }),
+        { flag: "wx" },
+      );
+    }
+  }
   const sessionFile = sessionManager.getSessionFile();
   if (!sessionFile) throw new Error("Persistent smoke session was not created");
   await session.extensionRunner.emit({ type: "session_shutdown" });
@@ -951,8 +1161,47 @@ try {
   if (widgetLines.some((line) => line.includes("Supervisor:")))
     throw new Error("Forked widget inherited the source supervisor");
   const forkActivated = session.extensionRunner.getActiveTools().includes("workflow_gate");
-  if (preflight ? forkActivated : !forkActivated) {
-    throw new Error(preflight ? "Fork inherited source-session native approval/activation" : "Forking the session did not inherit activated task tools");
+  // New session-owned control history cannot become the fork's activation/permission.
+  // Legacy board-only history retains the original activation compatibility check.
+  const forkHasControlHistory = forkedManager
+    .getBranch()
+    .some(
+      (entry) =>
+        entry.type === "custom" &&
+        (entry.customType === "continuous-tasks:control-facts" ||
+          (entry.customType === "continuous-tasks:supervisor" && entry.data?.version === 6)),
+    );
+  const forkRequiresNewOwner = preflight || forkHasControlHistory;
+  if (forkRequiresNewOwner ? forkActivated : !forkActivated) {
+    throw new Error(
+      JSON.stringify({
+        error: preflight
+          ? "Fork inherited source-session native approval/activation"
+          : "Forking the session did not inherit activated task tools",
+        taskDetails,
+        sourceSessionId: sessionManager.getSessionId(),
+        forkSessionId: forkedManager.getSessionId(),
+        activeTools: session.extensionRunner.getActiveTools(),
+        controlMetadata: forkedManager
+          .getBranch()
+          .filter(
+            (entry) =>
+              entry.type === "custom" &&
+              ["continuous-tasks:supervisor", "continuous-tasks:control-facts"].includes(
+                entry.customType,
+              ),
+          )
+          .slice(-8)
+          .map((entry) => ({
+            id: entry.id,
+            type: entry.customType,
+            version: entry.data?.version,
+            kind: entry.data?.kind,
+            sessionId: entry.data?.sessionId,
+            ownerSessionId: entry.data?.owner?.goal?.sessionId,
+          })),
+      }),
+    );
   }
   if (supervised) {
     const gate = await session.extensionRunner.emitToolCall({
@@ -961,9 +1210,13 @@ try {
       toolCallId: "fork-probe",
       input: { mode: "append" },
     });
-    if (preflight) {
-      if (!gate?.block || !/journal|session|preflight/i.test(gate.reason)) throw new Error("Fork accepted source-session native authorization");
-    } else if (gate?.block) throw new Error("Fork improperly inherited the source session's supervisor");
+    if (forkRequiresNewOwner) {
+      if (!gate?.block || !/journal|session|preflight/i.test(gate.reason))
+        throw new Error(
+          `Fork accepted source-session authorization/control history: ${JSON.stringify(gate)}`,
+        );
+    } else if (gate?.block)
+      throw new Error("Fork improperly inherited the source session's supervisor");
   }
 
   session.dispose();
@@ -989,6 +1242,7 @@ try {
   console.log(
     JSON.stringify({
       result: "PASS",
+      freshSuperviseEnteredReadOnlyPlanning: freshSupervise,
       preflightApprovedAndSeparatelyStarted: preflight,
       preflightOptionalPermissionNotGranted: preflight,
       mode: batchContinuation
@@ -996,7 +1250,9 @@ try {
         : longReceipts
           ? "supervised-long-receipts"
           : preflight
-            ? "supervised-preflight"
+            ? freshSupervise
+              ? "supervised-fresh-supervise"
+              : "supervised-preflight"
             : asyncExecution
               ? "supervised-async-execution"
               : ordinaryPause
@@ -1023,23 +1279,36 @@ try {
       boundedTaskWidgetLifecycle: true,
       readOnlyFullTaskList: true,
       uiStubNotRealTerminal: true,
+      preflightExecutionContractCombination:preflight&&asyncExecution,
       preflightSourceBoundarySimulated: preflight,
+      preflightContractAuthority:preflight?"recognized-host-fixed-specification":"not-in-this-arm",
+      preflightActualRegisteredCheck:preflight,
+      nativeContractReviewInThisArm:false,
       productionHumanProof: false,
+      taskOnlyNativeProgressFacts: progressTasks ? 4 : 0,
       resumedActivation: true,
       resumedSupervisorAcceptance: supervised,
       forkSupervisorNotInherited: supervised,
-      forkedActivation: !preflight,
+      forkedActivation: forkActivated,
       nativePreflightForkDenied: preflight,
+      foreignControlHistoryForkDenied: forkHasControlHistory && !forkActivated,
       independentDefaultDeny: true,
       realSettingsUntouched: true,
     }),
   );
+  fixturePassed=true;
 } finally {
   releaseInterruptedReview?.();
   session?.dispose();
   if (previousAgentDir === undefined) delete process.env.PI_CODING_AGENT_DIR;
   else process.env.PI_CODING_AGENT_DIR = previousAgentDir;
   process.argv = previousArgv;
-  if (preflight) [process.stdin, process.stdout].forEach((stream, i) => { const descriptor = ttyDescriptors[i]; if (descriptor) Object.defineProperty(stream, "isTTY", descriptor); else Reflect.deleteProperty(stream, "isTTY"); });
-  rmSync(sandbox, { recursive: true, force: true });
+  if (preflight)
+    [process.stdin, process.stdout].forEach((stream, i) => {
+      const descriptor = ttyDescriptors[i];
+      if (descriptor) Object.defineProperty(stream, "isTTY", descriptor);
+      else Reflect.deleteProperty(stream, "isTTY");
+    });
+  if(fixturePassed)rmSync(sandbox, { recursive: true, force: true });
+  else console.error("Owned smoke failure retained:",sandbox);
 }

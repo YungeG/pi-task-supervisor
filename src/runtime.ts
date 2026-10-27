@@ -2,11 +2,21 @@ import { AsyncLocalStorage } from "node:async_hooks";
 import type { ExtensionAPI, ToolDefinition } from "@earendil-works/pi-coding-agent";
 import type { TSchema } from "typebox";
 import { createEmptyBoard } from "./engine";
-import type { SupervisorState } from "./supervisor";
+import type { SupervisorState, Advisor } from "./supervisor";
 import type { PreflightState } from "./preflight";
 import type { ReceiptStore } from "./receipt-store";
 import type { TaskBoardSnapshot } from "./types";
 import type { GoalRuntime } from "./goal-records";
+import type { ControlJournalView, WorkOwnerKey } from "./control-journal";
+import type { ManagementState } from "./management-policy";
+import type { ProgressRuntime } from "./progress-facts";
+import type { InvocationRuntime } from "./invocation-runtime";
+import type { ExecutionRef } from "./types";
+import type {
+  FinalValidationIntent,
+  FinalValidationObservation,
+  FinalReviewStateV1,
+} from "./final-review";
 
 export interface ProjectionRepairHint {
   sessionId: string;
@@ -17,9 +27,26 @@ export interface ProjectionRepairHint {
 }
 
 export interface TaskRuntime {
+  /** Last Session observed from the real callback context; not a permission or WorkOwner. */
+  sessionId?: string;
   board: TaskBoardSnapshot;
   goal: GoalRuntime | undefined;
   goalEpoch: number;
+  controlJournal?: ControlJournalView;
+  management?: ManagementState;
+  progress?: ProgressRuntime;
+  invocation?: InvocationRuntime;
+  finalValidationIntents?: Map<string, FinalValidationIntent>;
+  finalValidation?: FinalValidationObservation;
+  finalReview?: FinalReviewStateV1;
+  finalReviewAbort?: AbortController;
+  reviewAdvisor?: Advisor;
+  executionMemoryBindings?: Array<{
+    sessionId: string;
+    owner: WorkOwnerKey | null;
+    taskId: string;
+    executionRef: ExecutionRef;
+  }>;
   planningLease: string | undefined;
   enabled: boolean;
   cancel: () => void;

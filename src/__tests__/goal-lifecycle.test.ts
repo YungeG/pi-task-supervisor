@@ -138,10 +138,11 @@ it("reopens an unstarted goal, explicitly replans within its identity, then stop
   expect(inspectGoalTransition(f.ctx, { goal: "Following goal", intent: "supervise" }).status).toBe(
     "eligible",
   );
-  expect(
-    (await requestGoalTransition(f.api, f.ctx, { goal: "Following goal", intent: "supervise" }))
-      .status,
-  ).toBe("committed-planning");
+  const following = await requestGoalTransition(f.api, f.ctx, {
+    goal: "Following goal",
+    intent: "supervise",
+  });
+  expect(following, JSON.stringify(following)).toMatchObject({ status: "committed-planning" });
   expect(currentRuntime().goal?.current?.scope.goalRunId).not.toBe(before.scope.goalRunId);
   expect(readGoalHistory(f.ctx).items).toHaveLength(2);
   expect(f.sendMessage).not.toHaveBeenCalled();

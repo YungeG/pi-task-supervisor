@@ -205,7 +205,8 @@ describe("resident UI publication", () => {
         footer.set(key, value);
       });
       await h.command("stop");
-      expect(supervisorState()).toMatchObject({ status: "stopped", pending: false });
+      expect(currentRuntime().supervisor).toMatchObject({ status: "stopped", pending: false });
+      expect(supervisorState()).toBeUndefined();
       expect(footer.get("continuous-supervisor")).toBeUndefined();
       expect(footer.get("other-extension")).toBe("keep");
       const snapshot = JSON.stringify({ board: getBoard(), state: supervisorState() });
@@ -231,7 +232,8 @@ describe("resident UI publication", () => {
       h.mock.api.appendEntry("continuous-tasks:snapshot", parentBoard);
       startSupervisor(h.mock.api, h.ctx, "Parent fixture");
       await h.command("stop");
-      expect(supervisorState()).toMatchObject({ status: "stopped", pending: false });
+      expect(currentRuntime().supervisor).toMatchObject({ status: "stopped", pending: false });
+      expect(supervisorState()).toBeUndefined();
       vi.mocked(h.ctx.sessionManager.getSessionId).mockReturnValue("child-session");
       const footer = new Map<string, string | undefined>([
         ["continuous-supervisor", "Supervisor: stopped (1/20 resumes)"],
@@ -347,7 +349,8 @@ describe("resident UI publication", () => {
     updateUI(h.ctx, board);
     expect(footer.get("til-done")).toBeDefined();
     await h.command("stop");
-    expect(supervisorState()?.status).toBe("stopped");
+    expect(currentRuntime().supervisor?.status).toBe("stopped");
+    expect(supervisorState()).toBeUndefined();
     expect(getBoard().workflowStatus).toBe("paused");
     expect(getBoard().tasks).toEqual(board.tasks);
     for (const key of ["til-done", "til-done-active", "continuous-supervisor"])
@@ -357,7 +360,7 @@ describe("resident UI publication", () => {
     const view = capture.captureUiBoardView(h.ctx, getBoard());
     expect(view.board.tasks).toEqual(board.tasks);
     expect(view.summary.counts).toEqual({ total: 12, done: 4, abandoned: 0, unfinished: 8 });
-    expect(supervisorState()?.holdCause).toBe("advisor_hold");
+    expect(currentRuntime().supervisor?.holdCause).toBe("advisor_hold");
     vi.mocked(h.ctx.isIdle).mockReturnValue(false);
     vi.mocked(h.ctx.hasPendingMessages).mockReturnValue(true);
     updateUI(h.ctx, getBoard());
@@ -406,6 +409,8 @@ describe("resident UI publication", () => {
           toolCallId: "pending",
           input: {},
         });
+      if (kind === "pending") vi.mocked(h.ctx.hasPendingMessages).mockReturnValue(true);
+      if (kind === "foreign") currentRuntime().supervisor!.sessionId = "foreign";
       if (kind === "pause" || kind === "fault")
         await h.command(kind === "pause" ? "pause Human pause" : "pause Existing work");
       else await h.command("stop");
@@ -428,7 +433,6 @@ describe("resident UI publication", () => {
           faultMessage: "Projection pending",
           ownsJournalFault: false,
         };
-      if (kind === "pending") supervisorState()!.pending = true;
       if (kind === "execution") {
         const board = getBoard();
         board.tasks[0]!.executionRef = { source: "workflow", runId: "existing" };
@@ -447,7 +451,6 @@ describe("resident UI publication", () => {
         };
         setBoard(board);
       }
-      if (kind === "foreign") supervisorState()!.sessionId = "foreign";
       vi.mocked(h.ctx.ui.setStatus).mockClear();
       vi.mocked(h.ctx.ui.setWidget).mockClear();
       updateUI(h.ctx, getBoard());
@@ -459,14 +462,22 @@ describe("resident UI publication", () => {
       expect(vi.mocked(h.ctx.ui.setWidget).mock.calls.at(-1)?.[1]).toEqual(expect.any(Function));
     },
   );
-  it("shows explicit board-only work again after a stopped history is resumed without restarting supervision", async () => {
+  it("requires explicit new task-only work after stop and never resumes historical supervision", async () => {
     const h = lifecycle();
     setSessionScopeEnabled(true);
     setBoard(activeBoard());
     startSupervisor(h.mock.api, h.ctx, "Historical goal");
     await h.command("stop");
     await h.command("resume");
-    expect(supervisorState()?.status).toBe("stopped");
+    expect(getBoard().workflowStatus).toBe("paused");
+    expect(currentRuntime().supervisor?.status).toBe("stopped");
+    expect(supervisorState()).toBeUndefined();
+    await h.command("enable");
+    expect(currentRuntime().management?.mode).toBe("tasks");
+    expect(getBoard().tasks).toHaveLength(0);
+    // UI-only new-board shape, not evidence or a revived permission grant.
+    setBoard(activeBoard());
+    updateUI(h.ctx, getBoard());
     expect(getBoard().workflowStatus).toBe("active");
     expect(
       vi

@@ -1,5 +1,18 @@
 import type { DecisionSpec } from "./decision-spec";
 
+export interface AcceptanceLayers {
+  taskRecords: "complete" | "incomplete";
+  hostBindings: number;
+  contract: "not-supervised" | "legacy-host" | "bound-unchecked" | "accepted-history";
+  contractId?: string;
+  revision?: number;
+  modelReview: "not-applicable" | "not-accepted" | "accepted-history";
+  manualResponses: number;
+  currentApplicability: "unknown";
+  realHumanProductAcceptance: "not-inferred";
+  definitionQuality: "independent-review-required";
+}
+
 // ── Status ──
 
 export type TaskStatus =

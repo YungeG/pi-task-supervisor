@@ -25,7 +25,9 @@ function instance(id: string) {
   return {
     mock,
     ctx,
-    command: (args: string) => definition.handler(args, ctx),
+    // These are retained legacy instance-isolation scenarios, not scoped first-start.
+    command: (args: string) =>
+      definition.handler(args.replace(/^supervise(?=\s|$)/, "supervise-legacy"), ctx),
     fire: (name: string, event: unknown = {}) => getHandler(mock, name)(event, ctx),
   };
 }

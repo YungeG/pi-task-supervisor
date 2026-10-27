@@ -105,7 +105,7 @@ it.each([false, true])(
   },
 );
 
-it("reconstructs the same planning role after the admitted callback identity was evicted", async () => {
+it("preserves the same planning role when active callback capacity is reached without evicting it", async () => {
   const f = await startedAfterPlanningCall(undefined, true);
   for (let i = 0; i < 512; i++)
     await f.fire("tool_call", {
@@ -121,7 +121,7 @@ it("reconstructs the same planning role after the admitted callback identity was
     toolCallId: "planning-read",
     toolName: "read",
     input: { path: "synthetic" },
-    content: [{ type: "text", text: "Evicted planning result" }],
+    content: [{ type: "text", text: "Retained planning result at callback capacity" }],
     isError: false,
   });
   expect(result).toMatchObject({
@@ -277,9 +277,10 @@ it("retains bounded names and duplicate occurrence IDs, never native arguments o
   const node = inspectSessionJournal(sessionJournalView(f.ctx)).branch.find(
     (n) => n.id === "planning-native-call",
   )!;
+  const inputDigest = "ae1a6c9dc0cfbb09092fe3f79bb3b3519e9086b3346d8cb1b6376ba643c2072a";
   expect(node.toolCalls).toEqual([
-    { id: "planning-read", name: "read" },
-    { id: "planning-read", name: "read" },
+    { id: "planning-read", name: "read", inputDigest },
+    { id: "planning-read", name: "read", inputDigest },
   ]);
   expect(node.toolCallIds).toEqual(["planning-read", "planning-read"]);
   expect(node.data).toBeUndefined();

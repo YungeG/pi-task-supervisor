@@ -1,8 +1,9 @@
 import type { ToolResultEvent } from "@earendil-works/pi-coding-agent";
-import { beforeEach, describe, expect, it } from "vitest";
+import { beforeEach, describe, expect, it, vi } from "vitest";
+import * as acceptanceRuntime from "../acceptance-runtime";
 import { setSessionScopeEnabled } from "../scope";
 import { getBoard, resetState, setBoard } from "../state";
-import { supervisorState, SUPERVISOR_ENTRY, type Advice } from "../supervisor";
+import { supervisorState, SUPERVISOR_ENTRY, prepareToolCapture, type Advice } from "../supervisor";
 import { createAdvanceTasksTool } from "../tools";
 import type { CompletionEvidence } from "../types";
 import { activeBoard, ACTIVATION, BOUNDARY, getHandler, lifecycle } from "./helpers/lifecycle";
@@ -106,6 +107,25 @@ describe("complete acceptance, not a percentage heuristic", () => {
     },
   );
 
+  it("reports stale host validation before an additional missing-condition gate", async () => {
+    const h = await ready();
+    await h.fire("tool_result", event("later-edit", "edit"));
+    // Negative gate-composition test only: no contract/check qualification is minted.
+    const missing = vi
+      .spyOn(acceptanceRuntime, "acceptanceContractIssue")
+      .mockReturnValue(
+        "Acceptance contract lacks applicable required checks: missing (EVIDENCE_MISSING)",
+      );
+    try {
+      await h.fire("agent_before_settle", BOUNDARY);
+      expect(supervisorState()).toMatchObject({
+        status: "fault",
+        reason: expect.stringContaining("stale"),
+      });
+    } finally {
+      missing.mockRestore();
+    }
+  });
   it("invalidates final validation after a potentially mutating host tool", async () => {
     const h = await ready();
     await h.fire("tool_result", event("later-edit", "edit"));
@@ -141,11 +161,17 @@ describe("complete acceptance, not a percentage heuristic", () => {
     const h = await ready();
     await h.fire("agent_before_settle", BOUNDARY);
     expect(supervisorState()!.status).toBe("completed");
-    await h.fire("tool_call", {
+    const intent = {
+      type: "tool_call" as const,
       toolCallId: "after-acceptance-intent",
       toolName: "write",
       input: { path: "fixture" },
-    });
+    };
+    expect(await h.fire("tool_call", intent)).toMatchObject({ block: true });
+    expect(supervisorState()!.acceptedDigest).toBeDefined();
+    // Failure injection: an actual host intent despite admission denial must
+    // still invalidate freshness; a blocked request alone is not a mutation.
+    prepareToolCapture(h.mock.api, intent, h.ctx);
     expect(supervisorState()!.acceptedDigest).toBeUndefined();
     const ctx = createMockContext(h.ctx.sessionManager.getBranch());
     attachMockJournal(h.mock, ctx);

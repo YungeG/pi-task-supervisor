@@ -443,14 +443,14 @@ export function preflightRequestPredecessor(
   const journal = inspectSessionJournal(sessionJournalView(ctx));
   const previous = [...selectedGoalEntries(journal.branch, "preflight")].reverse().find((n) => {
     if (n.customType !== PREFLIGHT_ENTRY) return false;
-    const data = ownerSnapshot(n.data);
+    const data = ownerSnapshot(n.data, "preflight");
     return (
       Check(NativePreflightStateSchema, data) &&
       data.preflightId === state.preflightId &&
       Boolean(kind === "permission" ? data.permissionRequest : data.startRequest)
     );
   });
-  const data = previous ? ownerSnapshot(previous.data) : undefined;
+  const data = previous ? ownerSnapshot(previous.data, "preflight") : undefined;
   const request = Check(NativePreflightStateSchema, data)
     ? kind === "permission"
       ? data.permissionRequest
@@ -473,41 +473,47 @@ export function preflightRequestPredecessor(
   return legacy ? { legacyControlEntryId: legacy.id } : undefined;
 }
 export function preflightPermissionScope(base: PreflightState, ids: string[]): object {
-  return goalLogicalScope({
-    action: "permissions",
-    sessionId: base.sessionId,
-    goal: base.goal,
-    preflightId: base.preflightId,
-    revision: base.revision,
-    planId: base.planId,
-    planDigest: base.planDigest,
-    proposal: base.proposal,
-    request: base.version === 2 ? base.permissionRequest : undefined,
-    permissionIds: ids,
-  });
+  return goalLogicalScope(
+    {
+      action: "permissions",
+      sessionId: base.sessionId,
+      goal: base.goal,
+      preflightId: base.preflightId,
+      revision: base.revision,
+      planId: base.planId,
+      planDigest: base.planDigest,
+      proposal: base.proposal,
+      request: base.version === 2 ? base.permissionRequest : undefined,
+      permissionIds: ids,
+    },
+    "preflight",
+  );
 }
 export function preflightStartScope(base: PreflightState, approvalEntryDigest: string): object {
-  return goalLogicalScope({
-    action: "start",
-    sessionId: base.sessionId,
-    goal: base.goal,
-    preflightId: base.preflightId,
-    revision: base.revision,
-    planId: base.planId,
-    planDigest: base.planDigest,
-    proposal: base.proposal,
-    request: base.version === 2 ? base.startRequest : undefined,
-    permissionIds: base.approval?.permissionIds,
-    approvalControlEntryId: base.approval?.controlEntryId,
-    approvalControlDigest: approvalEntryDigest,
-  });
+  return goalLogicalScope(
+    {
+      action: "start",
+      sessionId: base.sessionId,
+      goal: base.goal,
+      preflightId: base.preflightId,
+      revision: base.revision,
+      planId: base.planId,
+      planDigest: base.planDigest,
+      proposal: base.proposal,
+      request: base.version === 2 ? base.startRequest : undefined,
+      permissionIds: base.approval?.permissionIds,
+      approvalControlEntryId: base.approval?.controlEntryId,
+      approvalControlDigest: approvalEntryDigest,
+    },
+    "preflight",
+  );
 }
 function nativeRequest(base: PreflightState, start: boolean) {
   if (base.version !== 2) return undefined;
   return start ? base.startRequest : base.permissionRequest;
 }
 function nativeSnapshot(data: unknown): boolean {
-  data = ownerSnapshot(data);
+  data = ownerSnapshot(data, "preflight");
   return Boolean(data && typeof data === "object" && "version" in data && data.version === 2);
 }
 function nativeIdentity(base: PreflightState, control: NativePreflightControl): void {
@@ -877,7 +883,7 @@ export function revokePreflight(
 }
 
 function restoredSnapshot(data: unknown): PreflightState {
-  data = ownerSnapshot(data);
+  data = ownerSnapshot(data, "preflight");
   if (!Check(PreflightStateSchema, data) || !safeStrings(data))
     throw new Error("Invalid persisted preflight state");
   if (data.proposal) {
@@ -1326,7 +1332,7 @@ function foldPreflightControl(
   if (fold.legacyPending) throw new Error("Incomplete legacy preflight control cache");
   if ("version" in value) {
     const proof = confirmedPreflightProof(ctx, value.humanInteraction.requestId, restoration);
-    if (proof.control.id !== id || !same(fold.state, ownerSnapshot(proof.base.data)))
+    if (proof.control.id !== id || !same(fold.state, ownerSnapshot(proof.base.data, "preflight")))
       throw new Error("Preflight control base is stale");
     const request = fold.requests.get(value.humanInteraction.requestId);
     if (!request || request.retired || request.controlEntryId)

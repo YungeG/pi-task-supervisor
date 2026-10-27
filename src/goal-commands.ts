@@ -1,5 +1,6 @@
 import type { ExtensionAPI, ExtensionCommandContext } from "@earendil-works/pi-coding-agent";
 import { currentRuntime } from "./runtime";
+import { adoptSupervisedMode } from "./management-policy";
 import { getBoardRef, updateUI } from "./state";
 import { enableSessionScope, updateActiveTools } from "./scope";
 import {
@@ -49,7 +50,8 @@ function legacyHistory(): boolean {
     return true;
   return !runtime.supervisor && board.tasks.length > 0 && board.workflowStatus !== "active";
 }
-function prepareTools(pi: ExtensionAPI): void {
+function prepareTools(pi: ExtensionAPI, ctx: ExtensionCommandContext): void {
+  adoptSupervisedMode(pi, ctx);
   enableSessionScope(pi);
   updateActiveTools(pi, true);
 }
@@ -81,7 +83,7 @@ async function routeSameGoal(
   if (action === "preflight") {
     const result = await replanCurrentGoal(pi, ctx);
     if (result.status === "planning-ready" && result.planning) {
-      prepareTools(pi);
+      prepareTools(pi, ctx);
       dispatchGoalPlanning(pi, ctx, result.planning);
     } else notify(ctx, result.reason ?? result.status, result.status === "blocked");
     updateUI(ctx, getBoardRef());
@@ -103,7 +105,7 @@ async function routeGoalInput(
   }
   const result = await requestGoalTransition(pi, ctx, { goal: text, intent: action });
   if (result.status === "committed-planning" && result.planning) {
-    prepareTools(pi);
+    prepareTools(pi, ctx);
     dispatchGoalPlanning(pi, ctx, result.planning);
     notify(ctx, "旧目标已只读归档；新目标进入只读规划。业务权限与首次执行仍需独立确认。");
   } else notify(ctx, result.reason ?? result.status, result.status === "blocked");

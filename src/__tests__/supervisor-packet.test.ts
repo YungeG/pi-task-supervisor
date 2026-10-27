@@ -5,6 +5,9 @@ import { getBoardRef, resetState, setBoard } from "../state";
 import { supervisorState } from "../supervisor";
 import { activeBoard, BOUNDARY, lifecycle } from "./helpers/lifecycle";
 import { appendMockEntries } from "./helpers/mocks";
+import { executionRegistryFixture } from "./helpers/execution-registry";
+import { createAdvanceTasksTool } from "../tools";
+import type { CompletionEvidence } from "../types";
 
 const guide = {
   action: "next_batch",
@@ -18,6 +21,134 @@ describe("bounded supervisor evidence packet", () => {
     resetState();
     setSessionScopeEnabled(true);
     setBoard(activeBoard());
+  });
+
+  it("reviews sixteen applicable 1600-character Chinese receipts under 64000 bytes without rewriting retained evidence", async () => {
+    const f = await executionRegistryFixture(false, { gitWorkspace: true });
+    try {
+      expect((await f.review()).isError).not.toBe(true);
+      const refs: CompletionEvidence["refs"] = [];
+      for (let index = 0; index < 16; index++) {
+        const toolName = index === 0 ? "bash" : "read",
+          toolCallId = `capacity-${index}`;
+        const input =
+          index === 0
+            ? { command: "synthetic fixed validation" }
+            : { path: "synthetic-retained-material" };
+        await f.fire("tool_call", { type: "tool_call", toolName, toolCallId, input });
+        await f.fire("tool_result", {
+          type: "tool_result",
+          toolName,
+          toolCallId,
+          input,
+          content: [{ type: "text", text: "核".repeat(1600) }],
+          structuredContent: { exit_code: 0 },
+          isError: false,
+        });
+        refs.push({
+          kind: index === 0 ? "command" : "review",
+          label: `Retained proof ${index}`,
+          status: "passed",
+          ref: `tool:${toolCallId}`,
+          ...(index === 0 ? { exitCode: 0 } : {}),
+        });
+      }
+      const state = supervisorState()!,
+        original = structuredClone(state.receipts);
+      const packets: string[] = [];
+      const streamSimple = vi.fn(
+        (_model: unknown, context: { messages: { content: string }[] }) => {
+          packets.push(context.messages[0]!.content);
+          return {
+            result: async () =>
+              fauxAssistantMessage(
+                JSON.stringify({
+                  action: "accept",
+                  message: "Synthetic repeated output and host validation reviewed",
+                  taskIds: ["t-1.1"],
+                  evidenceRefs: refs.map((ref) => ref.ref),
+                }),
+              ),
+          };
+        },
+      );
+      Object.assign(f.ctx, { modelRegistry: { find: () => f.ctx.model, streamSimple } });
+      const done = await createAdvanceTasksTool(f.api).execute(
+        "capacity-done",
+        {
+          transitions: [
+            { id: "t-1.1", evidence: { summary: "Sixteen real retained fixture results", refs } },
+          ],
+        },
+        undefined,
+        undefined,
+        f.ctx,
+      );
+      expect(done.isError, JSON.stringify(done)).not.toBe(true);
+      await f.fire("agent_before_settle", BOUNDARY);
+      expect(streamSimple).toHaveBeenCalledOnce();
+      expect(Buffer.byteLength(packets[0]!, "utf8")).toBeLessThanOrEqual(64_000);
+      expect(JSON.parse(packets[0]!).receipts).toHaveLength(16);
+      expect(supervisorState()?.status).toBe("completed");
+      expect(supervisorState()!.receipts).toEqual(original);
+    } finally {
+      f.close();
+    }
+  });
+
+  it("rejects unreviewable required metadata before publishing done or completion bindings", async () => {
+    const h = lifecycle();
+    setBoard(
+      activeBoard({
+        finalAcceptanceTaskId: "t-1.1",
+        tasks: [{ ...activeBoard().tasks[0]!, title: "核".repeat(24000), status: "reviewing" }],
+        phases: [{ phase: 1, status: "active", title: "Bounded" }],
+      }),
+    );
+    await h.command("supervise Preserve required metadata under the original byte cap");
+    await h.fire("tool_result", {
+      type: "tool_result",
+      toolName: "bash",
+      toolCallId: "metadata-proof",
+      input: { command: "synthetic metadata check" },
+      content: [{ type: "text", text: "Passed" }],
+      structuredContent: { exit_code: 0 },
+      isError: false,
+    });
+    const board = structuredClone(getBoardRef()),
+      state = supervisorState()!,
+      bindings = structuredClone(state.bindings),
+      count = h.ctx.sessionManager.getBranch().length;
+    const result = await createAdvanceTasksTool(h.mock.api).execute(
+      "oversized-done",
+      {
+        transitions: [
+          {
+            id: "t-1.1",
+            evidence: {
+              summary: "Actual fixture result",
+              refs: [
+                {
+                  kind: "command",
+                  label: "Fixture validation",
+                  status: "passed",
+                  ref: "tool:metadata-proof",
+                  exitCode: 0,
+                },
+              ],
+            },
+          },
+        ],
+      },
+      undefined,
+      undefined,
+      h.ctx,
+    );
+    expect(result.isError).toBe(true);
+    expect(JSON.stringify(result)).toContain("REVIEW_VIEW_TOO_LARGE");
+    expect(getBoardRef()).toEqual(board);
+    expect(state.bindings).toEqual(bindings);
+    expect(h.ctx.sessionManager.getBranch()).toHaveLength(count);
   });
 
   it.each(["x", "核验"])(
@@ -92,9 +223,13 @@ describe("bounded supervisor evidence packet", () => {
     },
   );
 
-  it("refuses oversized bound evidence rather than shortening acceptance proof", async () => {
+  it("bounds dense registered bodies without refusing or rewriting retained acceptance evidence", async () => {
     const h = lifecycle();
-    const streamSimple = vi.fn();
+    const packets: string[] = [];
+    const streamSimple = vi.fn((_model: unknown, context: { messages: { content: string }[] }) => {
+      packets.push(context.messages[0]!.content);
+      return { result: async () => fauxAssistantMessage(JSON.stringify(guide)) };
+    });
     Object.assign(h.ctx, { modelRegistry: { find: () => h.ctx.model, streamSimple } });
     await h.command("supervise Preserve all bound validation evidence");
     for (let index = 0; index < 40; index++) {
@@ -115,12 +250,14 @@ describe("bounded supervisor evidence packet", () => {
     }));
     const receipts = structuredClone(state.receipts);
     const bindings = structuredClone(state.bindings);
-    expect(await h.fire("agent_before_settle", BOUNDARY)).toBeUndefined();
-    expect(supervisorState()).toMatchObject({
-      status: "fault",
-      reason: expect.stringContaining("exceeds 64KB"),
-    });
-    expect(streamSimple).not.toHaveBeenCalled();
+    expect((await h.fire("agent_before_settle", BOUNDARY))?.continue).toBe(true);
+    expect(supervisorState()).toMatchObject({ status: "active", pending: true });
+    expect(streamSimple).toHaveBeenCalledOnce();
+    expect(Buffer.byteLength(packets[0]!, "utf8")).toBeLessThanOrEqual(64_000);
+    const view = JSON.parse(packets[0]!);
+    expect(view.receipts).toHaveLength(40);
+    expect(view.excerpts.shortened).toBe(true);
+    expect(view.excerpts.details.length).toBeGreaterThan(0);
     expect(supervisorState()!.receipts).toEqual(receipts);
     expect(supervisorState()!.bindings).toEqual(bindings);
   });
@@ -134,7 +271,7 @@ describe("bounded supervisor evidence packet", () => {
         tasks: Array.from({ length: 30 }, (_, index) => ({
           ...activeBoard().tasks[0]!,
           id: `t-1.${index + 1}`,
-          prompt: "核".repeat(1000),
+          title: "核".repeat(1000),
         })),
       }),
     );

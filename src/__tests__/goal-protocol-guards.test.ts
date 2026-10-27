@@ -361,11 +361,15 @@ const commitChanges: [string, Change][] = [
 ];
 it.each(commitChanges)("does not publish C with %s", async (_label, change) => {
   const f = await prepared();
-  const entry = f.entries().at(-1)!;
+  const entry = [...f.entries()]
+    .reverse()
+    .find((item) => (item.data as Row).kind === "transition-committed")!;
   const r = structuredClone(entry.data) as Row;
   const lines = readFileSync(f.path, "utf8").trimEnd().split("\n");
-  lines.pop();
-  writeFileSync(f.path, lines.join("\n") + "\n");
+  const commitAt = lines.findIndex((line) => (JSON.parse(line) as Row).id === entry.id);
+  expect(commitAt).toBeGreaterThan(0);
+  // Retain actual A/B; remove C and its derived mode records, not an arbitrary last row.
+  writeFileSync(f.path, lines.slice(0, commitAt).join("\n") + "\n");
   f.reload();
   change(r, f);
   f.api.appendEntry("continuous-tasks:supervisor", r);

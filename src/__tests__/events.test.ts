@@ -135,6 +135,7 @@ describe("continuous task lifecycle events", () => {
       "agent_settled",
       "tool_call",
       "tool_result",
+      "tool_execution_end",
     ]);
   });
 

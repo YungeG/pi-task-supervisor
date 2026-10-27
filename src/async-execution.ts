@@ -45,7 +45,17 @@ async function requestOwner(
   method: "ping" | "status",
   params: Record<string, unknown>,
   signal: AbortSignal,
-): Promise<Record<string, unknown>> {
+): Promise<{ requestId: string; data: Record<string, unknown> }> {
+  const transport: unknown = pi.events;
+  if (
+    !transport ||
+    typeof transport !== "object" ||
+    !("on" in transport) ||
+    typeof transport.on !== "function" ||
+    !("emit" in transport) ||
+    typeof transport.emit !== "function"
+  )
+    throw new Error("Execution-owner transport unavailable; retain the execution reference");
   const requestId = randomUUID();
   const bounded = AbortSignal.any([signal, AbortSignal.timeout(RPC_TIMEOUT_MS)]);
   return new Promise((resolve, reject) => {
@@ -65,7 +75,7 @@ async function requestOwner(
         cleanup();
         if (reply.version !== 1 || reply.method !== method || reply.success !== true)
           throw new Error("Execution owner rejected lookup or returned an invalid reply");
-        resolve(record(reply.data));
+        resolve({ requestId, data: structuredClone(record(reply.data)) });
       } catch (error) {
         cleanup();
         reject(error instanceof Error ? error : new Error("Execution-owner reply failed"));
@@ -167,8 +177,8 @@ export async function observeExecutions(
   refs: readonly ExecutionIdentity[],
   signal: AbortSignal,
 ): Promise<ExecutionState> {
-  assertOwner(await requestOwner(pi, "ping", {}, signal), ctx);
-  const nodes = snapshotNodes(await requestOwner(pi, "status", {}, signal));
+  assertOwner((await requestOwner(pi, "ping", {}, signal)).data, ctx);
+  const nodes = snapshotNodes((await requestOwner(pi, "status", {}, signal)).data);
   const states = refs.map((ref) => {
     const node = nodes.find((candidate) => candidate.id === ref.runId);
     if (!node || (ref.source === "workflow" && node.kind !== "workflow"))
@@ -177,6 +187,39 @@ export async function observeExecutions(
   });
   if (states.includes("failed")) return "failed";
   return states.includes("active") ? "active" : "completed";
+}
+
+/** Target the canonical Run, not the untargeted display projection. */
+export async function observeExecutionTarget(
+  pi: ExtensionAPI,
+  ctx: ExtensionContext,
+  ref: ExecutionIdentity,
+  signal: AbortSignal,
+): Promise<ExecutionState> {
+  return nodeState((await queryExecutionTarget(pi, ctx, ref, signal)).root);
+}
+export interface ExecutionOwnerQuery {
+  requestId: string;
+  ping: Record<string, unknown>;
+  data: Record<string, unknown>;
+  root: Record<string, unknown>;
+  observedAt: number;
+}
+export async function queryExecutionTarget(
+  pi: ExtensionAPI,
+  ctx: ExtensionContext,
+  ref: ExecutionIdentity,
+  signal: AbortSignal,
+): Promise<ExecutionOwnerQuery> {
+  const ping = (await requestOwner(pi, "ping", {}, signal)).data;
+  assertOwner(ping, ctx);
+  const reply = await requestOwner(pi, "status", { id: ref.runId }, signal);
+  assertOwner(ping, ctx);
+  const node = snapshotNodes(reply.data).find((candidate) => candidate.id === ref.runId);
+  const expectedKind = ref.source === "workflow" ? "workflow" : "subagent";
+  if (!node || node.kind !== expectedKind)
+    throw new Error("Execution owner cannot confirm the exact Run/source");
+  return { requestId: reply.requestId, ping, data: reply.data, root: node, observedAt: Date.now() };
 }
 
 function lookupCurrent(

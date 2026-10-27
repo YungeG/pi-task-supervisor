@@ -2,10 +2,15 @@ import type { ExtensionContext } from "@earendil-works/pi-coding-agent";
 import type { RestoreJournalRead } from "./restore-journal";
 import { stripTerminalSequences } from "@earendil-works/pi-tui";
 import { currentRuntime } from "./runtime";
+import { acceptanceLayersFromCache } from "./acceptance-contract";
+import type { AdvisorUsage } from "./advisor-calls";
+import type { ManagementState } from "./management-policy";
+import { cachedProgressSummary } from "./progress-facts";
+import type { FinalReviewStateV1 } from "./final-review";
 import { goalControlIssue } from "./goal-scope";
 import { preflightTaskIssue } from "./preflight";
 import type { SupervisorState } from "./supervisor";
-import type { TaskBoardSnapshot } from "./types";
+import type { TaskBoardSnapshot, AcceptanceLayers } from "./types";
 
 export const SUPERVISOR_LIMITS = {
   tasks: 100,
@@ -30,6 +35,20 @@ export interface FlowFacts {
   }>;
   preflightIssue?: string;
   receiptIssue?: string;
+  advisorUsage?: AdvisorUsage;
+  finalReview?: Readonly<FinalReviewStateV1>;
+  progress?: ReturnType<typeof cachedProgressSummary>;
+  acceptance?: Readonly<AcceptanceLayers>;
+  management?: Readonly<{
+    mode: ManagementState["mode"];
+    state: ManagementState["state"];
+    context: "goal" | "board" | "unmanaged" | "unknown";
+    revision: number | null;
+    source: ManagementState["source"];
+    lastGoal: ManagementState["lastGoal"];
+    attention: ManagementState["attention"];
+    loadedRevision: "unknown";
+  }>;
   sessionId: string;
   idle: boolean;
   pending: boolean;
@@ -38,7 +57,8 @@ export interface FlowFacts {
 function currentGoalFacts(): FlowFacts["goal"] {
   const runtime = currentRuntime();
   const goal = runtime.goal;
-  if (!goal?.current) return undefined;
+  if (!goal?.current || (runtime.management && runtime.management.activeWorkOwner?.kind !== "goal"))
+    return undefined;
   const current = goal.current;
   return {
     sessionId: goal.sessionId,
@@ -51,25 +71,84 @@ function currentGoalFacts(): FlowFacts["goal"] {
     preflightPhase: runtime.preflight?.phase,
   };
 }
+function cachedFinalReview(ctx: ExtensionContext): FlowFacts["finalReview"] {
+  const runtime = currentRuntime(),
+    review = runtime.finalReview;
+  if (
+    !review ||
+    (runtime.management && runtime.management.activeWorkOwner?.kind !== "goal") ||
+    !runtime.supervisor ||
+    review.owner.sessionId !== ctx.sessionManager.getSessionId()
+  )
+    return undefined;
+  return review.owner.goalRunId === (runtime.goal?.current?.scope.goalRunId ?? null)
+    ? review
+    : undefined;
+}
+/** Cached presentation only: no ownership hydration, file/version capture or ledger read. */
+function legacyManagementFacts(): FlowFacts["management"] {
+  const runtime = currentRuntime();
+  const mode =
+    runtime.goal?.current || runtime.supervisor || runtime.preflight
+      ? "supervised"
+      : runtime.enabled
+        ? "tasks"
+        : "off";
+  return {
+    mode,
+    state: "active",
+    context: mode === "off" ? "unmanaged" : "unknown",
+    revision: null,
+    source: "legacy-compatible",
+    lastGoal: null,
+    attention: [],
+    loadedRevision: "unknown",
+  };
+}
+function managementFacts(): FlowFacts["management"] {
+  const selected = currentRuntime().management;
+  if (!selected) return legacyManagementFacts();
+  return {
+    mode: selected.mode,
+    state: selected.state,
+    context: selected.activeWorkOwner?.kind ?? (selected.mode === "off" ? "unmanaged" : "unknown"),
+    revision: selected.record?.data.revision ?? null,
+    source: selected.source,
+    lastGoal: selected.lastGoal,
+    attention: selected.attention,
+    loadedRevision: "unknown",
+  };
+}
 export function flowFacts(ctx: ExtensionContext, restoration?: RestoreJournalRead): FlowFacts {
   const runtime = currentRuntime();
+  const managedGoal = !runtime.management || runtime.management.activeWorkOwner?.kind === "goal";
   return {
     enabled: runtime.enabled,
     journalFault: runtime.journalFault,
     goalIssue: goalControlIssue(ctx),
     goal: currentGoalFacts(),
-    receiptIssue: runtime.receiptStore?.pendingCount
-      ? "Unknown host capture requires explicit recover and fresh validation"
-      : runtime.supervisor &&
-          (!runtime.receiptStore || runtime.receiptStore.format === 2) &&
-          runtime.supervisor.status !== "stopped"
-        ? "Legacy receipt format requires explicit recover/migration for unfinished goals"
-        : undefined,
-    preflightIssue: preflightTaskIssue(
-      ctx,
-      runtime.supervisor?.status === "stopped" ? undefined : runtime.supervisor?.preflightBinding,
-      restoration,
-    ),
+    finalReview: cachedFinalReview(ctx),
+    management: managementFacts(),
+    progress: cachedProgressSummary(),
+    acceptance: acceptanceLayersFromCache(runtime),
+    receiptIssue: !managedGoal
+      ? undefined
+      : runtime.receiptStore?.pendingCount
+        ? "Unknown host capture requires explicit recover and fresh validation"
+        : runtime.supervisor &&
+            (!runtime.receiptStore || runtime.receiptStore.format === 2) &&
+            runtime.supervisor.status !== "stopped"
+          ? "Legacy receipt format requires explicit recover/migration for unfinished goals"
+          : undefined,
+    preflightIssue: !managedGoal
+      ? undefined
+      : preflightTaskIssue(
+          ctx,
+          runtime.supervisor?.status === "stopped"
+            ? undefined
+            : runtime.supervisor?.preflightBinding,
+          restoration,
+        ),
     sessionId: ctx.sessionManager.getSessionId(),
     idle: ctx.isIdle(),
     pending: ctx.hasPendingMessages(),
@@ -136,7 +215,7 @@ function heldNextStep(
   if (board.workflowStatus === "completed" || board.tasks.length > SUPERVISOR_LIMITS.tasks)
     return "inspect and stop/re-plan; recover cannot reopen this board";
   if (state.status === "stopped") return "prepare a valid board and a new supervise <goal>";
-  return "inspect existing work, then /task-supervisor recover (resets review/continuation limits)";
+  return "inspect existing work, then /task-supervisor recover (preserves spent review/continuation budget)";
 }
 
 function preflightControlBlocker(facts: FlowFacts): string | undefined {
@@ -167,11 +246,28 @@ function decisionGateStep(
   return decisionNextStep(board, after);
 }
 
+function stoppingManagementNext(
+  board: Readonly<TaskBoardSnapshot>,
+  facts: FlowFacts,
+): string | undefined {
+  if (facts.management?.state !== "stopping-with-attention") return undefined;
+  const finish =
+    "then repeat /task-supervisor disable after actual quiescence; no recover/start or business replay";
+  if (facts.journalFault || facts.goalIssue)
+    return `Automation stopped; inspect original owner/journal before any metadata repair; ${finish}`;
+  if (board.decision)
+    return `/task-supervisor decide (original native response only, not business restart); ${finish}`;
+  if (facts.preflightIssue)
+    return `Resolve the original native preflight question with its owner; revocation alone is not an answer; ${finish}`;
+  return `Inspect exact existing writer/capture/control facts and repair metadata only; ${finish}`;
+}
 function flowBlocker(
   board: Readonly<TaskBoardSnapshot>,
   state: Readonly<SupervisorState> | undefined,
   facts: FlowFacts,
 ): string | undefined {
+  const stopping = stoppingManagementNext(board, facts);
+  if (stopping) return stopping;
   const planning = unstartedGoalNext(board, facts);
   if (planning) return planning;
   if (facts.journalFault) return "inspect journal; control recovery is disabled";
@@ -185,7 +281,7 @@ function flowBlocker(
   }
   if (!facts.idle || facts.pending)
     return "wait for the current host run/check and pending messages";
-  return undefined;
+  return finalReviewNext(board, state, facts);
 }
 
 /** Cached owner observations only: status does not perform RPC or prove process liveness. */
@@ -222,6 +318,30 @@ function unstartedGoalNext(
   return "/task-supervisor preflight (explicit same-GoalRun read-only replan), or /task-supervisor stop (end this unstarted goal)";
 }
 
+function finalReviewNext(
+  board: Readonly<TaskBoardSnapshot>,
+  state: Readonly<SupervisorState> | undefined,
+  facts: FlowFacts,
+): string | undefined {
+  const review = facts.finalReview;
+  if (
+    !review ||
+    board.workflowStatus !== "completed" ||
+    !state ||
+    ["stopped", "completed"].includes(facts.goal?.phase ?? "")
+  )
+    return undefined;
+  if (facts.receiptIssue)
+    return "inspect unknown host captures before review control; no automatic replay";
+  if (state.status === "paused" && state.holdCause === "user_pause")
+    return "/task-supervisor resume (lift the review-only human pause; business and spent limits remain closed), then retry-review";
+  if (!["active", "fault"].includes(state.status)) return undefined;
+  if (review.status === "needs_validation")
+    return "inspect applicable final-check registration via /task-supervisor retry-review; new validation only, no task/business replay";
+  if (["retryable_error", "pending", "blocked"].includes(review.status))
+    return `/task-supervisor retry-review${review.attemptId ? ` ${review.attemptId}` : ""} (same Goal, read-only review; permissions and spent budget unchanged)`;
+  return undefined;
+}
 /** Only recommends actions; an opaque execution reference never establishes liveness. */
 export function nextFlowStep(
   board: Readonly<TaskBoardSnapshot>,
@@ -275,6 +395,72 @@ function receiptStatusLines(): string[] {
       ]
     : [];
 }
+function advisorStatusLines(usage: AdvisorUsage | undefined): string[] {
+  return usage
+    ? [
+        `Advisor provider calls: ${usage.providerCalls} tracked; pending: ${usage.pendingCalls}; unknown usage: ${usage.unknownUsageCalls}; conflicts: ${usage.conflictedCalls}; untracked historical calls: ${usage.legacyCallsUnknown ? "unknown" : "none"}`,
+      ]
+    : ["Advisor provider calls: untracked/legacy (unknown); known subtotals are not full usage"];
+}
+function supervisorBudgetLine(
+  state: Readonly<SupervisorState>,
+  usage: AdvisorUsage | undefined,
+): string {
+  return `Budget: reviews ${state.reviews}/${SUPERVISOR_LIMITS.reviews}; auto continuations ${state.continuations}/${SUPERVISOR_LIMITS.continuations}; stagnant ${state.stagnant}/${SUPERVISOR_LIMITS.stagnant}; advisor known tokens ${usage?.knownTokens ?? state.tokens}; known cost ${usage?.knownCost ?? state.cost}`;
+}
+function finalReviewStatusLines(
+  board: Readonly<TaskBoardSnapshot>,
+  review: FlowFacts["finalReview"],
+): string[] {
+  if (!review) return [];
+  return [
+    `Work: ${board.workflowStatus === "completed" ? "task-complete" : "not complete"}; final review: ${review.status}${review.attemptId ? ` (${review.attemptId})` : ""}; ${review.reason}; recorded version only, current applicability is rechecked by review control`,
+  ];
+}
+export function managementStatusLines(management: FlowFacts["management"]): string[] {
+  if (!management) return [];
+  const last = management.lastGoal;
+  return [
+    `Management: ${management.mode}; ${management.state}; WorkContext: ${management.context}; mode revision ${management.revision ?? "volatile/unknown"} (${management.source})`,
+    `Loaded code revision: ${management.loadedRevision}; disk changes are not proof of a running revision`,
+    ...(last
+      ? [
+          `Last Goal: ${last.owner?.goalKey ?? "unknown"} (history only); recorded acceptance: ${last.acceptedRef ? "yes" : "not established by mode record"}; current validity: ${last.validity === "stale" ? "stale" : "needs_verification"}; not a current permission or evidence grant`,
+        ]
+      : []),
+    ...management.attention.map((issue) => `Management attention (${issue.kind}): ${issue.reason}`),
+  ];
+}
+function claimedBatchLine(claimed: Readonly<TaskBoardSnapshot["tasks"]>, facts: FlowFacts): string {
+  const label = facts.management?.mode === "off" ? "Retained tasks (history)" : "Claimed batch";
+  return `${label}: ${claimed.map((task) => task.id).join(", ") || "none"}`;
+}
+function supervisorStatusLines(
+  state: Readonly<SupervisorState> | undefined,
+  facts: FlowFacts,
+): string[] {
+  if (!state)
+    return facts.advisorUsage
+      ? [
+          "Advisor usage below belongs to retained history, not a renewed current budget",
+          `Retained known tokens ${facts.advisorUsage.knownTokens}; known cost ${facts.advisorUsage.knownCost}; unknown calls are not known zero`,
+          ...advisorStatusLines(facts.advisorUsage),
+        ]
+      : [];
+  return [
+    `Supervisor: ${state.status}${state.reason ? ` — ${state.reason}` : ""}`,
+    `Hold source: ${state.holdCause ?? "unknown"}`,
+    supervisorBudgetLine(state, facts.advisorUsage),
+    ...advisorStatusLines(facts.advisorUsage),
+  ];
+}
+export function acceptanceStatusLines(layers: Readonly<AcceptanceLayers> | undefined): string[] {
+  if (!layers) return [];
+  return [
+    `Acceptance layers: task records ${layers.taskRecords}; host bindings ${layers.hostBindings} (not revalidated by UI); contract ${layers.contract}${layers.contractId ? ` ${layers.contractId} r${layers.revision}` : ""}; model review ${layers.modelReview}`,
+    `Native manual responses: ${layers.manualResponses} physical records; current applicability unknown; person/product acceptance not inferred; definition quality needs independent review`,
+  ];
+}
 export function formatFlowStatus(
   board: Readonly<TaskBoardSnapshot>,
   state: Readonly<SupervisorState> | undefined,
@@ -283,17 +469,19 @@ export function formatFlowStatus(
   const claimed = board.tasks.filter((task) => ["implementing", "reviewing"].includes(task.status));
   const lines = [
     `Session: ${facts.enabled ? "enabled" : "disabled"}`,
+    ...managementStatusLines(facts.management),
     `Goal: ${state?.goal ?? "no supervised goal"}`,
     `Main: ${facts.idle ? "idle" : "host run busy (execution/settling)"}${facts.pending ? "; pending messages" : ""}`,
-    `Claimed batch: ${claimed.map((task) => task.id).join(", ") || "none"}`,
+    claimedBatchLine(claimed, facts),
     "Next checkpoint: native end-of-run; batch guidance only",
   ];
-  if (state)
+  lines.push(...supervisorStatusLines(state, facts));
+  lines.push(...acceptanceStatusLines(facts.acceptance));
+  if (facts.progress)
     lines.push(
-      `Supervisor: ${state.status}${state.reason ? ` — ${state.reason}` : ""}`,
-      `Hold source: ${state.holdCause ?? "unknown"}`,
-      `Budget: reviews ${state.reviews}/${SUPERVISOR_LIMITS.reviews}; auto continuations ${state.continuations}/${SUPERVISOR_LIMITS.continuations}; stagnant ${state.stagnant}/${SUPERVISOR_LIMITS.stagnant}; advisor tokens ${state.tokens}; advisor cost ${state.cost}`,
+      `Host progress: ${facts.progress.credited}/128 credited; ${facts.progress.definitions}/100 definitions; limited ${facts.progress.limited}; progress is not permission/done/acceptance`,
     );
+  lines.push(...finalReviewStatusLines(board, facts.finalReview));
   lines.push(...receiptStatusLines());
   lines.push(`External wait: ${externalWaitText(state)}`);
   if (facts.journalFault) lines.push(`Fault: ${facts.journalFault}`);

@@ -1,5 +1,6 @@
 import { appendFileSync, mkdtempSync, readFileSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
+import { execFileSync } from "node:child_process";
 import { join } from "node:path";
 import { vi } from "vitest";
 import { createMockAPI, createMockContext } from "./mocks";
@@ -22,7 +23,11 @@ export type GoalFixtureEntry = {
   data: unknown;
 };
 export async function goalFixture(
-  options: { emptyBoard?: boolean; unsupervisedLegacy?: boolean } = {},
+  options: {
+    emptyBoard?: boolean;
+    unsupervisedLegacy?: boolean;
+    gitWorkspace?: boolean | "uninitialized";
+  } = {},
 ) {
   // Mechanism simulation: real journal and installed CLI path; mocked TTY/UI, not human identity proof.
   const root = trustedCliRoots()[0];
@@ -45,6 +50,13 @@ export async function goalFixture(
     | undefined;
   const mock = createMockAPI();
   const ctx = createMockContext();
+  if (options.gitWorkspace) {
+    if (options.gitWorkspace === true)
+      execFileSync("git", ["init", "--quiet", dir], { timeout: 2000, stdio: "ignore" });
+    writeFileSync(join(dir, ".gitignore"), "session.jsonl\n");
+    writeFileSync(join(dir, "review-input.txt"), "Fixed synthetic review input\n");
+    Object.assign(ctx, { cwd: dir });
+  }
   Object.assign(ctx, { model: { provider: "faux", id: "test" } });
   Object.assign(ctx.sessionManager, {
     getSessionFile: () => path,
@@ -53,8 +65,17 @@ export async function goalFixture(
     getEntries: () => entries,
     getEntry: (id: string) => entries.find((e) => e.id === id),
     getLeafEntry: () => entries.find((e) => e.id === leaf),
+    ...(options.gitWorkspace ? { getCwd: () => dir } : {}),
   });
-  writeFileSync(path, JSON.stringify({ type: "session", version: 3, id: "test-session" }) + "\n");
+  writeFileSync(
+    path,
+    JSON.stringify({
+      type: "session",
+      version: 3,
+      id: "test-session",
+      ...(options.gitWorkspace ? { cwd: dir } : {}),
+    }) + "\n",
+  );
   mock.appendEntry.mockImplementation((customType: string, data: unknown) => {
     const fail = failure?.(customType, data);
     if (fail === "before") throw new Error("Before append");
@@ -92,7 +113,7 @@ export async function goalFixture(
     ],
     phases: [{ phase: 1, status: "active" }],
   };
-  if (options.unsupervisedLegacy) {
+  if (options.unsupervisedLegacy && !options.emptyBoard) {
     const legacy = {
       version: 1 as const,
       tasks: board.tasks.map((task) => ({ ...task, status: "done" as const })),

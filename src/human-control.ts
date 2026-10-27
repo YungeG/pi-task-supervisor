@@ -33,6 +33,7 @@ export function sessionJournalView(ctx: ExtensionContext) {
 /** Existing durable ancestry is checked before any native-history/no-owner fast path. */
 export function inspectRestorableSession(
   ctx: ExtensionContext,
+  immutable = false,
 ): ReturnType<typeof inspectSessionJournal> | undefined {
   const view = sessionJournalView(ctx);
   if (!view.path) return undefined; // Explicit in-memory sessions cannot receive new recoverable approvals.
@@ -45,7 +46,7 @@ export function inspectRestorableSession(
     if (missing && !conversation) return undefined; // Native setup-only sessions have not created a file yet.
     throw new JournalReadError("JOURNAL_UNAVAILABLE");
   }
-  return inspectSessionJournal(view);
+  return inspectSessionJournal(view, undefined, immutable);
 }
 
 /** The owner supplies its exact current state, not a model-selected storage path. */
@@ -66,7 +67,7 @@ export function captureReadbackFrame(
       (node) =>
         node.type === "custom" &&
         node.customType === snapshotType &&
-        journalDigest(ownerSnapshot(node.data)) === stateDigest,
+        journalDigest(ownerSnapshot(node.data, owner)) === stateDigest,
     );
   if (!base) throw new JournalReadError("READBACK_INVALID");
   return {
@@ -119,7 +120,7 @@ export function publishReadbackControl(
   const base = before.branch.find((node) => node.id === frame.baseSnapshotEntryId);
   if (!base || journalDigest(base.data) !== frame.baseSnapshotDigest)
     throw new JournalReadError("READBACK_INVALID");
-  requireCurrentCarrier(base.data);
+  requireCurrentCarrier(base.data, frame.owner);
   const controlType =
     frame.owner === "board" ? "continuous-tasks:event" : "continuous-tasks:preflight-control";
   const control = { ...body, humanInteraction: structuredClone(frame) };
@@ -152,6 +153,9 @@ function publishWitness(
   requireObservedAppend(ctx, "continuous-tasks:human-readback", witness);
 }
 
+/** Typed native consumers reuse the original physical witness producer only after
+ * requireNativeAnswer admission; this helper alone does not confirm an answer. */
+export { publishWitness as publishObservedNativeWitness };
 export function captureGoalReadbackFrame(
   ctx: ExtensionContext,
   requestId: string,

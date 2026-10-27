@@ -206,14 +206,14 @@ describe("continuous-tasks command", () => {
     expect(JSON.stringify(vi.mocked(ctx.ui.notify).mock.calls)).not.toContain("secret-value");
   });
 
-  it("starts an explicit supervisor goal without a model call or forged user message", async () => {
+  it("starts an explicitly selected legacy supervisor without a model call or forged user message", async () => {
     const mockAPI = createMockAPI();
     const ctx = createMockContext();
     Object.assign(ctx, { model: { provider: "faux", id: "test" } });
     registerCommands(mockAPI.api);
     setSessionScopeEnabled(false);
 
-    await commandHandler(mockAPI)("supervise Verify the approved work", ctx);
+    await commandHandler(mockAPI)("supervise-legacy Verify the approved work", ctx);
 
     expect(supervisorState()).toMatchObject({
       status: "active",
@@ -238,7 +238,7 @@ describe("continuous-tasks command", () => {
     const primary = commandHandler(mockAPI, "task-supervisor");
     const legacy = commandHandler(mockAPI);
 
-    await primary("supervise Verify alias compatibility", ctx);
+    await primary("supervise-legacy Verify alias compatibility", ctx);
     await legacy("pause maintenance", ctx);
     expect(supervisorState()).toMatchObject({
       status: "paused",

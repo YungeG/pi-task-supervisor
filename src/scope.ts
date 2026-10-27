@@ -13,25 +13,39 @@ export const TASK_TOOL_NAMES: readonly string[] = [
 ];
 
 export const PREFLIGHT_TOOL_NAME = "submit_preflight";
-const taskTools = new Set([...TASK_TOOL_NAMES, PREFLIGHT_TOOL_NAME]);
+const checkTools = ["run_check"];
+const proposalTools = ["propose_contract"];
+const taskTools = new Set([
+  ...TASK_TOOL_NAMES,
+  PREFLIGHT_TOOL_NAME,
+  ...checkTools,
+  ...proposalTools,
+]);
 
+function modePermitsTools(): boolean {
+  const mode = currentRuntime().management;
+  return !mode || mode.mode !== "off" || mode.state === "stopping-with-attention";
+}
 export function setSessionScopeEnabled(value: boolean): void {
-  currentRuntime().enabled = value;
+  currentRuntime().enabled = value && modePermitsTools();
 }
 
 export function isSessionScopeEnabled(): boolean {
-  return currentRuntime().enabled;
+  return currentRuntime().enabled && modePermitsTools();
 }
 
 export function updateActiveTools(pi: ExtensionAPI, value: boolean): void {
   const active = pi.getActiveTools().filter((name) => !taskTools.has(name));
-  const preflight = currentRuntime().preflight;
-  const planning = preflight && !preflight.started && preflight.phase !== "revoked";
+  value = value && modePermitsTools();
+  const runtime = currentRuntime(),
+    preflight = runtime.preflight;
+  const supervised = !runtime.management || runtime.management.mode === "supervised";
+  const planning = supervised && preflight && !preflight.started && preflight.phase !== "revoked";
   const selected = planning
     ? preflight.phase === "interrupted"
       ? []
-      : [PREFLIGHT_TOOL_NAME]
-    : TASK_TOOL_NAMES;
+      : [PREFLIGHT_TOOL_NAME, ...proposalTools]
+    : [...TASK_TOOL_NAMES, ...checkTools, ...proposalTools];
   pi.setActiveTools(value ? [...active, ...selected] : active);
 }
 

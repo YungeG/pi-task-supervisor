@@ -5,9 +5,21 @@ import { validDecisionSpec, type DecisionSpec } from "./decision-spec";
 import { answerBoardDecision, canReplaceBoardDecision } from "./board-human";
 import { currentRuntime } from "./runtime";
 import { goalLease } from "./goal-scope";
+import {
+  observeExecutionSettlement,
+  recordExecutionBinding,
+  recordExecutionSettlement,
+  recordExecutionResolution,
+  type ExecutionResolutionRequest,
+  confirmExecutionSnapshot,
+  registeredExecution,
+  existingExecutionMetadata,
+} from "./execution-settlement";
+import { assertLease, currentWorkOwner, readControlJournal } from "./control-journal";
 import type {
   ToolDefinition,
   ExtensionAPI,
+  ExtensionContext,
   AgentToolResult,
   Theme,
 } from "@earendil-works/pi-coding-agent";
@@ -21,7 +33,13 @@ import {
   WorkflowGateParams,
 } from "./schemas";
 import { TERMINAL_STATUSES, ACTIVE_STATUSES } from "./types";
-import type { AdvanceEdit, TaskBoardSnapshot, TaskEdit, TaskWorkflowEvent } from "./types";
+import type {
+  AdvanceEdit,
+  CompletionEvidence,
+  TaskBoardSnapshot,
+  TaskEdit,
+  TaskWorkflowEvent,
+} from "./types";
 import { writeTasks, applyEdits, compileBoard, createEmptyBoard, claimReadyTasks } from "./engine";
 import { cloneBoard, getStatusCounts, isSafeBoundedText } from "./validation";
 import {
@@ -33,8 +51,9 @@ import {
   refreshUI,
 } from "./state";
 import { preflightNotice, preflightDetailText } from "./human-presentation";
-import { loadConfig, resolvePhasePrompt } from "./config";
-import { assertObservedEvidence, bindCompletion } from "./supervisor";
+import { assertObservedEvidence, digest } from "./supervisor";
+import { checkAndSetPhaseCompletion, assertBoardCurrent, commitTaskAdvance } from "./task-advance";
+import { queueCompletionIntents } from "./completion-intents";
 import { isSessionScopeEnabled } from "./scope";
 import { submitAndPresentPreflight, type PreflightHumanResult } from "./preflight-human";
 import { SubmitPreflightParams, validPreflightSubmission } from "./preflight";
@@ -50,6 +69,9 @@ import {
 interface TaskToolDetails {
   snapshot: TaskBoardSnapshot;
   error?: string;
+  completionState?: "deferred";
+  intentIds?: string[];
+  rootIds?: string[];
 }
 
 // ── Result Helpers ──
@@ -80,46 +102,6 @@ function makeErrorResult(
  * MUTATES `afterBoard` — sets `afterBoard.pendingPhasePrompt` directly.
  * Returns void; callers must read from the mutated board.
  */
-async function checkAndSetPhaseCompletion(
-  beforePhases: TaskBoardSnapshot["phases"],
-  afterBoard: TaskBoardSnapshot,
-): Promise<void> {
-  // Find phases that were NOT completed before but ARE completed after
-  for (const afterPhase of afterBoard.phases) {
-    if (afterPhase.status !== "completed") continue;
-    const beforePhase = beforePhases.find((p) => p.phase === afterPhase.phase);
-    if (!beforePhase || beforePhase.status !== "completed") {
-      // This phase just completed
-      const config = await loadConfig();
-      const template = config.phaseCompletionPromptTemplate
-        ? resolvePhasePrompt(config.phaseCompletionPromptTemplate, afterPhase.phase)
-        : undefined;
-      if (template) {
-        afterBoard.pendingPhasePrompt = {
-          phase: afterPhase.phase,
-          message: template,
-        };
-      }
-      return; // Only handle the first newly completed phase
-    }
-  }
-}
-
-function assertBoardCurrent(
-  board: Readonly<TaskBoardSnapshot>,
-  signal: AbortSignal | undefined,
-  enabled: boolean,
-  lease: string,
-): void {
-  if (
-    signal?.aborted ||
-    goalLease() !== lease ||
-    getBoardRef() !== board ||
-    isSessionScopeEnabled() !== enabled
-  )
-    throw new Error("Task update cancelled; session or task board changed before commit");
-}
-
 // ── Shared Result Renderer ──
 
 function renderColoredBoardResult(text: string, _snapshot: TaskBoardSnapshot, theme: Theme): Text {
@@ -285,7 +267,7 @@ export function createWriteTasksTool(
               })),
           })),
         };
-        persistTaskUpdate(pi, [event], newBoard);
+        persistTaskUpdate(pi, [event], newBoard, undefined, ctx);
         refreshUI(ctx);
 
         return makeSuccessResult(
@@ -387,7 +369,7 @@ export function createEditTasksTool(
           }
           events.push(event);
         }
-        persistTaskUpdate(pi, events, newBoard);
+        persistTaskUpdate(pi, events, newBoard, undefined, ctx);
         refreshUI(ctx);
 
         const counts = getStatusCounts(newBoard);
@@ -459,7 +441,7 @@ export function createCompileTasksTool(
         assertBoardCurrent(board, signal, enabled, lease);
 
         const event: TaskWorkflowEvent = { type: "compile_tasks" };
-        persistTaskUpdate(pi, [event], newBoard);
+        persistTaskUpdate(pi, [event], newBoard, undefined, ctx);
         refreshUI(ctx);
 
         const counts = getStatusCounts(newBoard);
@@ -518,7 +500,7 @@ export function createClearTasksTool(
       emptyBoard.generation = board.generation + 1;
       const event: TaskWorkflowEvent = { type: "clear_tasks" };
       try {
-        persistTaskUpdate(pi, [event], emptyBoard);
+        persistTaskUpdate(pi, [event], emptyBoard, undefined, ctx);
         refreshUI(ctx);
         return makeSuccessResult("Board cleared.", emptyBoard);
       } catch (error) {
@@ -591,7 +573,7 @@ export function createGetReadyTasksTool(
           type: "claim_ready_tasks",
           ids: result.claimed.map((t) => t.id),
         };
-        persistTaskUpdate(pi, [event], result.board);
+        persistTaskUpdate(pi, [event], result.board, undefined, ctx);
         refreshUI(ctx);
 
         const claimedDetails = formatClaimedTaskDetails(result.claimed);
@@ -628,29 +610,6 @@ export function createGetReadyTasksTool(
 
 // ── Tool 6: advance_tasks ──
 
-function advanceEvent(
-  edit: AdvanceEdit,
-  before: TaskBoardSnapshot,
-  after: TaskBoardSnapshot,
-): TaskWorkflowEvent {
-  const original = before.tasks.find((task) => task.id === edit.id);
-  const updated = after.tasks.find((task) => task.id === edit.id);
-  if (!original || !updated) throw new Error(`Task "${edit.id}" disappeared during advance`);
-  if (original.status !== "implementing" && original.status !== "reviewing") {
-    throw new Error(`Task "${edit.id}" had invalid pre-advance status ${original.status}`);
-  }
-  if (updated.status !== "reviewing" && updated.status !== "done") {
-    throw new Error(`Task "${edit.id}" had invalid post-advance status ${updated.status}`);
-  }
-  return {
-    type: "advance_task",
-    id: edit.id,
-    from: original.status,
-    to: updated.status,
-    evidence: edit.data?.evidence,
-  };
-}
-
 export function createAdvanceTasksTool(
   pi: ExtensionAPI,
 ): ToolDefinition<typeof AdvanceTasksParams, TaskToolDetails> {
@@ -667,38 +626,40 @@ export function createAdvanceTasksTool(
       "Do not mark reviewing tasks done until review and required validation evidence are available.",
     ],
 
-    async execute(_toolCallId, params, signal, _onUpdate, ctx) {
+    async execute(toolCallId, params, signal, _onUpdate, ctx) {
       const board = getBoardRef();
-      const enabled = isSessionScopeEnabled();
-      const now = new Date().toISOString();
-      const beforePhases = board.phases.map((p) => ({ ...p }));
       const ids = params.transitions.map((transition) => transition.id);
       if (new Set(ids).size !== ids.length) {
         return makeErrorResult("Duplicate task ids in transitions", board);
       }
-      const edits: AdvanceEdit[] = params.transitions.map((transition) => ({
-        id: transition.id,
-        type: "advance" as const,
-        // SDK StringEnum uses its host TypeBox's TUnsafe; keep the existing wire contract.
-        // Runtime argument/engine/evidence validation remains unchanged below.
-        data: transition.evidence ? { evidence: transition.evidence } : undefined,
-      }));
+      const edits: AdvanceEdit[] = params.transitions.map((transition) => {
+        // The bundled SDK TypeBox can erase enum literals; bridge only at this validated boundary.
+        const evidence: unknown = transition.evidence;
+        return {
+          id: transition.id,
+          type: "advance" as const,
+          data: evidence ? { evidence: evidence as CompletionEvidence } : undefined,
+        };
+      });
 
       try {
-        for (const edit of edits) {
-          if (board.tasks.find((task) => task.id === edit.id)?.status === "reviewing")
-            assertObservedEvidence(edit.id, edit.data?.evidence);
-        }
-        const newBoard = applyEdits(board, edits, now);
-        const lease = goalLease();
-        await checkAndSetPhaseCompletion(beforePhases, newBoard);
-        assertBoardCurrent(board, signal, enabled, lease);
-
-        const events = edits.map((edit) => advanceEvent(edit, board, newBoard));
-        persistTaskUpdate(pi, events, newBoard, () => {
-          bindCompletion(pi, newBoard, ids);
-        });
-        refreshUI(ctx);
+        const deferred = queueCompletionIntents(pi, ctx, toolCallId, edits);
+        if (deferred)
+          return {
+            content: [
+              {
+                type: "text",
+                text: `Completion deferred until actual root quiescence; task remains reviewing. ${JSON.stringify({ completionState: deferred.completionState, intentIds: deferred.intentIds, rootIds: deferred.rootIds })}`,
+              },
+            ],
+            details: {
+              snapshot: board,
+              completionState: "deferred",
+              intentIds: deferred.intentIds,
+              rootIds: deferred.rootIds,
+            },
+          };
+        const newBoard = await commitTaskAdvance(pi, ctx, edits, signal);
 
         const counts = getStatusCounts(newBoard);
         const allTerminal = newBoard.tasks.every((t) => TERMINAL_STATUSES.has(t.status));
@@ -738,8 +699,9 @@ export function createAdvanceTasksTool(
 }
 
 type WorkflowGateInput = {
-  action: "wait_for_decision" | "bind_execution" | "clear_execution";
+  action: "wait_for_decision" | "bind_execution" | "clear_execution" | "resolve_execution";
   taskId?: string;
+  resolution?: ExecutionResolutionRequest;
   decision?: {
     question: string;
     whyUserOwned: string;
@@ -842,7 +804,13 @@ function bindExecution(board: Readonly<TaskBoardSnapshot>, params: WorkflowGateI
   };
 }
 
-function clearExecution(board: Readonly<TaskBoardSnapshot>, params: WorkflowGateInput): GateResult {
+async function clearExecution(
+  pi: ExtensionAPI,
+  ctx: ExtensionContext,
+  board: Readonly<TaskBoardSnapshot>,
+  params: WorkflowGateInput,
+  signal: AbortSignal | undefined,
+): Promise<GateResult> {
   const task = gateTask(board, params.taskId);
   const executionRef = requireExecutionRef(params);
   if (!task.executionRef) throw new Error(`Task "${task.id}" has no execution receipt`);
@@ -852,9 +820,31 @@ function clearExecution(board: Readonly<TaskBoardSnapshot>, params: WorkflowGate
   ) {
     throw new Error("executionRef does not match the active receipt");
   }
+  const decision = await observeExecutionSettlement(
+    pi,
+    ctx,
+    { taskId: task.id, ...executionRef },
+    signal ?? AbortSignal.timeout(4000),
+  );
+  throw new Error(decision.reason);
+}
+
+function recordedExecutionCandidate(
+  board: Readonly<TaskBoardSnapshot>,
+  params: WorkflowGateInput,
+): GateResult {
+  if (params.action === "bind_execution") return bindExecution(board, params);
+  const task = gateTask(board, params.taskId);
+  const executionRef = requireExecutionRef(params);
+  if (
+    !task.executionRef ||
+    task.executionRef.source !== executionRef.source ||
+    task.executionRef.runId !== executionRef.runId
+  )
+    throw new Error("executionRef does not match the active receipt");
   const updated = cloneBoard(board);
   const target = updated.tasks.find((candidate) => candidate.id === task.id);
-  if (!target) throw new Error(`Task "${task.id}" disappeared during update`);
+  if (!target) throw new Error("Execution task disappeared");
   target.executionRef = undefined;
   updated.generation++;
   updated.stagnantSettles = 0;
@@ -863,7 +853,53 @@ function clearExecution(board: Readonly<TaskBoardSnapshot>, params: WorkflowGate
     event: { type: "clear_execution", id: task.id, executionRef: { ...executionRef } },
   };
 }
-
+function confirmedExecutionNoOp(
+  ctx: ExtensionContext,
+  board: Readonly<TaskBoardSnapshot>,
+  params: WorkflowGateInput,
+): boolean {
+  if (params.action !== "bind_execution" && params.action !== "clear_execution") return false;
+  const task = gateTask(board, params.taskId);
+  const ref = requireExecutionRef(params);
+  currentRuntime().controlJournal = readControlJournal(ctx);
+  if (!currentWorkOwner(ctx.sessionManager.getSessionId())) return false;
+  const previous = registeredExecution(ctx, task.id, ref);
+  if (params.action === "clear_execution")
+    return !task.executionRef && !!previous?.settlement && !!previous.releasedSnapshot;
+  return (
+    task.executionRef?.source === ref.source &&
+    task.executionRef.runId === ref.runId &&
+    !!previous?.boundSnapshot &&
+    !previous.settlement
+  );
+}
+async function executeRecordedExecutionGate(
+  pi: ExtensionAPI,
+  ctx: ExtensionContext,
+  board: Readonly<TaskBoardSnapshot>,
+  params: WorkflowGateInput,
+  signal: AbortSignal | undefined,
+): Promise<void> {
+  if (confirmedExecutionNoOp(ctx, board, params)) return;
+  const candidate = recordedExecutionCandidate(board, params);
+  const ref = requireExecutionRef(params);
+  const task = gateTask(board, params.taskId);
+  const bounded = signal ?? AbortSignal.timeout(4000);
+  const lease =
+    params.action === "bind_execution"
+      ? await recordExecutionBinding(pi, ctx, board, candidate.board, task.id, ref, bounded)
+      : await recordExecutionSettlement(pi, ctx, board, candidate.board, task.id, ref, bounded);
+  assertLease(ctx, lease);
+  persistTaskUpdate(
+    pi,
+    [candidate.event],
+    candidate.board,
+    () => {
+      confirmExecutionSnapshot(ctx, candidate.board, lease);
+    },
+    ctx,
+  );
+}
 function persistWorkflowGate(pi: ExtensionAPI, result: GateResult): void {
   try {
     persistEntries(pi, result.event, result.board);
@@ -875,22 +911,149 @@ function persistWorkflowGate(pi: ExtensionAPI, result: GateResult): void {
   }
 }
 
-function applyWorkflowGate(
+async function applyWorkflowGate(
   board: Readonly<TaskBoardSnapshot>,
   params: WorkflowGateInput,
   now: string,
-): GateResult {
+  pi: ExtensionAPI,
+  ctx: ExtensionContext,
+  signal: AbortSignal | undefined,
+): Promise<GateResult> {
   switch (params.action) {
     case "wait_for_decision":
       return waitForDecision(board, params, now);
     case "bind_execution":
       return bindExecution(board, params);
     case "clear_execution":
-      return clearExecution(board, params);
+      return clearExecution(pi, ctx, board, params, signal);
+    case "resolve_execution":
+      throw new Error("Execution resolution requires confirmed physical records");
     default: {
       const unsupported: never = params.action;
       throw new Error(`Unsupported workflow gate: ${String(unsupported)}`);
     }
+  }
+}
+
+async function commitLegacyWorkflowGate(
+  pi: ExtensionAPI,
+  ctx: ExtensionContext,
+  board: Readonly<TaskBoardSnapshot>,
+  params: WorkflowGateInput,
+  now: string,
+  _signal: AbortSignal | undefined,
+): Promise<void> {
+  const runtime = currentRuntime();
+  const manager = ctx.sessionManager;
+  const enabled = isSessionScopeEnabled();
+  const lease = goalLease();
+  const contextKey = () =>
+    JSON.stringify([
+      manager.getSessionId(),
+      manager.getSessionFile(),
+      manager.getLeafId(),
+      currentRuntime().supervisor?.epoch,
+      digest(board),
+    ]);
+  const before = contextKey();
+  const result = await applyWorkflowGate(board, params, now, pi, ctx, _signal);
+  assertBoardCurrent(board, _signal, enabled, lease);
+  if (
+    runtime !== currentRuntime() ||
+    manager !== ctx.sessionManager ||
+    contextKey() !== before ||
+    runtime.journalFault
+  )
+    throw new Error("Execution gate context changed before commit; stale result discarded");
+  const owner =
+    params.action === "bind_execution" ? currentWorkOwner(manager.getSessionId()) : null;
+  persistWorkflowGate(pi, result);
+  setBoard(result.board);
+  if (params.action === "bind_execution") {
+    runtime.sessionId = manager.getSessionId();
+    (runtime.executionMemoryBindings ??= []).push({
+      sessionId: manager.getSessionId(),
+      owner,
+      taskId: gateTask(result.board, params.taskId).id,
+      executionRef: { ...requireExecutionRef(params) },
+    });
+  }
+  updateUI(ctx, result.board);
+}
+
+function workflowGateAdmission(
+  board: TaskBoardSnapshot,
+  params: WorkflowGateInput,
+  ctx: ExtensionContext,
+) {
+  const replacing = canReplaceBoardDecision(board, params);
+  const repairing =
+    currentRuntime().management?.state === "stopping-with-attention" &&
+    existingExecutionMetadata(ctx, "workflow_gate", params);
+  return { replacing, allowed: board.workflowStatus === "active" || replacing || repairing };
+}
+async function executeWorkflowGate(
+  pi: ExtensionAPI,
+  params: WorkflowGateInput,
+  _signal: AbortSignal | undefined,
+  ctx: ExtensionContext,
+): Promise<AgentToolResult<TaskToolDetails>> {
+  const board = getBoardRef();
+  const journalFault = currentRuntime().journalFault;
+  if (journalFault) return makeErrorResult(journalFault, board);
+  const { replacing, allowed } = workflowGateAdmission(board, params, ctx);
+  if (!allowed) {
+    return makeErrorResult("Workflow must be active or a complete decision replacement", board);
+  }
+  const now = new Date().toISOString();
+  try {
+    if (params.action === "resolve_execution") {
+      const task = gateTask(board, params.taskId);
+      if (!params.resolution) throw new Error("Execution resolution request is required");
+      recordExecutionResolution(pi, ctx, board, task.id, params.resolution, (refs) => {
+        assertObservedEvidence(
+          task.id,
+          {
+            summary: "Later host validation of known execution failure handling",
+            refs: refs.map((ref) => ({
+              kind: "command",
+              label: "Observed repair validation",
+              status: "passed",
+              exitCode: 0,
+              ref,
+            })),
+          },
+          ctx,
+        );
+      });
+      refreshUI(ctx);
+      return makeSuccessResult(
+        "Execution failure handling confirmed; old outcome and task status are unchanged",
+        getBoardRef(),
+      );
+    }
+    if (params.action !== "wait_for_decision" && ctx.sessionManager.getSessionFile()) {
+      await executeRecordedExecutionGate(pi, ctx, board, params, _signal);
+      refreshUI(ctx);
+      return makeSuccessResult(
+        "Execution binding/settlement confirmed; this is not business acceptance",
+        getBoardRef(),
+      );
+    }
+    await commitLegacyWorkflowGate(pi, ctx, board, params, now, _signal);
+    const status =
+      params.action === "wait_for_decision" && !replacing
+        ? await answerBoardDecision(pi, ctx, _signal)
+        : undefined;
+    return {
+      ...makeSuccessResult(
+        `Workflow gate applied: ${params.action}${status ? `; human result: ${JSON.stringify(status)}` : ""}. A native approval is not task acceptance.`,
+        getBoardRef(),
+      ),
+      ...(status?.projectionPending ? { isError: true } : {}),
+    };
+  } catch (error) {
+    return makeErrorResult(error instanceof Error ? error.message : String(error), board);
   }
 }
 
@@ -901,43 +1064,18 @@ export function createWorkflowGateTool(
     name: "workflow_gate",
     label: "Workflow Gate",
     description:
-      "Create a real user-decision gate or bind/clear an opaque subagent/workflow execution receipt. This tool never runs or resumes the external execution itself.",
+      "Create a real user-decision gate, bind/settle an opaque execution receipt, or resolve a known failed/cancelled settlement with later host validation. This tool never runs or resumes the external execution itself.",
     parameters: WorkflowGateParams,
     promptSnippet: "workflow_gate: wait for a user decision or bind an existing execution receipt",
     promptGuidelines: [
       "Use workflow_gate wait_for_decision only for a material user-owned decision after independent ready work is exhausted. Include spec version 1: authorization with scope/prohibitions, choice with exact options, or information with text/integer/date format. This is a proposal, never approval.",
       "For a legacy or rejected waiting gate submit the complete replacement with supersedes=current decision ID and the same task. Only its metadata changes; request a new native response through /task-supervisor decide, never claim chat text resolved it.",
       "Use workflow_gate bind_execution immediately after launching a writer so later continuations inspect rather than duplicate it.",
+      "clear_execution requires a trusted terminal/writer observation. resolve_execution only handles a known failed/cancelled settlement using later fresh host validation and, for superseded_success, a distinct successful binding; neither action runs, cancels or replays execution.",
     ],
 
-    async execute(_toolCallId, params, _signal, _onUpdate, ctx) {
-      const board = getBoardRef();
-      const journalFault = currentRuntime().journalFault;
-      if (journalFault) return makeErrorResult(journalFault, board);
-      const replacing = canReplaceBoardDecision(board, params);
-      if (board.workflowStatus !== "active" && !replacing) {
-        return makeErrorResult("Workflow must be active or a complete decision replacement", board);
-      }
-      const now = new Date().toISOString();
-      try {
-        const result = applyWorkflowGate(board, params, now);
-        persistWorkflowGate(pi, result);
-        setBoard(result.board);
-        updateUI(ctx, result.board);
-        const status =
-          params.action === "wait_for_decision" && !replacing
-            ? await answerBoardDecision(pi, ctx, _signal)
-            : undefined;
-        return {
-          ...makeSuccessResult(
-            `Workflow gate applied: ${params.action}${status ? `; human result: ${JSON.stringify(status)}` : ""}. A native approval is not task acceptance.`,
-            getBoardRef(),
-          ),
-          ...(status?.projectionPending ? { isError: true } : {}),
-        };
-      } catch (error) {
-        return makeErrorResult(error instanceof Error ? error.message : String(error), board);
-      }
+    execute(_toolCallId, params, signal, _onUpdate, ctx) {
+      return executeWorkflowGate(pi, params, signal, ctx);
     },
 
     renderCall(args: { action?: string }, theme) {

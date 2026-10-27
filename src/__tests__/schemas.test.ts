@@ -191,6 +191,7 @@ describe("WorkflowGateParams", () => {
       "wait_for_decision",
       "bind_execution",
       "clear_execution",
+      "resolve_execution",
     ]);
     expect((WorkflowGateParams.properties.decision as any).properties.question.maxLength).toBe(
       1000,
@@ -198,6 +199,12 @@ describe("WorkflowGateParams", () => {
     expect((WorkflowGateParams.properties.executionRef as any).properties.runId.maxLength).toBe(
       200,
     );
+    const resolution = WorkflowGateParams.properties.resolution;
+    expect(Reflect.get(resolution, "additionalProperties")).toBe(false);
+    expect(Reflect.get(resolution.properties.validationRefs, "minItems")).toBe(1);
+    expect(Reflect.get(resolution.properties.validationRefs, "maxItems")).toBe(20);
+    expect(Reflect.get(resolution.properties.settlementId, "maxLength")).toBe(100);
+    expect(resolution.properties).not.toHaveProperty("proof");
   });
 });
 

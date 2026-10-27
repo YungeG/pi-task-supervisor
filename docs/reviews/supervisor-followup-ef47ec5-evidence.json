@@ -1,0 +1,106 @@
+{
+  "baselineCommit": "ef47ec5299e321676ad6f38db8b3f02e9401f43c",
+  "recordedAt": "2026-10-24T15:32:35.738853+08:00",
+  "status": "recorded-not-fixed",
+  "method": "Production registered tool_call/execute/tool_result/agent_before_settle handlers with synthetic host context, journal adapter, executor RPC and Advisor",
+  "isolatedProbe": {
+    "cases": 7,
+    "safeBehaviorAssertionsFailed": 4,
+    "controlsAndPolicyChecksPassed": 3,
+    "repeatOutcome": "same outcome across repeated runs",
+    "modelUsageFixture": {
+      "inputTokens": 11,
+      "outputTokens": 6,
+      "totalTokens": 17,
+      "cost": 0.25
+    }
+  },
+  "existingRelatedTests": {
+    "files": 4,
+    "passed": 82
+  },
+  "observations": {
+    "FOLLOWUP_F1": {
+      "ownerState": "running",
+      "requests": ["ping", "status"],
+      "supervisor": "completed",
+      "board": "completed",
+      "executionRef": null
+    },
+    "FOLLOWUP_F2": {
+      "advisorCalls": 1,
+      "supervisor": "fault",
+      "board": "completed",
+      "deterministicAcceptance": null,
+      "recoveryNotice": "A faulted completed board cannot be reopened by recovery; stop and re-plan a new goal"
+    },
+    "FOLLOWUP_F3": {
+      "boundReceipts": 16,
+      "boundOutputBytes": 76800,
+      "packetError": "Supervisor evidence packet exceeds 64KB; narrow the plan before recovery",
+      "advisorCalls": 0,
+      "supervisor": "fault",
+      "board": "completed",
+      "deterministicAcceptance": null,
+      "recoveryNotice": "A faulted completed board cannot be reopened by recovery; stop and re-plan a new goal"
+    },
+    "FOLLOWUP_F4": {
+      "modelCalls": 1,
+      "reviews": 1,
+      "tokens": 0,
+      "cost": 0,
+      "status": "fault",
+      "reason": "Supervisor must use next_batch when no batch is claimed and ready tasks remain"
+    },
+    "FOLLOWUP_STAGNATION": {
+      "status": "paused",
+      "holdCause": "stagnant",
+      "stagnant": 3,
+      "successfulEditReceipts": 4,
+      "taskStatus": "implementing"
+    },
+    "FOLLOWUP_CODEMODE": {
+      "pendingDuringInnerValidation": 1,
+      "pendingAfterReturn": 0,
+      "epoch": 3,
+      "receipts": [
+        {
+          "id": "tool:inner-check",
+          "epoch": 2,
+          "eligible": false,
+          "exitCode": 0,
+          "ok": true
+        },
+        {
+          "id": "tool:outer-code",
+          "epoch": 1,
+          "eligible": false,
+          "exitCode": 0,
+          "ok": true
+        }
+      ]
+    }
+  },
+  "rawArtifacts": {
+    "directory": "/home/ygguo/agent-projs/agent-ext/pi-task-supervisor-worktrees/audit-fixes-artifacts/followup-review-ef47ec5",
+    "sha256": {
+      "REPORT.md": "bbdf25eeff994745b72c8e95ffb62bffb38929e4e70a0f046c18990535e9fca4",
+      "review.test.ts": "d250cbf37a4e40b9ebd3249ff4e4c1b8d19a69f06f1a6526010bc221894a1654",
+      "vitest.config.mjs": "dd13dc15241377f28ce304369e9032291d00a012b24e632dad56287cbc496ba8",
+      "smoke.log": "2d2e1c9af951e4fcbaf3f2c1b3b72f0ddf566a67f1965bfceec86c26a324e4a0",
+      "results-1.log": "ad3d538fb99d5240792991871757fa68c7b567ed80b67b3242991c2abec63dc6",
+      "results-2.log": "b55fb0e1ebd8fb22f4c487e66801e23e3b22a5396dda4dd9cf52e283c1a365a5",
+      "results-final.log": "e65e52bb42f865ce42964d8759e52036f5ea19f705512f971d707165e78d3d60",
+      "existing-tests.log": "1e805a7c07e4cfa36dbcffad8be56d16a35b39020472274b252ad0e4cdef89e8"
+    },
+    "containsNodeModules": false,
+    "replayNote": "Frozen harness/config preserve original absolute checkout and temporary paths; relocate imports/config paths before replay elsewhere. Not installed as a repository regression suite."
+  },
+  "limitations": [
+    "Synthetic executor protocol; no real worker or file-write race",
+    "Simulated final-advisor 503, not an actual network outage",
+    "Nested Code Mode callback model only; real plugin only-mode end-to-end not exercised",
+    "No independent source reviewer or production CLI/PTY acceptance"
+  ],
+  "implementationChanged": false
+}
