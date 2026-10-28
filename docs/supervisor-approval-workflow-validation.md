@@ -2,6 +2,8 @@
 
 2026-10-28。**计划内源码候选验收完成：独立只读审阅最终返回 OK，Main 已核对全部发现处置、当前验证与审阅前后身份，完成 F。** 接受范围仅为本页冻结的未提交源码候选，不包含安装、发布或真人/产品接受。无需用户操作；没有提交、安装、重载或操作业务会话。
 
+本页前文保留最初冻结候选的历史验收事实；后续手动绑约 UI 修补单独记录在[文末追加记录](#后续修补手动-review-contract-单列审核)，不沿用原候选的审阅结论。
+
 ## 候选和范围
 
 - 源码起点/当前 HEAD：`0f8f5f83e01a9db1d1e2c4662046471797897ab0`，未提交修改，仍只有 main 一个工作树。
@@ -119,3 +121,23 @@ python3 test/goal-native-smoke.py approval-preparation --out <隔离产物目录
 **Main 最终接受（F）：** 当前251文件摘要与审阅前完全一致，HEAD/单一工作树/两项受保护文件未变；再次检查实际CLI journal中的唯一批准/Start、完成状态、实际pid/close/exit与scratch清理，包的SHA-512完整性及bootstrap字节也匹配当前源码。证据为 `review-parent-identity-after-final.json`；原始完整门和最终审阅报告的SHA-256记录在该凭据中。C-ID/C-DEF/C-PREP/C-ACT/C-EVI/C-VIEW/C-WIRE的本轮要求、两个必要分支和发现处置已闭合，无已知必须完成而遗留的工作。
 
 本轮授权范围内的源码候选接受完成，后续不再自动修改或派发。仍未提交、推送、安装、重载、发布或操作业务会话；这些需要新的明确请求。真人可用性、产品/业务接受、非已声明宿主和恶意代码隔离不由本次结果推断。
+
+## 后续修补：手动 review-contract 单列审核
+
+2026-10-28，用户要求修复手动绑约可读性。此前集中审核只覆盖前置 `approval-bundle`；手动 `reviewAcceptanceContract` 没有 material，仍走旧的全文分页和“选项 1/2”弹窗。已安装新包不等于这条入口已改善，也不能用最初的 UI 测试代替此入口验收。
+
+本次以 `97a3430e2b7a16c5b2393b25553d00799ff8c9bf` 为起点修补，Main 单写者、自检，没有复用前轮独立审阅 OK 或操作被诊断的业务会话：
+
+- `acceptance-runtime.ts` 指定内部 `contract-definition` 用途，`human-ui.ts` 将其路由至原生单列 `ApprovalReview`，不再使用 legacy ordinal popup。
+- 同一审核文档持续显示 **Enter 绑定当前定义 / r 不绑定 / Esc 稍后**；不显示权限复选或建议再次 Start。未完整展示材料、取消、窗口变化或源版本过期不能绑定。
+- 范围、工作区、验收条件和通过要求先列出；身份、版本、固定执行元数据按层级字段列出而非大块 JSON。技术字段仍属于完整材料，没有裁剪或绕过阅读门。
+- 组件结果仍仅为原问题登记的私有本地选择。Host 将其映射为原有 `outcome: answer` 与“绑定此契约”/“不绑定”，不是 business approve；契约/物理见证 codec、源新鲜度、已批准范围、Start、暂停、撤销和预算语义未变。复制 DTO、错误 kind/owner/options、携带 approval 或非法/超量文本均拒绝，不退回旧弹窗。
+
+新的证据目录：`/home/ygguo/agent-artifacts/pi-task-supervisor/manual-contract-ui-20261028-hTIp7R/`。
+
+- `manual-contract-ui-red.log` 通过实际手动 review 入口复现旧路由，随后原生组件与命令回归通过。
+- `check-final.log`：`npm run check` 返回 0，**137 文件 / 3239 用例**，标准 **13 个 smoke 分支**全通过；statements **93.32%**、branches **90.05%**、functions **98.04%**、lines **95.4%**，未降低阈值或规则。中间门发现 null purpose 被误当默认值，已恢复“仅 undefined 可取默认”的拒绝边界，并重跑完整门。
+- `cli-host-1.4-manual-accepted/verified.json`：实际全局 Pi **1.4.0** CLI、真实 PTY、离线合成任务；**80×24** 未读 Enter 拒绝，Esc 稍后、r 不绑定均保持原批准及完整 supervisor 状态；重新审核完整材料，再改变真实几何为 **100×30** 后必须重新阅读；成功绑定仍保持暂停，显式 recover 后才执行。业务批准/Start 仍各一条，实际 Python check 与最终完成合格。
+- `cli-host-1.4-existing-accepted/verified.json`：原有定义的集中审核/独立 Start/实际 check/完成分支仍通过。项目 Pi 1.1 CLI 的准备分支另在 `cli-local-preparation-verified/owned-qeexbcjf/verified.json` 通过。
+
+以上是真实 CLI 下的自动按键和隔离合成任务，不是真人视觉评价、SSH 网络体验或业务接受。本次修补**尚未提交、安装或重载**；当前全局配置仍指向原 `97a3430...` 安装包，不能要求用户仅重载同包来获得此修复。原业务会话无需重建目标、重批未变权限或重复 Start。

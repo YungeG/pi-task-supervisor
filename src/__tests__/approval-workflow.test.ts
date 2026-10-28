@@ -614,18 +614,42 @@ it.each(["unsupported", "unknown-proposal", "busy", "pending"])(
     expect(h.ctx.ui.custom).toHaveBeenCalledTimes(questions);
   },
 );
+it("reviews manual contract binding in one native document with explicit actions and no ordinal popup", async () => {
+  const h = await startedNodeBundle(),
+    approved = structuredClone(currentRuntime().preflight),
+    held = structuredClone(currentRuntime().supervisor);
+  const selects = vi.mocked(h.ctx.ui.select).mock.calls.length;
+  const ui = installCustomUI(h.ctx, (driver) => {
+    const screen = driver.render();
+    expect(screen).toContain("契约定义审核");
+    expect(screen).toContain("Enter 绑定当前定义");
+    expect(screen).toContain("r 不绑定");
+    expect(screen).not.toContain("只读核对（非作答）");
+    driver.press("\r");
+    expect(driver.doneCount).toBe(0);
+    for (let page = 0; page < 1000 && !driver.render().includes("完整材料已核对"); page++)
+      driver.press("\u001b[6~");
+    driver.press("\r");
+  });
+  interfaces.push(ui);
+  const outcome = await reviewAcceptanceContract(h.mock.api, h.ctx, h.proposalId);
+  expect(outcome.status).toBe("bound");
+  const displayed = ui.rendered.join("\n");
+  expect(displayed).toContain("技术详情 · 身份与版本");
+  expect(displayed).not.toContain('owner: {"kind":');
+  expect(h.ctx.ui.select).toHaveBeenCalledTimes(selects);
+  expect(currentRuntime().preflight).toEqual(approved);
+  expect(currentRuntime().supervisor).toEqual(held);
+  expect(readControlJournal(h.ctx).acceptance?.contracts).toHaveLength(2);
+});
+
 it("records a native definition decline without replacing the original bound contract or business grant", async () => {
   const h = await startedNodeBundle(),
     before = readControlJournal(h.ctx).acceptance?.contracts;
   const approved = structuredClone(currentRuntime().preflight);
-  vi.mocked(h.ctx.ui.select).mockImplementation(
-    async (_title, options) =>
-      options.find((option) => /^选项 2(?:$| ·)/u.test(option)) ?? "稍后决定",
-  );
   const ui = installCustomUI(h.ctx, (driver) => {
-    driver.press("\u001b[B");
-    driver.press("\u001b[B");
-    driver.reviewAll();
+    expect(driver.render()).toContain("r 不绑定");
+    driver.press("r");
   });
   interfaces.push(ui);
   expect(await reviewAcceptanceContract(h.mock.api, h.ctx, h.proposalId)).toEqual({

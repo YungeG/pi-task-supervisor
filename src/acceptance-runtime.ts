@@ -889,7 +889,7 @@ export async function reviewAcceptanceContract(
     {
       frame,
       kind: "choice",
-      purpose: "business-choice",
+      purpose: "contract-definition",
       title: presentation.title,
       body,
       options: ["绑定此契约", "不绑定"],

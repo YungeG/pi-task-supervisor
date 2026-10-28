@@ -37,12 +37,15 @@ export class ApprovalReview implements Component {
   private closed = false;
   private layout?: { lines: string[]; capacity: number; pages: number };
   private message = "浏览与选择都是草稿，不产生批准。";
+  private readonly definition: boolean;
 
   constructor(
     private readonly question: NativeQuestion,
     private readonly env: UiViewEnvironment,
     private readonly done: (value: ApprovalSelection | undefined) => void,
   ) {
+    this.definition = question.purpose === "contract-definition";
+    if (this.definition) this.message = "查看材料不会绑定，也不会新增权限或执行。";
     for (const id of question.approval?.selectedIds ?? []) this.selected.add(id);
   }
   invalidate(): void {
@@ -70,6 +73,8 @@ export class ApprovalReview implements Component {
     return !!this.layout && this.shown.size === this.layout.pages;
   }
   private choices(width: number): string[] {
+    if (this.definition)
+      return [materialLine("只保存定义关联；原权限、Start 与暂停保持不变。", width)];
     const options = this.options();
     if (!options.length) return [materialLine("无额外权限；仅确认所示验收定义。", width)];
     const start = Math.min(Math.max(0, this.focus - 1), Math.max(0, options.length - 3));
@@ -78,6 +83,31 @@ export class ApprovalReview implements Component {
       const value = `${focused ? "›" : " "} [${this.selected.has(option.id) ? "x" : " "}] ${option.required ? "必需" : "可选"} ${option.label}`;
       return this.env.theme.fg(focused ? "accent" : "text", materialLine(value, width));
     });
+  }
+  private labels() {
+    if (this.definition)
+      return {
+        heading: "契约定义审核 · 不新增权限或执行",
+        choices: "本次操作的影响（不是权限审批）",
+        incomplete: "材料未完整核对，不会绑定",
+        suffix: "不代表检查通过或恢复执行",
+        actions: "Enter 绑定当前定义 | r 不绑定 | Esc 稍后",
+        help: "PgUp/PgDn 阅读 · 只绑定所示定义，不另弹选项确认",
+        unread: "请先用 PgDn 完整查看本次材料；本次没有绑定。",
+        ready: "材料已完整展示；Enter 才会绑定，尚未执行。",
+      };
+    return {
+      heading: "集中审核 · 范围与验收定义 · 尚未启动",
+      choices: "范围选择（只是草稿；完整对象和限制见上方材料）",
+      incomplete: "材料未完整核对，不会提交批准",
+      suffix: undefined,
+      actions: this.question.approval?.definitionsOnly
+        ? "Enter 确认更新定义 | r 不确认新定义 | Esc 稍后"
+        : "Enter 批准所选范围与定义 | r 拒绝本次方案 | Esc 稍后",
+      help: "↑↓ 移动选择 · 空格勾选 · a 全选必需项 · 不新增执行许可",
+      unread: "请先用 PgDn 完整查看本次材料；本次没有提交批准。",
+      ready: "材料已完整展示；选择仍是草稿，Enter 才保存决定。",
+    };
   }
   render(width: number): string[] {
     if (this.closed) return [];
@@ -108,9 +138,10 @@ export class ApprovalReview implements Component {
     const missing = this.options().filter(
       (option) => option.required && !this.selected.has(option.id),
     );
-    const status = this.reviewed() ? "完整材料已核对" : "材料未完整核对，不会提交批准";
+    const labels = this.labels();
+    const status = this.reviewed() ? "完整材料已核对" : labels.incomplete;
     return [
-      this.env.theme.fg("accent", materialLine("集中审核 · 范围与验收定义 · 尚未启动", width)),
+      this.env.theme.fg("accent", materialLine(labels.heading, width)),
       this.env.theme.bold(materialLine(this.question.title, width)),
       this.env.theme.fg(
         "muted",
@@ -118,26 +149,18 @@ export class ApprovalReview implements Component {
       ),
       ...body,
       ...Array.from({ length: capacity - body.length }, () => ""),
-      this.env.theme.fg(
-        "muted",
-        materialLine("范围选择（只是草稿；完整对象和限制见上方材料）", width),
-      ),
+      this.env.theme.fg("muted", materialLine(labels.choices, width)),
       ...choices,
       materialLine(
-        `${status} · ${missing.length ? `缺少${missing.length}项必需权限，保存后仍不启动` : "必需权限已齐，仍需独立Start"}`,
-        width,
-      ),
-      this.env.theme.fg("muted", materialLine(this.message, width)),
-      materialLine(
-        this.question.approval?.definitionsOnly
-          ? "Enter 确认更新定义 | r 不确认新定义 | Esc 稍后"
-          : "Enter 批准所选范围与定义 | r 拒绝本次方案 | Esc 稍后",
+        `${status} · ${labels.suffix ?? (missing.length ? `缺少${missing.length}项必需权限，保存后仍不启动` : "必需权限已齐，仍需独立Start")}`,
         width,
       ),
       this.env.theme.fg(
         "muted",
-        materialLine("↑↓ 移动选择 · 空格勾选 · a 全选必需项 · 不新增执行许可", width),
+        materialLine(this.reviewed() ? labels.ready : this.message, width),
       ),
+      materialLine(labels.actions, width),
+      this.env.theme.fg("muted", materialLine(labels.help, width)),
     ];
   }
   private movePage(delta: number): void {
@@ -187,7 +210,7 @@ export class ApprovalReview implements Component {
         this.complete("approve");
         return;
       }
-      this.message = "请先用 PgDn 完整查看本次材料；本次没有提交批准。";
+      this.message = this.labels().unread;
     } else return;
     this.env.requestRender();
   }

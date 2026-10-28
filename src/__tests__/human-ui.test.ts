@@ -4,6 +4,7 @@ import { realpathSync, readFileSync, statSync } from "node:fs";
 import type { ReadbackFrame } from "../human-journal";
 import { KeybindingsManager, TUI_KEYBINDINGS } from "@earendil-works/pi-tui";
 import { createMockTheme } from "./helpers/mocks";
+import { installCustomUI } from "./helpers/custom-ui";
 import {
   isTrustedLocalTui,
   requestNativeAnswer,
@@ -407,6 +408,81 @@ describe("requestNativeAnswer - positive mechanism tests", () => {
     expect(() => requireNativeAnswer(ctx, { ...answer }, question.frame)).toThrow();
   });
 
+  function contractQuestion(): NativeQuestion {
+    return {
+      kind: "choice",
+      purpose: "contract-definition",
+      title: "审核并绑定定义",
+      body: "完整条件、检查与范围；不启动执行。",
+      options: ["绑定此契约", "不绑定"],
+      frame: {
+        version: 2,
+        owner: "goal",
+        sessionId: "test-session",
+        requestId: "contract-r",
+        presentationId: "contract-p",
+        scopeDigest: "a".repeat(64),
+        baseEntryId: "contract-base",
+        baseEntryDigest: "b".repeat(64),
+      },
+    };
+  }
+  it.each([
+    ["\r", "绑定此契约"],
+    ["r", "不绑定"],
+    ["\u001b", undefined],
+  ])("maps only original manual document completion to native choice (%s)", async (key, value) => {
+    setupTrustedTui();
+    const ctx = createMockContext(),
+      question = contractQuestion();
+    const ui = installCustomUI(ctx, (driver) => driver.press(key));
+    const answer = await requestNativeAnswer(ctx, question, () => true);
+    ui.assertNoScriptErrors();
+    expect(ctx.ui.select).not.toHaveBeenCalled();
+    if (value === undefined) expect(answer).toBeUndefined();
+    else {
+      expect(answer).toMatchObject({ outcome: "answer", value });
+      expect(requireNativeAnswer(ctx, answer, question.frame)).toBe(answer);
+      expect(() => requireNativeAnswer(ctx, { ...answer }, question.frame)).toThrow();
+    }
+  });
+  it.each([
+    "wrong-kind",
+    "wrong-frame",
+    "missing-options",
+    "option-order",
+    "option-extra",
+    "approval",
+    "control",
+    "format",
+    "too-long",
+  ])("denies malformed manual contract metadata without a legacy fallback (%s)", async (kind) => {
+    setupTrustedTui();
+    const ctx = createMockContext(),
+      question: any = contractQuestion();
+    if (kind === "wrong-kind") question.kind = "authorization";
+    if (kind === "wrong-frame") question.frame = createMockFrame();
+    if (kind === "missing-options") delete question.options;
+    if (kind === "option-order") question.options.reverse();
+    if (kind === "option-extra") question.options.push("Start");
+    if (kind === "approval") question.approval = { permissions: [], selectedIds: [] };
+    if (kind === "control") question.body = "bad\u0000";
+    if (kind === "format") question.body = "bad\u200b";
+    if (kind === "too-long") question.body = "大".repeat(22000);
+    expect(await requestNativeAnswer(ctx, question, () => true)).toBeUndefined();
+    expect(ctx.ui.custom).not.toHaveBeenCalled();
+    expect(ctx.ui.select).not.toHaveBeenCalled();
+  });
+  it.each([
+    { outcome: "approve", permissionIds: [] },
+    { outcome: "answer", value: "绑定此契约" },
+  ])("does not mint a contract answer from a copied UI DTO (%j)", async (dto) => {
+    setupTrustedTui();
+    const ctx = createMockContext();
+    vi.mocked(ctx.ui.custom).mockResolvedValue(Object.freeze(dto));
+    expect(await requestNativeAnswer(ctx, contractQuestion(), () => true)).toBeUndefined();
+    expect(ctx.ui.select).not.toHaveBeenCalled();
+  });
   it("issues a private goal-frame2 archive-and-plan answer without treating it as business approval", async () => {
     setupTrustedTui();
     const ctx = createMockContext();

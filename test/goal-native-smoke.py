@@ -50,6 +50,7 @@ ansi = re.compile(rb'\x1b(?:\[[0-?]*[ -/]*[@-~]|\][^\x07]*(?:\x07|\x1b\\)|[@-Z\\
 data = bytearray(); transcript = sandbox/'terminal.log'; log = transcript.open('wb'); stage = 'startup'
 overall_deadline = time.monotonic()+150
 layout_checks = 0
+contract_ui_checks = 0
 def text():
     return ansi.sub(b'', bytes(data)).decode('utf8', 'replace')
 def receive(pattern, timeout=40):
@@ -81,9 +82,25 @@ def card_layouts():
     send('\x1bOR'); receive('A 会话卡')
     layout_checks += 1
 def answer(kind, already_selected=False):
-    global stage
+    global stage, contract_ui_checks
     stage = 'native draft and scope review '+kind
-    receive('需要你回应|只读核对|格式化浏览|集中审核')
+    receive('需要你回应|只读核对|格式化浏览|集中审核|契约定义审核')
+    if '契约定义审核' in text():
+        assert 'Enter 绑定当前定义' in text() and 'r 不绑定' in text() and 'Esc 稍后' in text()
+        assert '选项 1' not in text() and '选项 2' not in text()
+        for geometry in [None, (30,100)]:
+            if geometry:
+                fcntl.ioctl(fd,termios.TIOCSWINSZ,struct.pack('HHHH',*geometry,0,0)); os.kill(pid,signal.SIGWINCH)
+                data.clear(); receive('材料未完整核对')
+                send('\r'); receive('本次没有绑定')
+            for _ in range(128):
+                if '完整材料已核对' in text(): break
+                send('\x1b[6~'); receive(r'材料\s+\d+/\d+|完整材料已核对')
+            else: raise AssertionError('manual contract material never completed')
+        contract_ui_checks += 1
+        (sandbox/'contract-definition-complete.txt').write_text(text())
+        send('\r')
+        return
     if '集中审核' in text():
         if not already_selected and '必需权限已齐' not in text():
             send('a'); receive(r'必需权限已齐|完整材料已核对|Enter 批准')
@@ -260,7 +277,22 @@ try:
             assert prepared['board']['workflowStatus']=='inactive' and len(prepared['board']['tasks'])==1
             assert not prepared.get('acceptance',{}).get('contracts') and not (sandbox/'result.txt').exists()
             proposal_id=original['proposal']['contractProposalId']
+            stage='manual contract single document at SSH geometry'
+            fcntl.ioctl(fd,termios.TIOCSWINSZ,struct.pack('HHHH',24,80,0,0)); os.kill(pid,signal.SIGWINCH)
+            command('/task-supervisor review-contract '+proposal_id); receive('契约定义审核')
+            assert 'Enter 绑定当前定义' in text() and 'r 不绑定' in text() and 'Esc 稍后' in text()
+            (sandbox/'contract-definition-first-80x24.txt').write_text(text())
+            send('\r'); receive('本次没有绑定')
+            send('\x1b'); receive('契约仍未绑定.*deferred'); deferred_contract=probe('contract-deferred')
+            assert not deferred_contract.get('acceptance',{}).get('contracts') and not deferred_contract.get('acceptance',{}).get('contractReviews')
+            assert deferred_contract['supervisor']==prepared['supervisor'] and current_preflight(deferred_contract)['approval']==original['approval']
+            command('/task-supervisor review-contract '+proposal_id); receive('契约定义审核')
+            send('r'); receive('契约仍未绑定.*declined'); declined_contract=probe('contract-declined')
+            assert not declined_contract['acceptance']['contracts'] and len(declined_contract['acceptance']['contractReviews'])==1
+            assert declined_contract['acceptance']['contractReviews'][0]['control']['data']['value']=='不绑定'
+            assert declined_contract['supervisor']==prepared['supervisor'] and current_preflight(declined_contract)['approval']==original['approval']
             command('/task-supervisor review-contract '+proposal_id); answer('only prepared definitions')
+            assert contract_ui_checks==1
             reviewed=probe('reviewed')
             assert reviewed['supervisor']['status']=='paused'
             assert reviewed['supervisor']['reviews']==prepared['supervisor']['reviews']
@@ -301,7 +333,7 @@ try:
     verify_native_commits(final)
     raw = path.read_bytes(); assert raw.startswith(seed) and raw.endswith(b'\n')
     assert sha(settings)==before
-    report = {'result':'PASS','scenario':args.scenario,'sourceQualifiedSyntheticTaskCompletion':args.scenario.startswith('approval-'),'source':str(source),'actualCli':str(cli),'nativeSourceMocked':False,'syntheticKeystrokes':True,'businessExecutionCertified':False,'decisionLayoutChecks':layout_checks,'settingsUnchanged':True,'originalHistoryBytesUnchanged':True,'probe':final.get('probeArtifact',str(sandbox/'final.json')),'sessionFile':str(path),'transcript':str(transcript)}
+    report = {'result':'PASS','scenario':args.scenario,'sourceQualifiedSyntheticTaskCompletion':args.scenario.startswith('approval-'),'source':str(source),'actualCli':str(cli),'nativeSourceMocked':False,'syntheticKeystrokes':True,'businessExecutionCertified':False,'decisionLayoutChecks':layout_checks,'manualContractDocumentChecks':contract_ui_checks,'settingsUnchanged':True,'originalHistoryBytesUnchanged':True,'probe':final.get('probeArtifact',str(sandbox/'final.json')),'sessionFile':str(path),'transcript':str(transcript)}
     (sandbox/'verified.json').write_text(json.dumps(report,indent=2)+'\n')
     print(json.dumps(report), flush=True)
 finally:

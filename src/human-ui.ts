@@ -142,6 +142,7 @@ export interface NativeQuestion {
   readonly purpose?:
     | "authorization"
     | "business-choice"
+    | "contract-definition"
     | "first-start"
     | "information"
     | "approval-bundle";
@@ -333,25 +334,43 @@ function canonicalLaterStart(question: NativeQuestion): boolean {
   );
 }
 
+function canonicalContractDefinition(question: NativeQuestion): boolean {
+  return (
+    question.kind === "choice" &&
+    isGoalReadbackFrame(question.frame) &&
+    question.options?.length === 2 &&
+    question.options[0] === "绑定此契约" &&
+    question.options[1] === "不绑定"
+  );
+}
 function purposeFor(question: NativeQuestion): Purpose | undefined {
-  const purpose =
-    question.purpose === undefined
-      ? question.kind === "choice"
-        ? "business-choice"
-        : question.kind
-      : question.purpose;
+  // Only absent metadata selects a default; null/unknown purposes must stay invalid.
+  const defaults = {
+    choice: "business-choice",
+    authorization: "authorization",
+    information: "information",
+  } as const;
+  const purpose = question.purpose === undefined ? defaults[question.kind] : question.purpose;
   if (purpose === "approval-bundle" && question.kind === "authorization" && question.approval)
     return purpose;
-  if (purpose === "authorization" && question.kind === "authorization") return purpose;
-  if (purpose === "information" && question.kind === "information") return purpose;
-  if (purpose === "business-choice" && question.kind === "choice") return purpose;
-  if (purpose === "first-start" && question.kind === "choice" && canonicalLaterStart(question))
+  if ((purpose === "authorization" || purpose === "information") && purpose === question.kind)
     return purpose;
+  if (purpose === "business-choice" && question.kind === "choice") return purpose;
+  if (purpose === "contract-definition" && canonicalContractDefinition(question)) return purpose;
+  if (purpose === "first-start" && canonicalLaterStart(question)) return purpose;
   return undefined;
 }
 
+function validDefinitionBody(body: string): boolean {
+  return (
+    Buffer.byteLength(body, "utf8") <= 64000 &&
+    !Array.from(body).some((char) => char !== "\n" && /[\p{Cc}\p{Cf}\p{Cs}]/u.test(char))
+  );
+}
 function validDisplayMetadata(question: NativeQuestion): boolean {
   if (question.purpose === "approval-bundle" && !validApprovalMetadata(question)) return false;
+  if (question.purpose === "contract-definition" && !validDefinitionBody(question.body))
+    return false;
   if (question.approval && question.purpose !== "approval-bundle") return false;
   if (question.informationFormat !== undefined) {
     if (question.kind !== "information") return false;
@@ -511,6 +530,7 @@ function draftConfirmation(
     "business-choice": "业务选择（全文已核对）",
     information: "补充信息（全文已核对）",
     "approval-bundle": "集中审核（完整材料已核对）",
+    "contract-definition": "契约定义审核（完整材料已核对）",
   };
   let label = "确认提交所选方案";
   if (question.kind === "authorization") label = value === "Approve" ? "允许上述范围" : "不允许";
@@ -637,6 +657,10 @@ async function invokeApprovalReview(
     true,
   );
   if (!current() || !isApprovalSelection(selected, question)) return undefined;
+  if (question.purpose === "contract-definition")
+    return selected.permissionIds.length
+      ? undefined
+      : question.options?.[selected.outcome === "approve" ? 0 : 1];
   return selected.outcome === "reject" ? "Reject" : JSON.stringify(selected.permissionIds);
 }
 async function invokeLegacyQuestion(
@@ -672,7 +696,7 @@ async function invokeUI(
     if (!purpose || !validDisplayMetadata(question) || !current()) return undefined;
     await closeReadOnlyView(ctx);
     if (!current()) return undefined;
-    if (purpose === "approval-bundle")
+    if (purpose === "approval-bundle" || purpose === "contract-definition")
       return await invokeApprovalReview(ctx, question, current, signal);
     if (question.material) return await invokeDecisionCard(ctx, question, purpose, current, signal);
     return await invokeLegacyQuestion(ctx, question, purpose, current, signal);

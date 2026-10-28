@@ -5,6 +5,7 @@ import { readFileSync, writeFileSync } from "node:fs";
 import { dirname, join } from "node:path";
 import { beforeEach, expect, it, vi } from "vitest";
 import { preflightLifecycle, localProposal } from "./helpers/preflight";
+import { installCustomUI } from "./helpers/custom-ui";
 import { resetState, getBoard } from "../state";
 import { currentRuntime } from "../runtime";
 import { createSubmitPreflightTool, createWriteTasksTool, createCompileTasksTool } from "../tools";
@@ -611,23 +612,25 @@ it("does not bind a copied SDK/RPC definition-review result", async () => {
 });
 it("records a real declined definition review without manufacturing a selected contract", async () => {
   const h = await plannedFixture();
-  vi.mocked(h.ctx.ui.select).mockResolvedValue("选项 2");
+  const ui = installCustomUI(h.ctx, (driver) => driver.press("r"));
   expect(await reviewAcceptanceContract(h.mock.api, h.ctx, h.proposalId)).toEqual({
     status: "declined",
   });
+  ui.assertNoScriptErrors();
   const view = readControlJournal(h.ctx).acceptance;
   expect(view?.contractReviews[0]?.witness).toBeDefined();
   expect(view?.contracts).toHaveLength(0);
 });
 it("invalidates a native review when owned controlled bytes change before the answer is admitted", async () => {
   const h = await plannedFixture();
-  vi.mocked(h.ctx.ui.select).mockImplementation(async () => {
+  const ui = installCustomUI(h.ctx, (driver) => {
     writeFileSync(join(h.root, "input.txt"), "changed");
-    return "选项 1";
+    driver.reviewAll();
   });
   expect(await reviewAcceptanceContract(h.mock.api, h.ctx, h.proposalId)).toEqual({
     status: "deferred",
   });
+  ui.assertNoScriptErrors();
   expect(readControlJournal(h.ctx).acceptance?.contracts ?? []).toHaveLength(0);
 });
 it("versions a technical checker replacement, but does not allow deleting or changing required meaning", async () => {

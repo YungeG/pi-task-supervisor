@@ -313,7 +313,9 @@ function exactChecks(
         `  root：${exactField(check.checkerRoot ?? capture.workspace.root)}；超时：${check.timeoutMs}ms`,
         `  参数：${exactField(JSON.stringify(check.args))}`,
         exactList("  checker/config 文件", [...check.checkerFiles, ...check.configs]),
-        `  通过要求：${exactField(JSON.stringify(check.expected))}`,
+        `  通过要求：至少 ${check.expected.minTests} 项测试；不得失败或全部跳过`,
+        exactList("  必须通过的测试", check.expected.requiredCases),
+        exactList("  仅允许跳过的测试（其余不允许跳过）", check.expected.allowedSkipped),
         ...(check.tests ? [exactList("  固定测试方法", check.tests)] : []),
         ...(check.permissionId ? [`  额外执行许可：${exactField(check.permissionId)}`] : []),
         `  ${capture.pendingChecks.includes(check.checkId) ? "具体定义待准备后确认，不是受信检查器" : "现存定义已捕获；确认不代表运行通过"}`,
@@ -381,6 +383,20 @@ export function readableApprovalBundle(
     ].join("\n\n"),
   };
 }
+function exactDetail(name: string, value: unknown, depth = 0): string {
+  const prefix = "  ".repeat(depth) + exactField(name);
+  if (Array.isArray(value))
+    return value.length
+      ? `${prefix}（${value.length}项）：\n${value.map((item, index) => exactDetail(String(index + 1), item, depth + 1)).join("\n")}`
+      : `${prefix}：[]`;
+  if (value && typeof value === "object") {
+    const fields = Object.entries(value);
+    return fields.length
+      ? `${prefix}：\n${fields.map(([key, item]) => exactDetail(key, item, depth + 1)).join("\n")}`
+      : `${prefix}：{}`;
+  }
+  return `${prefix}：${exactField(value === undefined ? "未提供" : JSON.stringify(value))}`;
+}
 /** Full original fields, reorganized as a decision document; not a semantic review,
  * approval, execution result or a replacement for the exact native frame. */
 export function readableDefinitionReview(subject: ReturnType<typeof contractReviewSubject>): {
@@ -392,10 +408,12 @@ export function readableDefinitionReview(subject: ReturnType<typeof contractRevi
     ([key]) => !["originalGoal", "header", "checkDefinitions"].includes(key),
   );
   return {
-    title: "是否确认当前验收条件与具体检查定义？",
+    title: "审核并绑定当前验收定义",
     body: [
-      "需要你决定：仅绑定下面完整条件和当前实际检查定义，不新增业务权限、不首次Start，也不恢复暂停。",
+      "你现在决定：是否绑定下面这份契约定义。不会新增业务权限、再次 Start、运行检查或恢复暂停。",
       `原目标：${exactField(subject.originalGoal)}`,
+      `审核范围：${exactField(proposal.scopeId)} · 定义第 ${subject.revision} 版`,
+      `实际工作区：${exactField(subject.workspace.root)}`,
       exactList(
         "验收要求（不是结果已通过）",
         proposal.requirements.map(
@@ -427,24 +445,18 @@ export function readableDefinitionReview(subject: ReturnType<typeof contractRevi
               (file) => `${file.path} · ${file.bytes} bytes · SHA256 ${file.sha256}`,
             ),
           ),
-          exactList(
-            "固定执行元数据（不是执行证据）",
-            d.invocation
-              ? Object.entries(d.invocation).map(
-                  ([key, value]) => `${key}: ${JSON.stringify(value)}`,
-                )
-              : ["人工检查，不运行进程"],
+          exactDetail(
+            "技术详情 · 固定执行元数据（不是执行证据）",
+            d.invocation ?? "人工检查，不运行进程",
           ),
           `定义摘要：${d.definitionDigest}；环境摘要：${d.environmentDigest}`,
-          ...(d.checkerWorkspace
-            ? [`检查器实际工作区：${exactField(JSON.stringify(d.checkerWorkspace))}`]
-            : []),
+          ...(d.checkerWorkspace ? [exactDetail("检查器实际工作区", d.checkerWorkspace)] : []),
         ].join("\n"),
       ),
-      exactList(
-        "身份与版本详情（供诊断，不要求你选择schema）",
-        identity.map(([key, value]) => `${key}: ${JSON.stringify(value)}`),
-      ),
+      [
+        "技术详情 · 身份与版本（仅供核对，不是额外选择）",
+        ...identity.map(([key, value]) => exactDetail(key, value)),
+      ].join("\n"),
     ].join("\n\n"),
   };
 }

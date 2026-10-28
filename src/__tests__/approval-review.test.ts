@@ -11,7 +11,7 @@ const down = "\u001b[B",
   next = "\u001b[6~",
   previous = "\u001b[5~",
   enter = "\r";
-function fixture(definitionsOnly = false, permissions = 5) {
+function fixture(definitionsOnly = false, permissions = 5, contract = false) {
   const theme = createMockTheme();
   vi.mocked(theme.fg).mockImplementation((_color, value) => value);
   vi.mocked(theme.bold).mockImplementation((value) => value);
@@ -22,7 +22,7 @@ function fixture(definitionsOnly = false, permissions = 5) {
     requestRender: vi.fn(),
     keybindings: new KeybindingsManager(),
   };
-  const question: NativeQuestion = {
+  const bundle: NativeQuestion = {
     kind: "authorization",
     purpose: "approval-bundle",
     title: "明确范围与定义",
@@ -47,6 +47,25 @@ function fixture(definitionsOnly = false, permissions = 5) {
       definitionsOnly,
     },
   };
+  const question: NativeQuestion = contract
+    ? {
+        ...bundle,
+        kind: "choice",
+        purpose: "contract-definition",
+        approval: undefined,
+        options: ["绑定此契约", "不绑定"],
+        frame: {
+          version: 2,
+          owner: "goal",
+          sessionId: "owned",
+          requestId: "r",
+          presentationId: "p",
+          scopeDigest: "a".repeat(64),
+          baseEntryId: "base",
+          baseEntryDigest: "b".repeat(64),
+        },
+      }
+    : bundle;
   const done = vi.fn();
   const card = new ApprovalReview(question, env, done);
   const render = (width = 80) => card.render(width).join("\n");
@@ -172,6 +191,44 @@ it("only defers a defensive empty metadata view; it does not synthesize a native
   card.handleInput("\u001b");
   expect(done).toHaveBeenCalledWith(undefined);
 });
+it("keeps the manual contract document readable at SSH geometry and invalidates completion on resize", () => {
+  const h = fixture(false, 0, true);
+  const first = h.render();
+  expect(first).toContain("契约定义审核");
+  expect(first).toContain("Enter 绑定当前定义 | r 不绑定 | Esc 稍后");
+  expect(first).not.toContain("[ ]");
+  expect(first).not.toContain("仍需独立Start");
+  h.card.handleInput(enter);
+  expect(h.done).not.toHaveBeenCalled();
+  h.card.handleInput("a");
+  h.card.handleInput(" ");
+  h.readAll();
+  expect(h.render()).not.toContain("请先用 PgDn");
+  expect(h.render()).toContain("Enter 才会绑定");
+  expect(h.card.render(80).length).toBeLessThanOrEqual(24);
+  expect(h.card.render(80).every((line) => visibleWidth(line) <= 80)).toBe(true);
+  h.rows(18);
+  expect(h.render(60)).toContain("材料未完整核对");
+  h.card.handleInput(enter);
+  expect(h.done).not.toHaveBeenCalled();
+  h.readAll(60);
+  h.card.handleInput(enter);
+  const selection = h.done.mock.calls[0]?.[0];
+  expect(selection).toEqual({ outcome: "approve", permissionIds: [] });
+  expect(isApprovalSelection(selection, h.question)).toBe(true);
+  expect(() => requireNativeAnswer(createMockContext(), selection, h.question.frame)).toThrow();
+});
+it.each(["r", "\u001b"])(
+  "does not bind or claim approval on manual contract rejection/deferral (%s)",
+  (key) => {
+    const h = fixture(false, 0, true);
+    h.render();
+    h.card.handleInput(key);
+    if (key === "r")
+      expect(h.done.mock.calls[0]?.[0]).toEqual({ outcome: "reject", permissionIds: [] });
+    else expect(h.done).toHaveBeenCalledWith(undefined);
+  },
+);
 it("supports no extra permissions without creating a NativeAnswer", () => {
   const h = fixture(false, 0);
   expect(h.render()).toContain("无额外权限");
