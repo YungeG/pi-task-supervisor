@@ -57,6 +57,14 @@ export interface TaskRuntime {
   receiptPersistence: "legacy-v1" | "ledger" | undefined;
   preflight: PreflightState | undefined;
   preflightRepair?: ProjectionRepairHint;
+  /** Last failed actual definition check. Display-only; never a grant or current version proof. */
+  preflightDefinitionBlock?: {
+    preflightId: string;
+    planDigest: string;
+    controlEntryId: string;
+    kind: "definitions" | "materials" | "scope";
+    reason: string;
+  };
   boardRepair?: ProjectionRepairHint;
   journalFault: string | undefined;
   humanEpoch: number;

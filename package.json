@@ -27,6 +27,7 @@
   },
   "files": [
     "src/**/*.ts",
+    "src/python-unittest-bootstrap.py",
     "!src/__tests__/**",
     "docs/",
     "README.md",

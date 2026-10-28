@@ -2,6 +2,7 @@ import type { ExtensionContext } from "@earendil-works/pi-coding-agent";
 import { RestoreReadInvalidated, type RestoreJournalRead } from "./restore-journal";
 import { stripTerminalSequences } from "@earendil-works/pi-tui";
 import { currentRuntime } from "./runtime";
+import { PREFLIGHT_ASSOCIATION_FAULT } from "./approval-bundle";
 import {
   flowFacts,
   nextFlowStep,
@@ -123,7 +124,14 @@ function summaryInput(
     if (preflight?.sessionId === scope.sessionId)
       preflightDisplay = preflightSummary(
         preflight,
-        repairs.preflight ? "repair" : facts.journalFault ? "fault" : undefined,
+        repairs.preflight
+          ? "repair"
+          : facts.journalFault === PREFLIGHT_ASSOCIATION_FAULT
+            ? "association"
+            : facts.journalFault
+              ? "fault"
+              : undefined,
+        facts.approval,
       );
   } catch {
     facts.journalFault ??= "执行前展示用 owner 说明未知，请查看状态。";

@@ -1,10 +1,9 @@
 import { afterEach, beforeEach, expect, it, vi } from "vitest";
 import { rmSync } from "node:fs";
-import { goalFixture } from "./helpers/goal";
-import { localProposal } from "./helpers/preflight";
+import type { goalFixture } from "./helpers/goal";
+import { retainedGoalApprovalFixture } from "./helpers/goal";
 import { resetState } from "../state";
 import { currentRuntime } from "../runtime";
-import { submitAndPresentPreflight } from "../preflight-human";
 import { currentPreflightRequestIssue } from "../preflight";
 import { wrapGoalSnapshot, type GoalStateRecord } from "../goal-records";
 import { readGoalJournal } from "../goal-journal";
@@ -39,18 +38,10 @@ function expectOnlyStopAttention(f: Awaited<ReturnType<typeof goalFixture>>, wri
   expect(currentRuntime().management?.attention.some((item) => item.kind === "control")).toBe(true);
 }
 async function approved() {
-  const f = await goalFixture();
+  const f = await retainedGoalApprovalFixture();
   fixtures.push(f);
-  await f.command("supervise Current request closure");
-  vi.mocked(f.ctx.ui.select).mockResolvedValue("允许上述范围");
-  await submitAndPresentPreflight(
-    f.api,
-    f.ctx,
-    "initial-proposal",
-    currentRuntime().preflight!.preflightId,
-    localProposal,
-  );
   expect(currentRuntime().preflight?.phase).toBe("approved");
+  expect(currentRuntime().supervisor).toBeUndefined();
   return f;
 }
 it.each([

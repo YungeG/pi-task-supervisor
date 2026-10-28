@@ -1,5 +1,8 @@
 import { Type, type Static } from "typebox";
 import { Check } from "typebox/value";
+import { isAbsolute, resolve } from "node:path";
+import type { CheckerScope } from "./artifact-version";
+import { validPythonTestMethod } from "./check-profile";
 const strict = { additionalProperties: false } as const;
 const text = (maxLength: number) => Type.String({ minLength: 1, maxLength });
 const identifiers = () => Type.Array(text(100), { minItems: 1, maxItems: 16, uniqueItems: true });
@@ -15,6 +18,14 @@ export const CheckExpectationSchema = Type.Object(
   },
   strict,
 );
+export const CheckerScopeSchema = Type.Object(
+  {
+    checkId: text(100),
+    root: text(4096),
+    inputs: Type.Array(text(4096), { minItems: 1, maxItems: 32, uniqueItems: true }),
+  },
+  strict,
+);
 const checkIdentity = { checkId: text(100), requirementIds: identifiers() };
 const automatic = Type.Object(
   {
@@ -24,8 +35,12 @@ const automatic = Type.Object(
     checkerFiles: Type.Array(text(4096), { minItems: 1, maxItems: 32, uniqueItems: true }),
     configs: Type.Array(text(4096), { maxItems: 32, uniqueItems: true }),
     args: Type.Array(Type.String({ maxLength: 1000 }), { maxItems: 64 }),
-    timeoutMs: Type.Integer({ minimum: 1, maximum: 30000 }),
+    timeoutMs: Type.Integer({ minimum: 1, maximum: 120000 }),
     expected: CheckExpectationSchema,
+    runtime: Type.Optional(Type.Literal("python-unittest-v1")),
+    tests: Type.Optional(Type.Array(text(200), { minItems: 1, maxItems: 32, uniqueItems: true })),
+    checkerRoot: Type.Optional(text(4096)),
+    permissionId: Type.Optional(text(64)),
   },
   strict,
 );
@@ -104,9 +119,60 @@ function completeCheck(
     files.length <= 32 &&
     new Set(files).size === files.length &&
     check.checkerFiles.includes(check.script) &&
-    files.every((path) => proposal.inputs.includes(path)) &&
+    files.every(proposalPath) &&
+    (check.checkerRoot
+      ? exactCheckerRoot(check.checkerRoot)
+      : files.every((path) => proposal.inputs.includes(path))) &&
+    validExecutionProfile(check) &&
     check.args.every((arg) => !/[\p{Cc}\p{Cf}\p{Cs}]/u.test(arg))
   );
+}
+function validExecutionProfile(check: AutomaticCheckProposal): boolean {
+  if ((check.runtime || check.checkerRoot) && !check.permissionId) return false;
+  return check.runtime ? validPythonCheck(check) : !check.tests && check.timeoutMs <= 30000;
+}
+function exactCheckerRoot(root: string): boolean {
+  return isAbsolute(root) && resolve(root) === root && !/[\p{Cc}\p{Cf}\p{Cs}]/u.test(root);
+}
+function validPythonCheck(check: AutomaticCheckProposal): boolean {
+  const module = check.script.replace(/\.py$/, "").replaceAll("/", "."),
+    tests = check.tests;
+  if (!tests?.length) return false;
+  return (
+    check.script.endsWith(".py") &&
+    check.args.length === 0 &&
+    check.expected.minTests <= tests.length &&
+    [...check.expected.requiredCases, ...check.expected.allowedSkipped].every((id) =>
+      tests.includes(id),
+    ) &&
+    tests.every((id) => validPythonTestMethod(module, id))
+  );
+}
+/** Pure role inventory, not permission or a capture. The host supplies the actual product root. */
+export function checkerScopeInventory(
+  root: string,
+  inputs: readonly string[],
+  checks: readonly AcceptanceProposal["checks"][number][],
+): { checkerScopes: CheckerScope[]; inputs: string[] } {
+  const checkerScopes = checks
+    .filter((check): check is AutomaticCheckProposal => check.kind === "automatic")
+    .map((check) => ({
+      checkId: check.checkId,
+      root: check.checkerRoot ?? root,
+      inputs: [...check.checkerFiles, ...check.configs].sort(),
+    }))
+    .sort((a, b) => (a.checkId < b.checkId ? -1 : a.checkId > b.checkId ? 1 : 0));
+  return { checkerScopes, inputs: productScopeInputs(root, inputs, checkerScopes) };
+}
+export function productScopeInputs(
+  root: string,
+  inputs: readonly string[],
+  scopes: readonly CheckerScope[],
+): string[] {
+  const local = new Set(
+    scopes.filter((check) => check.root === root).flatMap((check) => check.inputs),
+  );
+  return inputs.filter((path) => !local.has(path));
 }
 /** Untrusted normalization only. No trust/owner/grant/result field is accepted. The native
  * binder must still capture actual file/profile bytes and verify original context. */

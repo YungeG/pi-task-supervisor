@@ -1,7 +1,8 @@
 import type { ExtensionContext } from "@earendil-works/pi-coding-agent";
 import type { RestoreJournalRead } from "./restore-journal";
 import { stripTerminalSequences } from "@earendil-works/pi-tui";
-import { currentRuntime } from "./runtime";
+import { currentRuntime, type TaskRuntime } from "./runtime";
+import type { PreflightState } from "./preflight";
 import { acceptanceLayersFromCache } from "./acceptance-contract";
 import type { AdvisorUsage } from "./advisor-calls";
 import type { ManagementState } from "./management-policy";
@@ -9,6 +10,12 @@ import { cachedProgressSummary } from "./progress-facts";
 import type { FinalReviewStateV1 } from "./final-review";
 import { goalControlIssue } from "./goal-scope";
 import { preflightTaskIssue } from "./preflight";
+import {
+  approvalAction,
+  PREFLIGHT_ASSOCIATION_FAULT,
+  type ApprovalAction,
+} from "./approval-bundle";
+import { executionActivityIssue } from "./control-journal";
 import type { SupervisorState } from "./supervisor";
 import type { TaskBoardSnapshot, AcceptanceLayers } from "./types";
 
@@ -34,6 +41,8 @@ export interface FlowFacts {
     preflightPhase?: string;
   }>;
   preflightIssue?: string;
+  approval?: Readonly<ApprovalAction>;
+  activityIssue?: string;
   receiptIssue?: string;
   advisorUsage?: AdvisorUsage;
   finalReview?: Readonly<FinalReviewStateV1>;
@@ -119,6 +128,57 @@ function managementFacts(): FlowFacts["management"] {
     loadedRevision: "unknown",
   };
 }
+/** Bounded resident projection only. Does not scan/hydrate, capture files or grant authority. */
+function currentApprovalState(runtime: TaskRuntime, sessionId: string) {
+  const state = runtime.preflight;
+  if (
+    state?.sessionId !== sessionId ||
+    (runtime.management && runtime.management.mode !== "supervised") ||
+    (state.started && runtime.management && runtime.management.activeWorkOwner?.kind !== "goal") ||
+    (runtime.goal?.current && runtime.goal.current.planning.preflightId !== state.preflightId)
+  )
+    return;
+  return state;
+}
+function matchingDefinitionBlock(
+  state: PreflightState,
+  block: TaskRuntime["preflightDefinitionBlock"],
+) {
+  if (state.version !== 2 || !block) return;
+  return block.preflightId === state.preflightId &&
+    block.planDigest === state.planDigest &&
+    block.controlEntryId === state.definitionApproval?.controlEntryId
+    ? block
+    : undefined;
+}
+export function cachedApprovalAction(sessionId: string): ApprovalAction | undefined {
+  const runtime = currentRuntime(),
+    state = currentApprovalState(runtime, sessionId);
+  if (!state) return;
+  const block = matchingDefinitionBlock(state, runtime.preflightDefinitionBlock);
+  const action = approvalAction(
+    state,
+    Boolean(acceptanceLayersFromCache(runtime).contractId),
+    block !== undefined,
+  );
+  if (!action || !block) return action;
+  if (block.kind === "materials")
+    return {
+      kind: "materials",
+      actor: "Main",
+      proposalId: state.proposal?.contractProposalId,
+      effect: `真实输入/能力材料暂不可用；Main 先核对并补齐，不请求 Start，也不因此重批业务权限。${block.reason}`,
+    };
+  if (block.kind === "scope")
+    return {
+      kind: "permissions",
+      actor: "user",
+      proposalId: state.proposal?.contractProposalId,
+      command: `/task-supervisor approve ${state.planId} ${state.approval?.permissionIds.join(",") || "none"}`,
+      effect: "工作区身份已改变；仅定义审核不能延展旧业务许可，需要明确的新范围确认，仍不启动。",
+    };
+  return action;
+}
 export function flowFacts(ctx: ExtensionContext, restoration?: RestoreJournalRead): FlowFacts {
   const runtime = currentRuntime();
   const managedGoal = !runtime.management || runtime.management.activeWorkOwner?.kind === "goal";
@@ -131,6 +191,10 @@ export function flowFacts(ctx: ExtensionContext, restoration?: RestoreJournalRea
     management: managementFacts(),
     progress: cachedProgressSummary(),
     acceptance: acceptanceLayersFromCache(runtime),
+    approval: cachedApprovalAction(ctx.sessionManager.getSessionId()),
+    activityIssue: managedGoal
+      ? executionActivityIssue(ctx.sessionManager.getSessionId())
+      : undefined,
     receiptIssue: !managedGoal
       ? undefined
       : runtime.receiptStore?.pendingCount
@@ -261,6 +325,15 @@ function stoppingManagementNext(
     return `Resolve the original native preflight question with its owner; revocation alone is not an answer; ${finish}`;
   return `Inspect exact existing writer/capture/control facts and repair metadata only; ${finish}`;
 }
+function journalNext(facts: FlowFacts): string {
+  return facts.journalFault === PREFLIGHT_ASSOCIATION_FAULT &&
+    facts.idle &&
+    !facts.pending &&
+    !facts.receiptIssue &&
+    !facts.activityIssue
+    ? "user: /task-supervisor repair-preflight — 只精确修复已确认定义的关联；不重批、不 Start、不派发，原暂停与预算保留"
+    : "inspect journal; control recovery is disabled";
+}
 function flowBlocker(
   board: Readonly<TaskBoardSnapshot>,
   state: Readonly<SupervisorState> | undefined,
@@ -270,10 +343,12 @@ function flowBlocker(
   if (stopping) return stopping;
   const planning = unstartedGoalNext(board, facts);
   if (planning) return planning;
-  if (facts.journalFault) return "inspect journal; control recovery is disabled";
+  if (facts.journalFault) return journalNext(facts);
   if (facts.goalIssue) return `inspect goal lifecycle: ${facts.goalIssue}`;
   if (!facts.enabled) return "/task-supervisor enable (tools only), then recheck status";
   if (state && state.sessionId !== facts.sessionId) return "inspect foreign supervisor identity";
+  const approval = approvalNext(board, state, facts);
+  if (approval) return approval;
   const preflight = preflightControlBlocker(facts);
   if (preflight) return preflight;
   if (board.decision || board.workflowStatus === "waiting_for_decision") {
@@ -311,6 +386,8 @@ function unstartedGoalNext(
   if (goal.phase === "stopped" && goal.closedUnstarted)
     return "/task-supervisor supervise <new goal> (archive stopped history; independent new permissions/start)";
   if (!["planning", "planning-interrupted"].includes(goal.phase)) return undefined;
+  const approval = approvalNext(board, undefined, facts);
+  if (approval) return approval;
   if (goal.preflightPhase === "approved")
     return "/task-supervisor start (separate native first-start; approval alone does not execute)";
   if (goal.hasProposal)
@@ -318,6 +395,55 @@ function unstartedGoalNext(
   return "/task-supervisor preflight (explicit same-GoalRun read-only replan), or /task-supervisor stop (end this unstarted goal)";
 }
 
+function approvalControlNext(
+  board: Readonly<TaskBoardSnapshot>,
+  state: Readonly<SupervisorState> | undefined,
+  facts: FlowFacts,
+): string | undefined {
+  if (board.decision || board.workflowStatus === "waiting_for_decision")
+    return decisionGateStep(board, state);
+  if (facts.activityIssue || facts.receiptIssue)
+    return `先检查未闭合/未知执行：${facts.activityIssue ?? facts.receiptIssue}；不得自动重派或补授权`;
+  if (!facts.idle || facts.pending || state?.pending)
+    return "等待当前宿主调用与消息实际结束；不自动重放批准或 Start";
+  return undefined;
+}
+function preparationNext(
+  board: Readonly<TaskBoardSnapshot>,
+  state: Readonly<SupervisorState> | undefined,
+  action: Readonly<ApprovalAction>,
+): string | undefined {
+  if (
+    state?.status === "paused" &&
+    !board.finalAcceptanceTaskId &&
+    board.tasks.every((task) => task.status === "draft")
+  )
+    return `user: ${action.laterCommand} — 检查准备是否就绪，仅审核具体定义；既有暂停不变，其他门仍有效`;
+  if (state?.status === "fault")
+    return `${heldNextStep(board, state)}；仅回到已批准备，不跳过定义审核`;
+  return undefined;
+}
+function approvalNext(
+  board: Readonly<TaskBoardSnapshot>,
+  state: Readonly<SupervisorState> | undefined,
+  facts: FlowFacts,
+): string | undefined {
+  const action = facts.approval;
+  if (
+    !action ||
+    action.kind === "bound" ||
+    ["stopped", "completed"].includes(facts.goal?.phase ?? "") ||
+    (facts.goal?.phase === "fault" && action.kind !== "association")
+  )
+    return;
+  const blocker = approvalControlNext(board, state, facts);
+  if (blocker) return blocker;
+  if (action.kind === "preparing") {
+    const preparing = preparationNext(board, state, action);
+    if (preparing) return preparing;
+  }
+  return `${action.actor}: ${action.command ? action.command + " — " : ""}${action.effect}${action.laterCommand ? ` 完成准备后：${action.laterCommand}` : ""}`;
+}
 function finalReviewNext(
   board: Readonly<TaskBoardSnapshot>,
   state: Readonly<SupervisorState> | undefined,

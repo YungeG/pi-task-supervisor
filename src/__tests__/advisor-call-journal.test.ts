@@ -1,8 +1,7 @@
 import { expect, it, vi } from "vitest";
 import { readFileSync, rmSync } from "node:fs";
 import { fauxAssistantMessage } from "@earendil-works/pi-ai";
-import { goalFixture } from "./helpers/goal";
-import { localProposal } from "./helpers/preflight";
+import { goalFixture, completeGoalProposal } from "./helpers/goal";
 import { submitAndPresentPreflight } from "../preflight-human";
 import { currentRuntime } from "../runtime";
 import { resetState } from "../state";
@@ -11,7 +10,7 @@ import { advisorUsageFor, beginAdvisorCall, observeAdvisorCall } from "../adviso
 
 async function context() {
   resetState();
-  const f = await goalFixture();
+  const f = await goalFixture({ gitWorkspace: true });
   vi.mocked(f.ctx.ui.select).mockResolvedValue("确认提交所选方案");
   await f.command("supervise Synthetic accounting protocol");
   await f.fire("agent_start");
@@ -21,7 +20,7 @@ async function context() {
     f.ctx,
     "call-proposal",
     currentRuntime().preflight!.preflightId,
-    localProposal,
+    await completeGoalProposal(f),
   );
   await f.fire("agent_settled", { type: "agent_settled", aborted: false });
   vi.mocked(f.ctx.ui.select).mockResolvedValue("开始执行");

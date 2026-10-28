@@ -9,6 +9,12 @@ import { materialLine, type HumanMaterial } from "./human-material-view";
 import { suspendTaskWidget } from "./board-ui";
 import { closeReadOnlyView } from "./ui-view-lifecycle";
 import { DecisionCard, isDecisionDraft, type DecisionDraft } from "./human-decision-card";
+import {
+  ApprovalReview,
+  isApprovalSelection,
+  type ApprovalOption,
+  type ApprovalSelection,
+} from "./approval-review";
 import type { UiViewEnvironment } from "./ui-environment";
 import type { Component } from "@earendil-works/pi-tui";
 import { visibleWidth, truncateToWidth, stripTerminalSequences } from "@earendil-works/pi-tui";
@@ -133,7 +139,17 @@ export interface NativeQuestion {
   readonly displayOptions?: readonly string[];
   readonly informationValidator?: (value: string) => boolean;
   /** Display-only metadata; never grants authority or replaces the owner validator. */
-  readonly purpose?: "authorization" | "business-choice" | "first-start" | "information";
+  readonly purpose?:
+    | "authorization"
+    | "business-choice"
+    | "first-start"
+    | "information"
+    | "approval-bundle";
+  readonly approval?: Readonly<{
+    permissions: readonly ApprovalOption[];
+    selectedIds: readonly string[];
+    definitionsOnly?: boolean;
+  }>;
   readonly informationFormat?: "text" | "integer" | "date";
 }
 
@@ -240,6 +256,7 @@ function cloneQuestion(question: NativeQuestion): NativeQuestion {
     displayOptions: question.displayOptions ? [...question.displayOptions] : undefined,
     informationValidator: question.informationValidator,
     purpose: question.purpose,
+    approval: question.approval ? structuredClone(question.approval) : undefined,
     informationFormat: question.informationFormat,
   };
 }
@@ -280,7 +297,10 @@ async function performNativeInteraction(
   if (!isCurrent() || signal?.aborted) return undefined;
 
   // Map result to answer
-  const answer = mapResultToAnswer(question.kind, result, question.options);
+  const answer =
+    question.purpose === "approval-bundle"
+      ? approvalAnswer(result, question)
+      : mapResultToAnswer(question.kind, result, question.options);
   if (!answer) return undefined;
 
   // Register answer with metadata
@@ -320,6 +340,8 @@ function purposeFor(question: NativeQuestion): Purpose | undefined {
         ? "business-choice"
         : question.kind
       : question.purpose;
+  if (purpose === "approval-bundle" && question.kind === "authorization" && question.approval)
+    return purpose;
   if (purpose === "authorization" && question.kind === "authorization") return purpose;
   if (purpose === "information" && question.kind === "information") return purpose;
   if (purpose === "business-choice" && question.kind === "choice") return purpose;
@@ -329,6 +351,8 @@ function purposeFor(question: NativeQuestion): Purpose | undefined {
 }
 
 function validDisplayMetadata(question: NativeQuestion): boolean {
+  if (question.purpose === "approval-bundle" && !validApprovalMetadata(question)) return false;
+  if (question.approval && question.purpose !== "approval-bundle") return false;
   if (question.informationFormat !== undefined) {
     if (question.kind !== "information") return false;
     if (!["text", "integer", "date"].includes(question.informationFormat)) return false;
@@ -395,39 +419,51 @@ async function questionView<T>(
     env: UiViewEnvironment,
     done: (value: T | undefined) => void,
   ) => Component & { dispose(): void },
+  expanded = false,
 ): Promise<T | undefined> {
   if (!current()) return undefined;
   let component: (Component & { dispose(): void }) | undefined;
   let abort: (() => void) | undefined;
   const completion: { done: boolean; value: T | undefined } = { done: false, value: undefined };
   try {
-    const result = await ctx.ui.custom<T | undefined>((tui, theme, keybindings, done) => {
-      const validBeforeFactory = current();
-      const finish = (value: T | undefined) => {
-        if (completion.done) return;
-        completion.done = true;
-        completion.value = value;
-        done(value);
-      };
-      component = create(
-        {
-          theme,
-          keybindings,
-          requestRender: () => {
-            tui.requestRender();
+    const result = await ctx.ui.custom<T | undefined>(
+      (tui, theme, keybindings, done) => {
+        const validBeforeFactory = current();
+        const finish = (value: T | undefined) => {
+          if (completion.done) return;
+          completion.done = true;
+          completion.value = value;
+          done(value);
+        };
+        component = create(
+          {
+            theme,
+            keybindings,
+            requestRender: () => {
+              tui.requestRender();
+            },
+            rows: () =>
+              Math.max(
+                0,
+                expanded
+                  ? Math.floor(tui.terminal.rows * 0.9) - 2
+                  : tui.terminal.rows - HOST_CHROME_ROWS,
+              ),
           },
-          rows: () => Math.max(0, tui.terminal.rows - HOST_CHROME_ROWS),
-        },
-        finish,
-      );
-      abort = () => {
-        component?.dispose();
-        finish(undefined);
-      };
-      signal?.addEventListener("abort", abort, { once: true });
-      if (!validBeforeFactory || !current()) abort();
-      return component;
-    });
+          finish,
+        );
+        abort = () => {
+          component?.dispose();
+          finish(undefined);
+        };
+        signal?.addEventListener("abort", abort, { once: true });
+        if (!validBeforeFactory || !current()) abort();
+        return component;
+      },
+      expanded
+        ? { overlay: true, overlayOptions: { width: "95%", maxHeight: "90%", anchor: "center" } }
+        : undefined,
+    );
     return current() && completion.done && result === completion.value
       ? completion.value
       : undefined;
@@ -474,6 +510,7 @@ function draftConfirmation(
     "first-start": "首次启动（全文已核对）",
     "business-choice": "业务选择（全文已核对）",
     information: "补充信息（全文已核对）",
+    "approval-bundle": "集中审核（完整材料已核对）",
   };
   let label = "确认提交所选方案";
   if (question.kind === "authorization") label = value === "Approve" ? "允许上述范围" : "不允许";
@@ -543,6 +580,87 @@ async function invokeDecisionCard(
   return undefined;
 }
 
+function validApprovalMetadata(question: NativeQuestion): boolean {
+  const approval = question.approval;
+  if (
+    !approval ||
+    question.kind !== "authorization" ||
+    approval.permissions.length > 20 ||
+    Array.from(question.body).some((char) => char !== "\n" && /[\p{Cc}\p{Cf}\p{Cs}]/u.test(char))
+  )
+    return false;
+  const ids = approval.permissions.map((option) => option.id);
+  return (
+    new Set(ids).size === ids.length &&
+    approval.permissions.every(
+      (option) =>
+        isSafeBoundedText(option.id, 64) &&
+        isSafeBoundedText(option.label, 500) &&
+        typeof option.required === "boolean",
+    ) &&
+    new Set(approval.selectedIds).size === approval.selectedIds.length &&
+    approval.selectedIds.every((id) => ids.includes(id))
+  );
+}
+function approvalAnswer(value: string, question: NativeQuestion): NativeAnswer | undefined {
+  try {
+    const selected: unknown = JSON.parse(value);
+    if (
+      !Array.isArray(selected) ||
+      !selected.every((id) => typeof id === "string") ||
+      new Set(selected).size !== selected.length ||
+      !selected.every((id) => question.approval?.permissions.some((option) => option.id === id))
+    )
+      return undefined;
+    return Object.freeze({
+      outcome: "approve",
+      value: JSON.stringify([...selected].sort()),
+      answeredAt: Date.now(),
+    });
+  } catch {
+    return value === "Reject"
+      ? Object.freeze({ outcome: "reject", value: undefined, answeredAt: Date.now() })
+      : undefined;
+  }
+}
+async function invokeApprovalReview(
+  ctx: ExtensionContext,
+  question: NativeQuestion,
+  current: () => boolean,
+  signal?: AbortSignal,
+): Promise<string | undefined> {
+  const selected = await questionView<ApprovalSelection>(
+    ctx,
+    current,
+    signal,
+    (env, done) => new ApprovalReview(question, env, done),
+    true,
+  );
+  if (!current() || !isApprovalSelection(selected, question)) return undefined;
+  return selected.outcome === "reject" ? "Reject" : JSON.stringify(selected.permissionIds);
+}
+async function invokeLegacyQuestion(
+  ctx: ExtensionContext,
+  question: NativeQuestion,
+  purpose: Purpose,
+  current: () => boolean,
+  signal?: AbortSignal,
+): Promise<string | undefined> {
+  const text = reviewText(question, purpose);
+  let needsReview = true;
+  while (current()) {
+    if (needsReview) {
+      const reviewed = await reviewScope(ctx, text, current, signal, question.material);
+      if (!current() || !reviewed) return undefined;
+    }
+    if (!current()) return undefined;
+    const result = await invokeFinalUI(ctx, question, purpose, current, signal);
+    if (!current()) return undefined;
+    if (result === REVIEW_AGAIN || result === RETRY_INPUT) needsReview = result === REVIEW_AGAIN;
+    else return result;
+  }
+  return undefined;
+}
 async function invokeUI(
   ctx: ExtensionContext,
   question: NativeQuestion,
@@ -554,22 +672,10 @@ async function invokeUI(
     if (!purpose || !validDisplayMetadata(question) || !current()) return undefined;
     await closeReadOnlyView(ctx);
     if (!current()) return undefined;
+    if (purpose === "approval-bundle")
+      return await invokeApprovalReview(ctx, question, current, signal);
     if (question.material) return await invokeDecisionCard(ctx, question, purpose, current, signal);
-    const text = reviewText(question, purpose);
-    let needsReview = true;
-    while (current()) {
-      if (needsReview) {
-        const reviewed = await reviewScope(ctx, text, current, signal, question.material);
-        if (!current() || !reviewed) return undefined;
-      }
-      if (!current()) return undefined;
-      const result = await invokeFinalUI(ctx, question, purpose, current, signal);
-      if (!current()) return undefined;
-      if (result === REVIEW_AGAIN || result === RETRY_INPUT) {
-        needsReview = result === REVIEW_AGAIN;
-      } else return result;
-    }
-    return undefined;
+    return await invokeLegacyQuestion(ctx, question, purpose, current, signal);
   } catch {
     // No custom fallback, summary approval, or implicit retry after UI failure.
     return undefined;

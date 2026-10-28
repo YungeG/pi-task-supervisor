@@ -5,6 +5,14 @@ import type { PreflightHumanResult } from "./preflight-human";
 import type { BoardHumanResult } from "./board-human";
 import type { DecisionRecord } from "./types";
 import type { HumanMaterial } from "./human-material-view";
+import type { AcceptanceProposal } from "./acceptance-proposal";
+import {
+  approvalAction,
+  type ApprovalAction,
+  type ApprovalContractCapture,
+} from "./approval-bundle";
+import { productScopeInputs, checkerScopeInventory } from "./acceptance-proposal";
+import type { contractReviewSubject } from "./acceptance-journal";
 
 export interface HumanNotice {
   message: string;
@@ -31,8 +39,15 @@ export function preflightNotice(result: Partial<PreflightHumanResult>): HumanNot
     rejected: `本次范围未获允许。${retained}不会自动重复询问；请先检查或修改方案。`,
     deferred: "本次未提交确认，既有授权及执行状态未改变。可稍后再处理。",
     unsupported: "当前环境无法提交确认。请使用本机 Pi 交互终端；既有状态未改变。",
-    started: "启动确认已保存，等待 Main 推进。权限、证据和预算门槛仍有效，不代表任务完成。",
+    started:
+      "启动确认已保存；接下来复核定义关联与其余门，只有全部满足才派发 Main。不代表任务完成。",
     already_saved: "已找到保存的记录，本次没有重复确认或启动。其他门槛仍有效。",
+    defined:
+      "新的检查定义已确认；既有业务权限不变，尚未启动。\n下一步：/task-supervisor start（独立确认）",
+    definition_declined:
+      "新定义未确认，既有业务权限不变；未启动。请先修正定义，再使用 /task-supervisor approve 审核。",
+    awaiting_contract:
+      "方案已保存，验收材料尚未齐备；未请求批准，也未启动。\n下一步：Main 先提交完整 propose_contract，再用 contractProposalId 补齐本版方案。",
   };
   return {
     message: messages[result.status],
@@ -250,6 +265,189 @@ export function preflightMaterial(
   };
 }
 
+function exactField(value: string): string {
+  const quoted = /[\\\r\n\t\p{Cc}\p{Cf}\p{Cs}]|^\s|\s$| {2}/u.test(value)
+    ? JSON.stringify(value)
+    : value;
+  return Array.from(quoted, (char) =>
+    /[\p{Cc}\p{Cf}\p{Cs}\p{Default_Ignorable_Code_Point}]/u.test(char)
+      ? `\\u{${char.codePointAt(0)?.toString(16).toUpperCase()}}`
+      : char,
+  ).join("");
+}
+function exactList(title: string, values: readonly string[]): string {
+  return `${title}\n${values.map((value) => `  • ${exactField(value)}`).join("\n") || "  无"}`;
+}
+function exactPermissions(state: PreflightState): string {
+  return (
+    (state.proposal?.permissions ?? [])
+      .map((p) =>
+        [
+          `${exactField(p.id)} · ${p.required ? "必需" : "可选"} · ${exactField(p.action)}`,
+          `  对象：${exactField(p.target)}；环境：${exactField(p.environment)}`,
+          `  限制：${exactField(p.limits)}`,
+          `  风险：${exactField(p.risks)}`,
+          `  不选时：${exactField(p.fallback)}`,
+          `  重新确认条件：${exactField(p.reconfirm)}`,
+        ].join("\n"),
+      )
+      .join("\n\n") || "无额外权限"
+  );
+}
+function exactChecks(
+  contract: AcceptanceProposal,
+  capture: Pick<ApprovalContractCapture, "workspace" | "pendingChecks">,
+): string {
+  return contract.checks
+    .map((check) => {
+      const common = `${exactField(check.checkId)} → 条件 ${check.requirementIds.map(exactField).join(", ")}`;
+      if (check.kind === "manual")
+        return [
+          common,
+          `  人工问题：${exactField(check.question)}`,
+          `  回应：${exactField(JSON.stringify(check.response))}；通过值：${exactField(check.expectedValue)}`,
+        ].join("\n");
+      return [
+        common,
+        `  检查器：${exactField(check.script)}；profile：${check.runtime ?? "fixed-node-readonly"}`,
+        `  root：${exactField(check.checkerRoot ?? capture.workspace.root)}；超时：${check.timeoutMs}ms`,
+        `  参数：${exactField(JSON.stringify(check.args))}`,
+        exactList("  checker/config 文件", [...check.checkerFiles, ...check.configs]),
+        `  通过要求：${exactField(JSON.stringify(check.expected))}`,
+        ...(check.tests ? [exactList("  固定测试方法", check.tests)] : []),
+        ...(check.permissionId ? [`  额外执行许可：${exactField(check.permissionId)}`] : []),
+        `  ${capture.pendingChecks.includes(check.checkId) ? "具体定义待准备后确认，不是受信检查器" : "现存定义已捕获；确认不代表运行通过"}`,
+      ].join("\n");
+    })
+    .join("\n\n");
+}
+export function readableApprovalBundle(
+  state: PreflightState,
+  contract: AcceptanceProposal,
+  capture: ApprovalContractCapture,
+): { title: string; body: string } {
+  const proposal = state.proposal;
+  if (!proposal) throw Error("Complete approval proposal is required for native material");
+  const definitionsOnly = state.version === 2 && state.permissionRequest?.purpose === "definitions";
+  return {
+    title: definitionsOnly
+      ? "是否确认更新的验收定义？（既有业务权限不变）"
+      : "是否批准所选范围并确认验收定义？",
+    body: [
+      `需要你决定：${definitionsOnly ? "仅确认所示检查定义的更新，不新增业务权限。" : "选择本次允许的范围，并确认以下验收要求与现存检查定义。"}`,
+      `当前目标：${exactField(state.goal)}`,
+      `方案：${exactField(proposal.summary)}`,
+      `契约范围：${exactField(contract.scopeId)}；实际工作区：${exactField(capture.workspace.root)}`,
+      definitionsOnly
+        ? `既有业务权限仅供核对，不重新授权、不允许修改：${state.approval?.permissionIds.map(exactField).join(", ") || "无"}。`
+        : "以下权限是可选择范围，不代表已批准；复选状态决定实际选择。",
+      exactPermissions(state),
+      exactList("执行计划", proposal.steps),
+      exactList("预检方案自身的验收要求（不是结果已通过）", proposal.acceptance),
+      exactList(
+        "正式契约验收要求（不是结果已通过）",
+        contract.requirements.map(
+          (r) =>
+            `${r.requirementId} · ${r.required ? "必需" : "可选"} · ${r.text}；来源：${r.source}`,
+        ),
+      ),
+      exactChecks(contract, capture),
+      exactList(
+        "product 输入",
+        checkerScopeInventory(capture.workspace.root, contract.inputs, contract.checks).inputs,
+      ),
+      exactList("声明产物（执行后才取版本与结果）", contract.artifacts),
+      `环境：${exactField(JSON.stringify(contract.environment))}`,
+      exactList("禁止事项", proposal.prohibitions),
+      exactList("需要重新确认的变化", proposal.reconfirm),
+      ...(proposal.preparation
+        ? [
+            exactList("获准后准备步骤（任务板保持未编译）", proposal.preparation.steps),
+            exactList("准备关联检查器", proposal.preparation.checkIds),
+            `准备所需权限：${proposal.preparation.permissionIds.map(exactField).join(", ")}`,
+          ]
+        : []),
+      "本次只保存明确决定，不启动执行、不扩大到未选权限、不判断产物通过。必需权限缺失不启动；未知、失败或缺证不能被本次确认补齐。",
+      capture.pendingChecks.length
+        ? "具体定义尚待形成／捕获；只有明确获准的准备可以在独立Start后进行，后续定义确认不重复收取业务权限或Start。"
+        : "确认完整保存后复核其他门，再由你独立Start。",
+      `材料版本：${exactField(capture.proposalId)}；检查器文件摘要如下（不是执行证据）`,
+      ...capture.checkers.map((check) =>
+        exactList(
+          check.checkId,
+          check.files.map((file) => `${file.path} · ${file.bytes} bytes · SHA256 ${file.sha256}`),
+        ),
+      ),
+    ].join("\n\n"),
+  };
+}
+/** Full original fields, reorganized as a decision document; not a semantic review,
+ * approval, execution result or a replacement for the exact native frame. */
+export function readableDefinitionReview(subject: ReturnType<typeof contractReviewSubject>): {
+  title: string;
+  body: string;
+} {
+  const proposal = { ...subject.header, checks: subject.checkDefinitions.map((d) => d.spec) };
+  const identity = Object.entries(subject).filter(
+    ([key]) => !["originalGoal", "header", "checkDefinitions"].includes(key),
+  );
+  return {
+    title: "是否确认当前验收条件与具体检查定义？",
+    body: [
+      "需要你决定：仅绑定下面完整条件和当前实际检查定义，不新增业务权限、不首次Start，也不恢复暂停。",
+      `原目标：${exactField(subject.originalGoal)}`,
+      exactList(
+        "验收要求（不是结果已通过）",
+        proposal.requirements.map(
+          (r) =>
+            `${r.requirementId} · ${r.required ? "必需" : "可选"} · ${r.text}；来源：${r.source}`,
+        ),
+      ),
+      exactChecks(proposal, { workspace: subject.workspace, pendingChecks: [] }),
+      exactList(
+        "product 输入",
+        subject.checkerScopes === undefined
+          ? proposal.inputs
+          : productScopeInputs(subject.workspace.root, proposal.inputs, subject.checkerScopes),
+      ),
+      exactList("声明产物（执行后才取版本和通过结果）", proposal.artifacts),
+      `环境 profile：${exactField(proposal.environment.profileId)}`,
+      exactList(
+        "固定环境值（不继承整个进程环境）",
+        Object.entries(proposal.environment.values).map(
+          ([key, value]) => `${key}=${JSON.stringify(value)}`,
+        ),
+      ),
+      "确认后：只保存定义关联。既有权限、Start、用户暂停、撤销、预算与未知执行hold全部保留；旧版本观察不能充当新定义通过。条件完整性和检查语义仍需独立审阅。",
+      ...subject.checkDefinitions.map((d) =>
+        [
+          exactList(
+            `冻结文件 · ${d.spec.checkId}`,
+            d.frozenFiles.map(
+              (file) => `${file.path} · ${file.bytes} bytes · SHA256 ${file.sha256}`,
+            ),
+          ),
+          exactList(
+            "固定执行元数据（不是执行证据）",
+            d.invocation
+              ? Object.entries(d.invocation).map(
+                  ([key, value]) => `${key}: ${JSON.stringify(value)}`,
+                )
+              : ["人工检查，不运行进程"],
+          ),
+          `定义摘要：${d.definitionDigest}；环境摘要：${d.environmentDigest}`,
+          ...(d.checkerWorkspace
+            ? [`检查器实际工作区：${exactField(JSON.stringify(d.checkerWorkspace))}`]
+            : []),
+        ].join("\n"),
+      ),
+      exactList(
+        "身份与版本详情（供诊断，不要求你选择schema）",
+        identity.map(([key, value]) => `${key}: ${JSON.stringify(value)}`),
+      ),
+    ].join("\n\n"),
+  };
+}
 export function preflightDetailText(result: Partial<PreflightHumanResult>): string {
   const state = result.state;
   if (!state?.proposal) return "";
@@ -262,8 +460,15 @@ export function preflightDetailText(result: Partial<PreflightHumanResult>): stri
 /** A read-only label, never a permission or execution qualification. */
 export function preflightSummary(
   state: PreflightState,
-  held?: "repair" | "fault",
+  held?: "repair" | "fault" | "association",
+  action?: Readonly<ApprovalAction>,
 ): { label: string; next: string; color: ThemeColor } {
+  if (held === "association")
+    return {
+      label: "定义决定已保存，实际关联需精确修复；执行仍阻止",
+      next: "/task-supervisor repair-preflight（仅修复关联，不重批、不 Start、不派发）",
+      color: "warning",
+    };
   if (held === "repair")
     return {
       label: "确认已保存，状态同步未完成；执行仍被阻止",
@@ -276,6 +481,26 @@ export function preflightSummary(
       next: "/task-supervisor status（先检查记录，不要重复启动）",
       color: "error",
     };
+  const current = action ?? (!state.started ? approvalAction(state) : undefined);
+  if (current && current.kind !== "bound") {
+    const labels = {
+      plan: "只读规划，尚未授权",
+      materials: "验收材料尚未齐备，不请求批准",
+      permissions: "等待完整范围确认，尚未启动",
+      rejected: "本版方案已拒绝，不自动重问",
+      definitions: "既有权限保留，当前定义待重新核对",
+      start: "本版决定已保存，尚未独立 Start",
+      preparing: "仅获准准备先行，具体定义尚未关联",
+      association: "已确认定义仍缺实际关联，执行仍被阻止",
+      bound: "定义已关联",
+      revoked: "权限已撤销，未自动恢复",
+    };
+    return {
+      label: labels[current.kind],
+      next: `${current.actor}: ${current.command ?? current.effect}${current.laterCommand ? ` 完成准备后：${current.laterCommand}` : ""}`,
+      color: ["plan", "start"].includes(current.kind) ? "muted" : "warning",
+    };
+  }
   if (state.phase === "awaiting_authorization" && state.started)
     return {
       label: "等待权限确认；既有启动记录保留，未自动恢复或重启",

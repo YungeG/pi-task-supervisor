@@ -6,14 +6,20 @@ import { vi } from "vitest";
 import { createMockAPI, createMockContext } from "./mocks";
 import { installCustomUI } from "./custom-ui";
 import { trustedCliRoots } from "../../human-ui";
-import { setBoard, getBoard, migrateLegacySnapshot } from "../../state";
-import { startSupervisor } from "../../supervisor";
+import { setBoard, getBoard, migrateLegacySnapshot, resetState } from "../../state";
+import { startSupervisor, type Advisor } from "../../supervisor";
 import { registerCommands } from "../../commands";
 import { registerEventHandlers } from "../../events";
 import { getHandler } from "./lifecycle";
 import { setSessionScopeEnabled } from "../../scope";
 import type { TaskBoardSnapshot } from "../../types";
 import { createEmptyBoard } from "../../engine";
+import { createProposeContractTool } from "../../acceptance-tool";
+import { localProposal } from "./preflight";
+
+const fixtureChecker = `import{readFileSync}from'node:fs';import assert from'node:assert/strict';
+assert.equal(readFileSync(new URL('./review-input.txt',import.meta.url),'utf8'),'Fixed synthetic review input\\n');
+console.log(JSON.stringify({protocol:'check-result-v1',tests:1,passed:1,failed:0,skipped:0,requiredCases:{fixture:'passed'},skippedIds:[]}));\n`;
 
 export type GoalFixtureEntry = {
   type: "custom";
@@ -27,6 +33,7 @@ export async function goalFixture(
     emptyBoard?: boolean;
     unsupervisedLegacy?: boolean;
     gitWorkspace?: boolean | "uninitialized";
+    advisor?: Advisor;
   } = {},
 ) {
   // Mechanism simulation: real journal and installed CLI path; mocked TTY/UI, not human identity proof.
@@ -55,6 +62,7 @@ export async function goalFixture(
       execFileSync("git", ["init", "--quiet", dir], { timeout: 2000, stdio: "ignore" });
     writeFileSync(join(dir, ".gitignore"), "session.jsonl\n");
     writeFileSync(join(dir, "review-input.txt"), "Fixed synthetic review input\n");
+    writeFileSync(join(dir, "fixture-checker.mjs"), fixtureChecker);
     Object.assign(ctx, { cwd: dir });
   }
   Object.assign(ctx, { model: { provider: "faux", id: "test" } });
@@ -126,7 +134,7 @@ export async function goalFixture(
     setBoard(options.emptyBoard ? createEmptyBoard() : board);
   }
   setSessionScopeEnabled(true);
-  registerEventHandlers(mock.api);
+  registerEventHandlers(mock.api, undefined, options.advisor);
   if (!options.unsupervisedLegacy) startSupervisor(mock.api, ctx, "Synthetic old goal");
   registerCommands(mock.api);
   const command = mock.registerCommand.mock.calls[0]![1];
@@ -140,6 +148,10 @@ export async function goalFixture(
   const ui = installCustomUI(ctx, (driver) => {
     const choice = nextDraftChoice;
     nextDraftChoice = 1;
+    if (choice > 1 && driver.render().includes("集中审核")) {
+      driver.press(choice === 2 ? "r" : "\u001b");
+      return;
+    }
     if (choice > 1 && driver.render().includes("需要你回应"))
       for (let i = 0; i < choice; i++) driver.press("\u001b[B");
     driver.reviewAll();
@@ -180,5 +192,90 @@ export async function goalFixture(
       });
       ui.assertNoScriptErrors();
     },
+  };
+}
+
+/** Replay an actual old producer, never manufacture legacy facts by rewriting a
+ * current native control/frame. Source qualification remains at that old level. */
+async function retainedGoalFixture(
+  filename: string,
+  physicalWorkspace: boolean | "uninitialized" = false,
+) {
+  const f = await goalFixture(physicalWorkspace ? { gitWorkspace: physicalWorkspace } : {});
+  const original = readFileSync(new URL(`../fixtures/${filename}`, import.meta.url), "utf8");
+  // Relocate only the fixture container's workspace locator. All original rows,
+  // controls, witnesses and their digests remain unchanged; no proof is upgraded.
+  const header = readFileSync(f.path, "utf8").split("\n")[0]!;
+  writeFileSync(f.path, header + "\n" + original.slice(original.indexOf("\n") + 1));
+  f.reload();
+  resetState();
+  setSessionScopeEnabled(true);
+  await f.fire("session_tree");
+  f.sendMessage.mockClear();
+  return f;
+}
+export async function retainedGoalApprovalFixture() {
+  return retainedGoalFixture("retained-goal-approval-0f8f5f8.jsonl");
+}
+export async function retainedGoalDoneFixture() {
+  return retainedGoalFixture("retained-goal-done-stopped-0f8f5f8.jsonl", true);
+}
+export async function retainedGoalActiveFixture(
+  physicalWorkspace: boolean | "uninitialized" = false,
+) {
+  const f = await retainedGoalFixture("retained-goal-active-0f8f5f8.jsonl", physicalWorkspace);
+  // Cold active owners remain interrupted. Only this explicit recovery restores
+  // the retained test owner; restoration itself never dispatches work.
+  await f.command("recover");
+  return f;
+}
+
+/** Definition-only setup for current normal Goal fixtures. No pass, permission,
+ * native execution or receipt is manufactured. The existing checker predates planning. */
+export async function completeGoalProposal(
+  f: Pick<Awaited<ReturnType<typeof goalFixture>>, "api" | "ctx" | "dir">,
+) {
+  if (f.ctx.cwd !== f.dir)
+    throw Error("Use goalFixture({gitWorkspace:true}) for physical definition material");
+  const result = await createProposeContractTool(f.api).execute(
+    "fixture-proposal",
+    {
+      proposal: {
+        version: 1,
+        scopeId: "goal-lifecycle-fixture",
+        inputs: ["review-input.txt", "fixture-checker.mjs"],
+        artifacts: [],
+        environment: { profileId: "fixture", values: {} },
+        requirements: [
+          {
+            requirementId: "fixture",
+            source: "Owned lifecycle test fixture only",
+            text: "The fixed fixture input must remain valid; not product acceptance",
+            required: true,
+          },
+        ],
+        checks: [
+          {
+            kind: "automatic",
+            checkId: "fixture",
+            requirementIds: ["fixture"],
+            script: "fixture-checker.mjs",
+            checkerFiles: ["fixture-checker.mjs"],
+            configs: [],
+            args: [],
+            timeoutMs: 1000,
+            expected: { minTests: 1, requiredCases: ["fixture"], allowedSkipped: [] },
+          },
+        ],
+      },
+    },
+    undefined,
+    undefined,
+    f.ctx,
+  );
+  if (result.isError) throw Error(JSON.stringify(result.content));
+  return {
+    ...localProposal,
+    contractProposalId: (result.details as { proposalId: string }).proposalId,
   };
 }

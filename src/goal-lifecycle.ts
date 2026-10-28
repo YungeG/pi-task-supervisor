@@ -6,6 +6,7 @@ import type {
 import type { RestoreJournalRead } from "./restore-journal";
 import { randomUUID } from "node:crypto";
 import { executionActivityIssue, executionOwnerSnapshot } from "./control-journal";
+import { ensureApprovalWorkflowFence } from "./approval-bundle";
 
 export interface GoalRestoreOptions {
   read: RestoreJournalRead;
@@ -470,6 +471,7 @@ function newSeed(ctx: ExtensionContext, goal: string, previousGeneration: number
       goal,
       phase: "planning",
       revision: 0,
+      approvalFlow: "consolidated-v1",
     },
     planning: { attemptNo: 0, attemptId: randomUUID(), preflightId, status: "prepared" },
   };
@@ -735,6 +737,7 @@ export async function requestGoalTransition(
   if (answer.value !== "Archive and plan new goal") return { status: "cancelled" };
   try {
     if (!current()) throw new Error("Goal transition source changed");
+    ensureApprovalWorkflowFence(pi, ctx);
     const body: GoalControl = {
       version: 5,
       protocol: GOAL_PROTOCOL,

@@ -10,6 +10,7 @@ import {
 import {
   WorkOwnerSchema,
   validWorkOwner,
+  validControlFence,
   ControlJournalError,
   validInvocationFact,
   ReviewAttemptStartedSchema,
@@ -32,6 +33,8 @@ import {
 import {
   AcceptanceProposalSchema,
   validateAcceptanceProposal,
+  CheckerScopeSchema,
+  checkerScopeInventory,
   type AcceptanceProposal,
 } from "./acceptance-proposal";
 import type {
@@ -42,8 +45,10 @@ import type {
   CheckObservationV1,
 } from "./acceptance-contract";
 import { checkContractAcceptance } from "./acceptance-contract";
-import type { ArtifactFileDigest } from "./artifact-version";
+import type { ArtifactFileDigest, CheckerScope, ArtifactVersionV1 } from "./artifact-version";
+import { NativeInvocationDescriptorSchema } from "./check-profile";
 import type { NativeCheckExecution } from "./check-runner";
+import { confirmedApprovalDefinitionSource } from "./preflight";
 
 export const ACCEPTANCE_FACT_ENTRY = "continuous-tasks:acceptance-facts";
 export type AcceptanceHeader = Omit<AcceptanceProposal, "checks">;
@@ -55,6 +60,7 @@ export interface AcceptanceDefinitionFact {
   sourceRef: AcceptanceReference;
   spec: AcceptanceProposal["checks"][number];
   frozenFiles: ArtifactFileDigest[];
+  checkerWorkspace?: ArtifactVersionV1["workspace"];
   environmentDigest: string;
   invocation:
     | (NativeCheckExecution["invocation"] & { nodeVersion: string; platform: string })
@@ -73,10 +79,17 @@ export interface AcceptanceBoundFact {
   header: AcceptanceHeader;
   workspace: { root: string; device: string; inode: string };
   scopeDigest: string;
+  checkerScopes?: CheckerScope[];
   definitions: Array<{ checkId: string; ref: AcceptanceReference; definitionDigest: string }>;
   authority:
     | { kind: "recognized-host"; originalGoalDigest: string }
-    | { kind: "native-reviewed"; originalGoalDigest: string; controlRef: AcceptanceReference };
+    | { kind: "native-reviewed"; originalGoalDigest: string; controlRef: AcceptanceReference }
+    | {
+        kind: "preflight-reviewed";
+        originalGoalDigest: string;
+        permissionControlRef: AcceptanceReference;
+        definitionControlRef: AcceptanceReference;
+      };
   contractDigest: string;
 }
 export interface AcceptanceCheckStarted {
@@ -113,6 +126,7 @@ export interface AcceptanceCheckObserved {
   beforeGeneration: string;
   afterGeneration: string | null;
   result: CheckResultV1 | null;
+  temporary?: NativeCheckExecution["temporary"];
 }
 export interface AcceptanceCheckRun {
   start: AcceptanceFactView<AcceptanceCheckStarted>;
@@ -209,17 +223,8 @@ export const CheckResultSchema = Type.Object(
   },
   strict,
 );
-const invocationDescriptorSchema = Type.Object(
-  {
-    executable: id(4096),
-    args: Type.Array(Type.String({ maxLength: 5000 }), { maxItems: 580 }),
-    cwd: id(4096),
-    environmentDigest: hash,
-    nodeVersion: id(100),
-    platform: id(100),
-  },
-  strict,
-);
+const invocationDescriptorSchema = NativeInvocationDescriptorSchema;
+const workspaceSchema = Type.Object({ root: id(4096), device: id(), inode: id() }, strict);
 const frozenFileSchema = Type.Object(
   { path: id(4096), bytes: Type.Integer({ minimum: 0, maximum: 16777216 }), sha256: hash },
   strict,
@@ -273,6 +278,7 @@ function declarationSchema(owner: typeof WorkOwnerSchema) {
       kind: Type.Literal("acceptance-definition-declared"),
       spec: AcceptanceProposalSchema.properties.checks.items,
       frozenFiles: Type.Array(frozenFileSchema, { maxItems: 32 }),
+      checkerWorkspace: Type.Optional(workspaceSchema),
       environmentDigest: hash,
       invocation: Type.Union([Type.Null(), invocationDescriptorSchema]),
       definitionDigest: hash,
@@ -280,38 +286,9 @@ function declarationSchema(owner: typeof WorkOwnerSchema) {
     strict,
   );
 }
-function makeSchema(owner: typeof WorkOwnerSchema) {
+function observationSchema(owner: typeof WorkOwnerSchema) {
   const base = { version: Type.Literal(1), recordId: id(), owner, sourceRef: reference };
-  const bound = Type.Object(
-    {
-      ...base,
-      kind: Type.Literal("acceptance-contract-bound"),
-      contractId: id(),
-      revision: Type.Integer({ minimum: 1, maximum: 16 }),
-      previousRef: Type.Union([reference, Type.Null()]),
-      header: Type.Omit(AcceptanceProposalSchema, ["checks"]),
-      workspace: Type.Object({ root: id(4096), device: id(), inode: id() }, strict),
-      scopeDigest: hash,
-      definitions: Type.Array(
-        Type.Object({ checkId: id(100), ref: reference, definitionDigest: hash }, strict),
-        { minItems: 1, maxItems: 16 },
-      ),
-      authority: Type.Union([
-        Type.Object({ kind: Type.Literal("recognized-host"), originalGoalDigest: hash }, strict),
-        Type.Object(
-          {
-            kind: Type.Literal("native-reviewed"),
-            originalGoalDigest: hash,
-            controlRef: reference,
-          },
-          strict,
-        ),
-      ]),
-      contractDigest: hash,
-    },
-    strict,
-  );
-  const observed = Type.Object(
+  return Type.Object(
     {
       ...base,
       kind: Type.Literal("acceptance-check-observed"),
@@ -335,9 +312,66 @@ function makeSchema(owner: typeof WorkOwnerSchema) {
       beforeGeneration: hash,
       afterGeneration: Type.Union([hash, Type.Null()]),
       result: Type.Union([CheckResultSchema, Type.Null()]),
+      temporary: Type.Optional(
+        Type.Object(
+          {
+            root: id(4096),
+            inputDigest: hash,
+            cleanup: Type.Union([
+              Type.Literal("removed"),
+              Type.Literal("retained"),
+              Type.Literal("failed"),
+            ]),
+          },
+          strict,
+        ),
+      ),
     },
     strict,
   );
+}
+function makeSchema(owner: typeof WorkOwnerSchema) {
+  const base = { version: Type.Literal(1), recordId: id(), owner, sourceRef: reference };
+  const bound = Type.Object(
+    {
+      ...base,
+      kind: Type.Literal("acceptance-contract-bound"),
+      contractId: id(),
+      revision: Type.Integer({ minimum: 1, maximum: 16 }),
+      previousRef: Type.Union([reference, Type.Null()]),
+      header: Type.Omit(AcceptanceProposalSchema, ["checks"]),
+      workspace: workspaceSchema,
+      scopeDigest: hash,
+      checkerScopes: Type.Optional(Type.Array(CheckerScopeSchema, { maxItems: 16 })),
+      definitions: Type.Array(
+        Type.Object({ checkId: id(100), ref: reference, definitionDigest: hash }, strict),
+        { minItems: 1, maxItems: 16 },
+      ),
+      authority: Type.Union([
+        Type.Object({ kind: Type.Literal("recognized-host"), originalGoalDigest: hash }, strict),
+        Type.Object(
+          {
+            kind: Type.Literal("native-reviewed"),
+            originalGoalDigest: hash,
+            controlRef: reference,
+          },
+          strict,
+        ),
+        Type.Object(
+          {
+            kind: Type.Literal("preflight-reviewed"),
+            originalGoalDigest: hash,
+            permissionControlRef: reference,
+            definitionControlRef: reference,
+          },
+          strict,
+        ),
+      ]),
+      contractDigest: hash,
+    },
+    strict,
+  );
+  const observed = observationSchema(owner);
   const reviewed = Type.Object(
     {
       ...base,
@@ -410,6 +444,16 @@ function specTuple(spec: AcceptanceProposal["checks"][number]): unknown[] {
           [...spec.expected.requiredCases].sort(),
           [...spec.expected.allowedSkipped].sort(),
         ],
+        ...(spec.runtime || spec.checkerRoot || spec.tests || spec.permissionId
+          ? [
+              [
+                spec.runtime ?? null,
+                spec.checkerRoot ?? null,
+                spec.tests ?? null,
+                spec.permissionId ?? null,
+              ],
+            ]
+          : []),
       ];
 }
 export function acceptanceDefinitionDigest(
@@ -431,8 +475,10 @@ export function acceptanceDefinitionDigest(
           command.environmentDigest,
           command.nodeVersion,
           command.platform,
+          ...(command.profile ? [command.profile] : []),
         ]
       : null,
+    ...(data.checkerWorkspace ? [["checker-workspace-v1", data.checkerWorkspace]] : []),
   ]);
 }
 export function acceptanceContractDigest(
@@ -461,11 +507,19 @@ export function acceptanceContractDigest(
     data.definitions.map((item) => [item.checkId, refTuple(item.ref), item.definitionDigest]),
     data.authority.kind === "recognized-host"
       ? [data.authority.kind, data.authority.originalGoalDigest]
-      : [
-          data.authority.kind,
-          data.authority.originalGoalDigest,
-          refTuple(data.authority.controlRef),
-        ],
+      : data.authority.kind === "native-reviewed"
+        ? [
+            data.authority.kind,
+            data.authority.originalGoalDigest,
+            refTuple(data.authority.controlRef),
+          ]
+        : [
+            data.authority.kind,
+            data.authority.originalGoalDigest,
+            refTuple(data.authority.permissionControlRef),
+            refTuple(data.authority.definitionControlRef),
+          ],
+    ...(data.checkerScopes !== undefined ? [["checker-scopes-v1", data.checkerScopes]] : []),
   ]);
 }
 /** Actual earlier native supervisor material only; a cache or model label is not a source. */
@@ -534,11 +588,25 @@ function assertCurrentOwner(journal: SessionJournal, data: AcceptanceFact, posit
   const last = [...journal.branch.slice(0, position)]
     .reverse()
     .find((node) => node.supervisorProof)?.supervisorProof;
+  const metadata =
+    data.kind === "acceptance-definition-declared" ||
+    (data.kind === "acceptance-contract-bound" && data.authority.kind !== "recognized-host");
+  const pausedMetadata =
+    metadata &&
+    ["paused", "fault"].includes(last?.status ?? "") &&
+    journal.branch
+      .slice(0, position)
+      .some(
+        (node) =>
+          node.customType === "continuous-tasks:supervisor" &&
+          validControlFence(node.data) &&
+          node.data.features.includes("approval-workflow-v1"),
+      );
   if (
     !last ||
     last.sessionId !== data.owner.goal.sessionId ||
     last.goalKey !== data.owner.goal.goalKey ||
-    last.status !== "active"
+    (last.status !== "active" && !pausedMetadata)
   )
     fail();
 }
@@ -560,6 +628,39 @@ function boundDefinitions(
       fail();
     return entry.data;
   });
+}
+function assertCheckerInventory(
+  data: AcceptanceBoundFact,
+  definitions: readonly AcceptanceDefinitionFact[],
+  proposal: AcceptanceProposal,
+): void {
+  if (data.checkerScopes !== undefined) {
+    const inventory = checkerScopeInventory(
+      data.workspace.root,
+      data.header.inputs,
+      proposal.checks,
+    );
+    if (
+      !isDeepStrictEqual(data.checkerScopes, inventory.checkerScopes) ||
+      definitions.some(
+        (definition) =>
+          definition.spec.kind === "automatic" &&
+          (!definition.checkerWorkspace ||
+            definition.checkerWorkspace.root !==
+              (definition.spec.checkerRoot ?? data.workspace.root)),
+      )
+    )
+      fail();
+  } else if (
+    definitions.some(
+      (definition) =>
+        definition.checkerWorkspace ||
+        definition.invocation?.profile ||
+        (definition.spec.kind === "automatic" &&
+          (definition.spec.runtime || definition.spec.checkerRoot)),
+    )
+  )
+    fail();
 }
 function assertBound(
   data: AcceptanceBoundFact,
@@ -593,19 +694,28 @@ function assertBound(
         journalDigest({ entryId: prior.entryId, digest: prior.digest }) ||
       journalDigest([
         proposal.requirements,
-        proposal.inputs,
+        data.checkerScopes === undefined
+          ? proposal.inputs
+          : checkerScopeInventory(data.workspace.root, proposal.inputs, proposal.checks).inputs,
         proposal.artifacts,
         proposal.scopeId,
       ]) !==
         journalDigest([
           prior.data.header.requirements,
-          prior.data.header.inputs,
+          prior.data.checkerScopes === undefined
+            ? prior.data.header.inputs
+            : checkerScopeInventory(
+                prior.data.workspace.root,
+                prior.data.header.inputs,
+                boundDefinitions(prior.data, view.definitions).map((item) => item.spec),
+              ).inputs,
           prior.data.header.artifacts,
           prior.data.header.scopeId,
         ])
     )
       fail();
   } else if (data.revision !== 1 || data.previousRef !== null) fail();
+  assertCheckerInventory(data, definitions, proposal);
   assertReviewedAuthority(data, definitions, view, journal, position);
   const environmentDigest = journalDigest(
     Object.keys(data.header.environment.values)
@@ -922,6 +1032,7 @@ export function contractReviewSubject(
     | "header"
     | "workspace"
     | "scopeDigest"
+    | "checkerScopes"
   >,
   definitions: readonly AcceptanceDefinitionFact[],
   proposal: ContractProposalView,
@@ -941,12 +1052,14 @@ export function contractReviewSubject(
     header: data.header,
     workspace: data.workspace,
     scopeDigest: data.scopeDigest,
+    ...(data.checkerScopes !== undefined ? { checkerScopes: data.checkerScopes } : {}),
     checkDefinitions: definitions.map((item) => ({
       spec: item.spec,
       frozenFiles: item.frozenFiles,
       environmentDigest: item.environmentDigest,
       invocation: item.invocation,
       definitionDigest: item.definitionDigest,
+      ...(item.checkerWorkspace ? { checkerWorkspace: item.checkerWorkspace } : {}),
     })),
     versionId,
     inputGeneration,
@@ -984,6 +1097,10 @@ function assertReviewedAuthority(
   journal: SessionJournal,
   position: number,
 ): void {
+  if (data.authority.kind === "preflight-reviewed") {
+    assertPreflightReviewedAuthority(data, definitions, journal, position);
+    return;
+  }
   if (data.authority.kind !== "native-reviewed") return;
   const controlRef = data.authority.controlRef,
     review = view.contractReviews.find(
@@ -1024,6 +1141,149 @@ function assertReviewedAuthority(
     invocationOwnerKey(control.owner) !== invocationOwnerKey(data.owner)
   )
     fail();
+}
+type ConfirmedApprovalSource = ReturnType<typeof confirmedApprovalDefinitionSource>;
+function assertAssociationMaterial(
+  data: AcceptanceBoundFact,
+  definitions: readonly AcceptanceDefinitionFact[],
+  journal: SessionJournal,
+  position: number,
+  permission: ConfirmedApprovalSource,
+  definition: ConfirmedApprovalSource,
+): void {
+  const binding = journal.nodes.get(data.sourceRef.entryId)?.supervisorProof?.preflightBinding;
+  const expected = {
+    preflightId: permission.base.preflightId,
+    planId: permission.base.planId,
+    planDigest: permission.base.planDigest,
+  };
+  if (
+    permission.control.kind !== "approve" ||
+    !isDeepStrictEqual(binding, expected) ||
+    permission.base.planDigest !== definition.base.planDigest ||
+    !isDeepStrictEqual(permission.capture.workspace, definition.capture.workspace) ||
+    !isDeepStrictEqual(definition.capture.workspace, data.workspace) ||
+    definition.capture.pendingChecks.length ||
+    permission.base.proposal?.permissions.some(
+      (item) => item.required && !permission.control.permissionIds.includes(item.id),
+    ) ||
+    !isDeepStrictEqual(
+      { ...data.header, checks: definitions.map((item) => item.spec) },
+      definition.proposal.data.proposal,
+    ) ||
+    !beforePosition(
+      journal,
+      { entryId: permission.proof.witness.id, digest: permission.proof.witness.digest },
+      position,
+    ) ||
+    !beforePosition(
+      journal,
+      { entryId: definition.proof.witness.id, digest: definition.proof.witness.digest },
+      position,
+    )
+  )
+    fail();
+}
+function assertAssociationOwner(
+  owner: Extract<WorkOwnerKey, { kind: "goal" }>,
+  authority: Extract<AcceptanceBoundFact["authority"], { kind: "preflight-reviewed" }>,
+  permission: ConfirmedApprovalSource,
+  definition: ConfirmedApprovalSource,
+): void {
+  const scope = definition.goalScope;
+  if (
+    scope
+      ? scope.goalRunId !== owner.goal.goalRunId ||
+        scope.lifecycleCommitId !== owner.goal.lifecycleCommitId
+      : owner.goal.goalRunId !== null
+  )
+    fail();
+  if (definition.control.kind === "define") {
+    if (
+      !isDeepStrictEqual(
+        definition.base.permissionRequest?.businessApproval,
+        authority.permissionControlRef,
+      ) ||
+      !isDeepStrictEqual(definition.control.permissionIds, permission.control.permissionIds)
+    )
+      fail();
+  } else if (!isDeepStrictEqual(authority.permissionControlRef, authority.definitionControlRef))
+    fail();
+}
+function assertNoLaterApprovalChanges(
+  journal: SessionJournal,
+  position: number,
+  definition: ConfirmedApprovalSource,
+): void {
+  const start = journal.branch.findIndex((node) => node.id === definition.proof.witness.id);
+  for (const node of journal.branch.slice(start + 1, position)) {
+    if (
+      node.customType !== "continuous-tasks:preflight-control" ||
+      !node.data ||
+      typeof node.data !== "object"
+    )
+      continue;
+    const later = node.data as { preflightId?: unknown; kind?: unknown };
+    if (later.preflightId === definition.base.preflightId && later.kind !== "start") fail();
+  }
+}
+function capturedCheckerMatches(
+  item: AcceptanceDefinitionFact,
+  frozen: ConfirmedApprovalSource["capture"]["checkers"][number] | undefined,
+  capture: ConfirmedApprovalSource["capture"],
+  workspace: AcceptanceBoundFact["workspace"],
+): boolean {
+  if (!frozen || !item.invocation) return false;
+  const { nodeVersion, platform, ...command } = item.invocation;
+  const invocationMatches = frozen.invocation
+    ? isDeepStrictEqual(frozen.invocation, command)
+    : item.invocation.executable === capture.executable;
+  return (
+    isDeepStrictEqual(frozen.files, item.frozenFiles) &&
+    isDeepStrictEqual(frozen.workspace, item.checkerWorkspace ?? workspace) &&
+    item.environmentDigest === capture.environmentDigest &&
+    invocationMatches &&
+    nodeVersion === capture.nodeVersion &&
+    platform === capture.platform
+  );
+}
+/** Exact metadata match only, not provenance or authority. Reused before producer
+ * writes so a repair cannot append refreshed bytes under an old confirmation. */
+export function assertCapturedApprovalDefinitions(
+  data: Pick<AcceptanceBoundFact, "workspace">,
+  definitions: readonly AcceptanceDefinitionFact[],
+  definition: ConfirmedApprovalSource,
+): void {
+  const automatic = definitions.filter((item) => item.spec.kind === "automatic");
+  if (
+    !isDeepStrictEqual(data.workspace, definition.capture.workspace) ||
+    automatic.length !== definition.capture.checkers.length
+  )
+    fail();
+  for (const item of automatic) {
+    const frozen = definition.capture.checkers.find((row) => row.checkId === item.spec.checkId);
+    if (!capturedCheckerMatches(item, frozen, definition.capture, data.workspace)) fail();
+  }
+}
+function assertPreflightReviewedAuthority(
+  data: AcceptanceBoundFact,
+  definitions: readonly AcceptanceDefinitionFact[],
+  journal: SessionJournal,
+  position: number,
+): void {
+  if (data.authority.kind !== "preflight-reviewed" || data.owner.kind !== "goal") fail();
+  const permission = confirmedApprovalDefinitionSource(
+    journal,
+    data.authority.permissionControlRef,
+  );
+  const definition = confirmedApprovalDefinitionSource(
+    journal,
+    data.authority.definitionControlRef,
+  );
+  assertAssociationMaterial(data, definitions, journal, position, permission, definition);
+  assertAssociationOwner(data.owner, data.authority, permission, definition);
+  assertNoLaterApprovalChanges(journal, position, definition);
+  assertCapturedApprovalDefinitions(data, definitions, definition);
 }
 export function acceptanceRunActivityIssue(
   view: AcceptanceJournalView | undefined,
@@ -1293,6 +1553,29 @@ function requiresActiveOwner(data: AcceptanceFact): boolean {
   );
 }
 /** Caller supplies only actual preceding-fenced physical nodes in causal order. */
+function assertApprovalFeature(
+  journal: SessionJournal,
+  data: AcceptanceFact,
+  position: number,
+): void {
+  const extended =
+    (data.kind === "acceptance-definition-declared" &&
+      (data.checkerWorkspace || data.invocation?.profile)) ||
+    (data.kind === "acceptance-contract-bound" && data.checkerScopes !== undefined) ||
+    (data.kind === "acceptance-check-observed" && (data.temporary || data.invocation.profile));
+  if (
+    extended &&
+    !journal.branch
+      .slice(0, position)
+      .some(
+        (entry) =>
+          entry.customType === "continuous-tasks:supervisor" &&
+          validControlFence(entry.data) &&
+          entry.data.features.includes("approval-workflow-v1"),
+      )
+  )
+    fail();
+}
 export function readAcceptanceFacts(
   journal: SessionJournal,
   records: readonly JournalNode[],
@@ -1316,6 +1599,7 @@ export function readAcceptanceFacts(
     const data = node.data,
       position = journal.branch.findIndex((item) => item.id === node.id);
     if (position < 0) fail();
+    assertApprovalFeature(journal, data, position);
     if (requiresActiveOwner(data)) assertCurrentOwner(journal, data, position);
     acceptanceGoalSource(journal, data.owner, data.sourceRef, position);
     if (data.kind === "acceptance-definition-declared") {

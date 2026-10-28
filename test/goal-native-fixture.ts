@@ -5,6 +5,8 @@ import { fauxProvider, fauxAssistantMessage, fauxToolCall } from "@earendil-work
 import extension from "../src/index.ts";
 import { getBoardRef, setBoard } from "../src/state.ts";
 import { answerBoardDecision } from "../src/board-human.ts";
+import { approvalNativeResponses } from "./approval-native-responses.ts";
+import { readControlJournal } from "../src/control-journal.ts";
 
 const proposal = {
   summary: "Owned offline native lifecycle check; no business operations",
@@ -45,36 +47,11 @@ export default function goalNativeFixture(pi: any) {
     models: [{ id: "test", contextWindow: 128000 }],
   });
   faux.setResponses(
-    scenario === "permissions"
-      ? [
-          () => {
-            const preflightId = commits().at(-1)?.data.seed.preflight.preflightId;
-            if (!preflightId) throw new Error("Native planning lacks its confirmed C seed");
-            return fauxAssistantMessage(
-              fauxToolCall("submit_preflight", { preflightId, proposal }),
-              { stopReason: "toolUse" },
-            );
-          },
-          fauxAssistantMessage("GOAL_NATIVE_APPROVED_ONLY: permission is not execution"),
-          fauxAssistantMessage("GOAL_NATIVE_BUSINESS_NO_EFFECT: no business tool was invoked"),
-          fauxAssistantMessage(
-            JSON.stringify({
-              action: "hold",
-              message: "Owned offline fixture ends without task acceptance",
-              taskIds: [],
-              evidenceRefs: [],
-            }),
-          ),
-        ]
-      : [
-          fauxAssistantMessage(
-            "GOAL_NATIVE_PLAN_ONE: read-only proposal attempt, no business work",
-          ),
-          fauxAssistantMessage("GOAL_NATIVE_PLAN_TWO: explicit same-goal replan, no business work"),
-          fauxAssistantMessage(
-            "GOAL_NATIVE_PLAN_THREE: independent following goal, no business work",
-          ),
-        ],
+    approvalNativeResponses(scenario, branch, proposal) ?? [
+      fauxAssistantMessage("GOAL_NATIVE_PLAN_ONE: read-only proposal attempt, no business work"),
+      fauxAssistantMessage("GOAL_NATIVE_PLAN_TWO: explicit same-goal replan, no business work"),
+      fauxAssistantMessage("GOAL_NATIVE_PLAN_THREE: independent following goal, no business work"),
+    ],
   );
   pi.registerProvider(faux.provider);
   extension(pi);
@@ -90,20 +67,29 @@ export default function goalNativeFixture(pi: any) {
     idles++;
     ctx.ui.notify(`GOAL_NATIVE_IDLE_${idles}`, "info");
   });
-  if (scenario === "information") pi.registerCommand("goal-native-information", {
-    description: "Owned offline information-card fixture; no business execution",
-    async handler(_args: string, ctx: any) {
-      const board = structuredClone(getBoardRef());
-      board.generation++;
-      board.workflowStatus = "waiting_for_decision";
-      board.decision = {id:"owned-information",taskId:"old-task",question:"填写候选观察天数",whyUserOwned:"只记录一个整数，不授权或执行任务。",createdAt:"2026-10-23T00:00:00.000Z",spec:{version:1,kind:"information",format:"integer"}};
-      pi.appendEntry("continuous-tasks:snapshot", board);
-      setBoard(board);
-      const result = await answerBoardDecision(pi, ctx);
-      if (result.status !== "answered" || result.confirmed?.value !== "42") throw new Error("Native information not saved exactly");
-      ctx.ui.notify("GOAL_NATIVE_INFORMATION_SAVED", "info");
-    },
-  });
+  if (scenario === "information")
+    pi.registerCommand("goal-native-information", {
+      description: "Owned offline information-card fixture; no business execution",
+      async handler(_args: string, ctx: any) {
+        const board = structuredClone(getBoardRef());
+        board.generation++;
+        board.workflowStatus = "waiting_for_decision";
+        board.decision = {
+          id: "owned-information",
+          taskId: "old-task",
+          question: "填写候选观察天数",
+          whyUserOwned: "只记录一个整数，不授权或执行任务。",
+          createdAt: "2026-10-23T00:00:00.000Z",
+          spec: { version: 1, kind: "information", format: "integer" },
+        };
+        pi.appendEntry("continuous-tasks:snapshot", board);
+        setBoard(board);
+        const result = await answerBoardDecision(pi, ctx);
+        if (result.status !== "answered" || result.confirmed?.value !== "42")
+          throw new Error("Native information not saved exactly");
+        ctx.ui.notify("GOAL_NATIVE_INFORMATION_SAVED", "info");
+      },
+    });
   pi.registerCommand("goal-native-probe", {
     description: "Read only owned offline fixture metadata",
     handler(label: string, ctx: any) {
@@ -123,6 +109,23 @@ export default function goalNativeFixture(pi: any) {
         leafId: manager.getLeafId(),
         modelCalls: faux.state.callCount,
         idles,
+        // This command is outside the supervisor's private scopedAPI runtime.
+        // Inspect actual published first-owner facts, not its unrelated default runtime.
+        ...(scenario?.startsWith("approval-")
+          ? {
+              board: [...entries]
+                .reverse()
+                .find((row: any) => row.customType === "continuous-tasks:snapshot")?.data,
+              supervisor: [...entries]
+                .reverse()
+                .find(
+                  (row: any) =>
+                    row.customType === "continuous-tasks:supervisor" && row.data?.version === 3,
+                )?.data,
+              acceptance: readControlJournal(ctx).acceptance,
+              stateFromPublishedJournal: true,
+            }
+          : {}),
         currentGoalRunId: selected?.data.seed.goalRunId,
         entries: entries.filter(
           (entry: any) =>

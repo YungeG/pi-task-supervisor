@@ -5,7 +5,7 @@ import type {
   ExtensionContext,
 } from "@earendil-works/pi-coding-agent";
 import type { ContinuousTasksConfig } from "./config";
-import { contractCompilationAdmission } from "./acceptance-runtime";
+import { contractCompilationAdmission, preflightAssociationIssue } from "./acceptance-runtime";
 import {
   observeFinalValidation,
   finalReviewWriteIssue,
@@ -229,7 +229,8 @@ async function supervisedBoundary(
 ): Promise<BoundaryResult | undefined> {
   if (!current()) return undefined;
   const advice = await cancellable(reviewSupervisor(pi, ctx, signal, advisor), signal);
-  if (!advice || !current() || ctx.hasPendingMessages()) return undefined;
+  if (!advice || !current() || ctx.hasPendingMessages() || preflightAssociationIssue(ctx))
+    return undefined;
   if (advice.action === "next_batch")
     return continuation(
       `[SUPERVISOR CONTROL — NOT USER APPROVAL]\nAction: next_batch. No batch is claimed and ready work remains; this is not a goal pause. Call get_ready_tasks to claim the next ready batch now. Work within the existing authorized scope; batch completion alone does not require another confirmation.\n${formatContinuePrompt(getBoardRef())}\nReview targets: ${advice.taskIds.join(", ")}\nEvidence: ${advice.evidenceRefs.join(", ") || "collect fresh tool evidence"}\nPreserve all real approvals, pauses, budgets and existing execution receipts.`,

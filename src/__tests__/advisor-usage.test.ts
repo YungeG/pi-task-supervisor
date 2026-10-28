@@ -1,8 +1,7 @@
 import { fauxAssistantMessage } from "@earendil-works/pi-ai";
 import { beforeEach, expect, it, vi } from "vitest";
 import { rmSync } from "node:fs";
-import { goalFixture } from "./helpers/goal";
-import { localProposal } from "./helpers/preflight";
+import { goalFixture, completeGoalProposal } from "./helpers/goal";
 import { submitAndPresentPreflight } from "../preflight-human";
 import { currentRuntime } from "../runtime";
 import { createWriteTasksTool, createCompileTasksTool, createGetReadyTasksTool } from "../tools";
@@ -38,7 +37,7 @@ it.each([
   "restores scoped accounting for %s without inferring calls from reviews or charging twice",
   async (kind) => {
     const { advisorUsageFor } = await import("../advisor-calls");
-    const f = await goalFixture();
+    const f = await goalFixture({ gitWorkspace: true });
     try {
       vi.mocked(f.ctx.ui.select).mockResolvedValue("确认提交所选方案");
       await f.command("supervise Scoped synthetic usage ledger");
@@ -49,7 +48,7 @@ it.each([
         f.ctx,
         "usage-proposal",
         currentRuntime().preflight!.preflightId,
-        localProposal,
+        await completeGoalProposal(f),
       );
       await f.fire("agent_settled", { type: "agent_settled", aborted: false });
       vi.mocked(f.ctx.ui.select).mockResolvedValue("开始执行");
@@ -132,7 +131,7 @@ it.each([
             f.ctx,
             "next-usage-proposal",
             currentRuntime().preflight!.preflightId,
-            localProposal,
+            await completeGoalProposal(f),
           );
           await f.fire("agent_settled", { type: "agent_settled", aborted: false });
           vi.mocked(f.ctx.ui.select).mockResolvedValue("开始执行");

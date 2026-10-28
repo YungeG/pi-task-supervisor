@@ -3,6 +3,11 @@ import { appendFileSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { trustedCliRoots } from "../../human-ui";
+import { beginPreflight, preflightContext } from "../../preflight";
+import { assertPlanningAdmission, enterPlanningMode } from "../../management-policy";
+import { enableSessionScope, updateActiveTools } from "../../scope";
+import { refreshUI } from "../../state";
+import { currentRuntime } from "../../runtime";
 const drivers: ReturnType<typeof installCustomUI>[] = [];
 const cleanups: Array<() => void> = [];
 afterEach(() => {
@@ -12,8 +17,10 @@ afterEach(() => {
 import { afterEach, vi } from "vitest";
 import { lifecycle } from "./lifecycle";
 
-/** SDK persistence boundary: appends have actual unique branch identities, not a fixed fake leaf. */
-export function preflightLifecycle() {
+/** SDK persistence boundary with actual unique identities. Default setup deliberately
+ * preserves the historical v2 permission protocol through the host initializer; new
+ * workflow tests pass consolidated:true and use the real human command route. */
+export function preflightLifecycle(options: { consolidated?: boolean } = {}) {
   const h = lifecycle();
   // Real-file/native-boundary simulation, never a production source bypass.
   const dir = mkdtempSync(join(tmpdir(), "preflight-fixture-"));
@@ -78,10 +85,39 @@ export function preflightLifecycle() {
         ? "开始执行"
         : options.includes("确认提交所选方案")
           ? "确认提交所选方案"
-          : "允许上述范围",
+          : (options.find((option) => /^选项 1(?:$| ·)/u.test(option)) ?? "允许上述范围"),
     );
     try {
-      await h.command(args);
+      if (!options.consolidated && args.startsWith("preflight ") && !currentRuntime().goal) {
+        // Historical host setup, not a current human command or a new legacy switch.
+        let began = false;
+        try {
+          await h.ctx.waitForIdle();
+          assertPlanningAdmission(h.ctx);
+          beginPreflight(h.mock.api, h.ctx, args.slice("preflight ".length));
+          began = true;
+          enableSessionScope(h.mock.api);
+          enterPlanningMode(h.mock.api, h.ctx);
+          updateActiveTools(h.mock.api, true);
+          refreshUI(h.ctx);
+          const content = preflightContext(h.ctx);
+          if (!content) throw Error("Retained planning context unavailable");
+          h.mock.api.sendMessage(
+            { customType: "continuous-tasks:preflight-planning", content, display: false },
+            { triggerTurn: true, deliverAs: "followUp" },
+          );
+        } catch (error) {
+          if (began) {
+            currentRuntime().cancel();
+            currentRuntime().journalFault ??=
+              "Preflight planning dispatch failed; inspect journal before control";
+          }
+          h.ctx.ui.notify(
+            error instanceof Error ? error.message : "Retained planning failed",
+            "error",
+          );
+        }
+      } else await h.command(args);
     } finally {
       vi.mocked(h.ctx.ui.select).mockResolvedValue("稍后决定");
     }

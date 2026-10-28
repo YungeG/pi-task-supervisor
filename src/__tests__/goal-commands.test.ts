@@ -1,11 +1,11 @@
 import { afterEach, beforeEach, expect, it, vi } from "vitest";
 import { rmSync } from "node:fs";
-import { goalFixture } from "./helpers/goal";
+import { goalFixture, completeGoalProposal } from "./helpers/goal";
 import { resetState } from "../state";
 import { currentRuntime } from "../runtime";
 import { BOUNDARY } from "./helpers/lifecycle";
+import { readControlJournal } from "../control-journal";
 import { submitAndPresentPreflight } from "../preflight-human";
-import { localProposal } from "./helpers/preflight";
 
 const fixtures: Awaited<ReturnType<typeof goalFixture>>[] = [];
 beforeEach(() => {
@@ -91,7 +91,7 @@ it("routes supervise through native archive then one claimed read-only planning 
 });
 
 it("does not dispatch business Main until the new goal has its own approval and separate native first-start", async () => {
-  const f = await goalFixture();
+  const f = await goalFixture({ gitWorkspace: true });
   fixtures.push(f);
   await f.command("supervise Native permission sequence");
   await f.fire("agent_start");
@@ -103,7 +103,7 @@ it("does not dispatch business Main until the new goal has its own approval and 
     f.ctx,
     "new-proposal",
     currentRuntime().preflight!.preflightId,
-    localProposal,
+    await completeGoalProposal(f),
   );
   await f.fire("agent_settled", { type: "agent_settled", aborted: false });
   expect(currentRuntime().supervisor).toBeUndefined();
@@ -112,6 +112,17 @@ it("does not dispatch business Main until the new goal has its own approval and 
   await f.command("start");
   expect(currentRuntime().supervisor?.status).toBe("active");
   expect(currentRuntime().preflight?.phase).toBe("started");
+  const journal = readControlJournal(f.ctx);
+  const bound = journal.acceptance?.contracts.at(-1)?.data;
+  expect(bound?.authority.kind).toBe("preflight-reviewed");
+  expect(bound?.owner).toMatchObject({
+    kind: "goal",
+    goal: {
+      goalRunId: currentRuntime().goal?.current?.scope.goalRunId,
+      lifecycleCommitId: currentRuntime().goal?.current?.scope.lifecycleCommitId,
+    },
+  });
+  expect(journal.acceptance?.contractReviews).toHaveLength(0);
   expect(turns()).toHaveLength(2);
   expect(turns()[1]?.[0]).toMatchObject({
     customType: "continuous-tasks:continue",
@@ -138,7 +149,7 @@ it("does not dispatch business Main until the new goal has its own approval and 
 });
 
 it("can explicitly end an approved but never-started planning goal without revoking or reusing its old permission", async () => {
-  const f = await goalFixture();
+  const f = await goalFixture({ gitWorkspace: true });
   fixtures.push(f);
   await f.command("supervise Approved draft goal");
   vi.mocked(f.ctx.ui.select).mockResolvedValue("允许上述范围");
@@ -147,7 +158,7 @@ it("can explicitly end an approved but never-started planning goal without revok
     f.ctx,
     "approved-draft",
     currentRuntime().preflight!.preflightId,
-    localProposal,
+    await completeGoalProposal(f),
   );
   const approval = structuredClone(currentRuntime().preflight?.approval);
   await f.command("stop");

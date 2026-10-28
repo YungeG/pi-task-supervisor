@@ -1,9 +1,7 @@
 import { createEventBus } from "@earendil-works/pi-coding-agent";
-import { expect, vi } from "vitest";
+import { expect } from "vitest";
 import { rmSync } from "node:fs";
-import { goalFixture } from "./goal";
-import { localProposal } from "./preflight";
-import { submitAndPresentPreflight } from "../../preflight-human";
+import { goalFixture, retainedGoalActiveFixture } from "./goal";
 import { currentRuntime } from "../../runtime";
 import { currentWorkOwner } from "../../control-journal";
 import { adoptSupervisedMode } from "../../management-policy";
@@ -64,36 +62,16 @@ export async function executionRegistryFixture(
   options: { gitWorkspace?: boolean | "uninitialized" } = {},
 ) {
   resetState();
-  const f = await goalFixture({
-    unsupervisedLegacy: boardOnly !== false,
-    gitWorkspace: options.gitWorkspace,
-  });
-  // Persist explicit activation in this synthetic Session; a memory flag is not restored authority.
-  setSessionScopeEnabled(false);
-  await f.command("enable");
-  if (!boardOnly) {
-    vi.mocked(f.ctx.ui.select).mockResolvedValue("确认提交所选方案");
-    await f.command("supervise Owned execution registry");
-    if (!currentRuntime().preflight) {
-      const diagnostic = JSON.stringify(vi.mocked(f.ctx.ui.notify).mock.calls);
-      currentRuntime().cancel();
-      f.restoreHost();
-      throw new Error(
-        `Owned scoped fixture did not enter planning; retained ${f.dir}; notices: ${diagnostic}`,
-      );
-    }
-    await f.fire("agent_start");
-    vi.mocked(f.ctx.ui.select).mockResolvedValue("允许上述范围");
-    await submitAndPresentPreflight(
-      f.api,
-      f.ctx,
-      "execution-proposal",
-      currentRuntime().preflight!.preflightId,
-      localProposal,
-    );
-    await f.fire("agent_settled", { type: "agent_settled", aborted: false });
-    vi.mocked(f.ctx.ui.select).mockResolvedValue("开始执行");
-    await f.command("start");
+  // This adapter tests the pre-SDK registry/receipt protocol at its original
+  // level. Current normal/native execution is covered by the actual SDK fixtures.
+  const f =
+    boardOnly === false
+      ? await retainedGoalActiveFixture(options.gitWorkspace ?? false)
+      : await goalFixture({ unsupervisedLegacy: true, gitWorkspace: options.gitWorkspace });
+  if (boardOnly) {
+    // Persist explicit activation; a memory flag is not restored authority.
+    setSessionScopeEnabled(false);
+    await f.command("enable");
   }
   await createWriteTasksTool(f.api).execute(
     "write",

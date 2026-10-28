@@ -61,6 +61,13 @@ export function installCustomUI(ctx: ExtensionContext, script?: (driver: Driver)
       const before = doneCount;
       for (let page = 0; page < 10000; page++) {
         const lines = driver.render().split("\n");
+        if (lines[0]?.includes("集中审核")) {
+          driver.press("a");
+          if (driver.render().includes("完整材料已核对")) driver.press(ENTER);
+          else driver.press("\u001b[6~");
+          if (doneCount !== before) return;
+          continue;
+        }
         if (lines[0]?.includes("需要你回应")) {
           const visible = lines.map(stripTerminalSequences);
           if (visible.some((line) => /→\s*稍后决定（不提交）/u.test(line))) driver.press(DOWN);

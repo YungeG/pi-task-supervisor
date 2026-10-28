@@ -28,6 +28,7 @@ export interface JournalSupervisorProof {
   sessionId: string;
   goalText?: string;
   preflightId?: string;
+  preflightBinding?: { preflightId: string; planId: string; planDigest: string };
   goalKey?: string;
   lifecycleCommitId?: string;
   epoch: number;
@@ -285,12 +286,29 @@ function taskBindingMetadata(bindings: unknown[]): JournalSupervisorProof["taskB
 }
 function supervisorPreflightProof(
   payload: Record<string, unknown>,
-): Pick<JournalSupervisorProof, "preflightId"> {
-  return record(payload.preflightBinding) &&
-    typeof payload.preflightBinding.preflightId === "string" &&
-    payload.preflightBinding.preflightId.length <= 200
-    ? { preflightId: payload.preflightBinding.preflightId }
-    : {};
+): Pick<JournalSupervisorProof, "preflightId" | "preflightBinding"> {
+  const binding = payload.preflightBinding;
+  if (
+    !record(binding) ||
+    typeof binding.preflightId !== "string" ||
+    binding.preflightId.length > 200
+  )
+    return {};
+  return {
+    preflightId: binding.preflightId,
+    ...(typeof binding.planId === "string" &&
+    binding.planId.length <= 120 &&
+    typeof binding.planDigest === "string" &&
+    /^[a-f0-9]{64}$/.test(binding.planDigest)
+      ? {
+          preflightBinding: {
+            preflightId: binding.preflightId,
+            planId: binding.planId,
+            planDigest: binding.planDigest,
+          },
+        }
+      : {}),
+  };
 }
 function supervisorProof(data: unknown): JournalSupervisorProof | undefined {
   if (!record(data)) return undefined;
@@ -669,7 +687,9 @@ function matchesOwner(
   return (
     node.customType === "continuous-tasks:preflight-control" &&
     record(node.data) &&
-    ["approve", "revoke", "reject", "start"].includes(String(node.data.kind))
+    ["approve", "revoke", "reject", "start", "define", "decline-definition"].includes(
+      String(node.data.kind),
+    )
   );
 }
 

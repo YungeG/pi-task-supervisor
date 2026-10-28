@@ -15,7 +15,13 @@ import {
 } from "./flow";
 import { currentRuntime } from "./runtime";
 import { repairCompletionMetadata } from "./completion-intents";
-import { verifyManualCheck, reviewAcceptanceContract } from "./acceptance-runtime";
+import {
+  verifyManualCheck,
+  reviewAcceptanceContract,
+  adoptPreflightAcceptance,
+  preflightAssociationIssue,
+  repairPreflightAcceptance,
+} from "./acceptance-runtime";
 import {
   requestModeChange,
   captureManagementSnapshot,
@@ -79,7 +85,7 @@ function continuationHeld(): boolean {
 function continueNow(pi: ExtensionAPI, ctx: ExtensionCommandContext): void {
   if (decideAdmission(captureManagementSnapshot(ctx), { kind: "boundary" }).verdict === "deny")
     return;
-  if (goalExecutionIssue(ctx)) return;
+  if (goalExecutionIssue(ctx) || preflightAssociationIssue(ctx)) return;
   const board = getBoardRef();
   const state = supervisorState();
   const facts = flowFacts(ctx);
@@ -246,7 +252,7 @@ async function beginPlanning(
 ): Promise<void> {
   await ctx.waitForIdle();
   assertPlanningAdmission(ctx);
-  beginPreflight(pi, ctx, goal);
+  beginPreflight(pi, ctx, goal, { consolidated: true });
   try {
     enableSessionScope(pi);
     enterPlanningMode(pi, ctx);
@@ -287,6 +293,7 @@ async function startGoal(
         adoptSupervisedMode(pi, ctx);
         const config = await loadConfig();
         if (config.receiptCache) currentRuntime().receiptStore?.configure(config.receiptCache);
+        adoptPreflightAcceptance(pi, ctx);
         continueNow(pi, ctx);
       } catch (error) {
         currentRuntime().cancel();
@@ -378,8 +385,10 @@ async function routeStart(
 }
 function repairCommand(pi: ExtensionAPI, ctx: ExtensionCommandContext, action: string): boolean {
   if (action === "repair-decision") repairBoardProjection(pi, ctx);
-  else if (action === "repair-preflight") repairPreflightProjection(pi, ctx);
-  else return false;
+  else if (action === "repair-preflight") {
+    if (currentRuntime().preflightRepair) repairPreflightProjection(pi, ctx);
+    else repairPreflightAcceptance(pi, ctx);
+  } else return false;
   status(ctx);
   return true;
 }

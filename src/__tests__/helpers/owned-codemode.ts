@@ -18,6 +18,10 @@ import {
 import { fauxProvider, fauxAssistantMessage, fauxToolCall } from "@earendil-works/pi-ai";
 import supervisor from "../../index";
 import { createMockContext } from "./mocks";
+import { installCustomUI } from "./custom-ui";
+import { trustedCliRoots } from "../../human-ui";
+import type { AcceptanceProposal } from "../../acceptance-proposal";
+import type { PreflightProposal } from "../../preflight";
 const customRows = (manager: SessionManager) =>
   manager.getBranch().filter((row) => row.type === "custom");
 const forbiddenNavigation = async () => {
@@ -102,6 +106,12 @@ export interface OwnedFixtureHooks {
   checkTool?: string;
   prepare?: (dir: string) => void;
   goalStart?: (pi: ExtensionAPI, ctx: ExtensionContext, dir: string) => void;
+  approvalWorkflow?: {
+    contract: (dir: string) => AcceptanceProposal;
+    proposal: (dir: string) => Omit<PreflightProposal, "contractProposalId">;
+    produce: (dir: string) => void;
+    prepareChecker?: (dir: string) => void;
+  };
 }
 export async function ownedCodemode(kind: OwnedCase, hooks: OwnedFixtureHooks = {}) {
   const dir = mkdtempSync(join(tmpdir(), "owned-codemode-covered-")),
@@ -115,7 +125,19 @@ export async function ownedCodemode(kind: OwnedCase, hooks: OwnedFixtureHooks = 
   const errors: unknown[] = [],
     notices: string[] = [];
   let injected = false;
+  const argv = process.argv;
+  const tty = [process.stdin, process.stdout].map((stream) =>
+    Object.getOwnPropertyDescriptor(stream, "isTTY"),
+  );
+  let uiDriver: ReturnType<typeof installCustomUI> | undefined;
   try {
+    if (hooks.approvalWorkflow) {
+      const root = trustedCliRoots()[0];
+      if (!root) throw Error("Owned native UI peer unavailable");
+      process.argv = [process.execPath, join(root, "dist/cli.js")];
+      for (const stream of [process.stdin, process.stdout])
+        Object.defineProperty(stream, "isTTY", { configurable: true, value: true });
+    }
     process.env.PI_CODING_AGENT_DIR = dir;
     globalThis.fetch = async () => {
       throw Error("Owned SDK fixture forbids network");
@@ -131,6 +153,13 @@ export async function ownedCodemode(kind: OwnedCase, hooks: OwnedFixtureHooks = 
       models: [{ id: "test", contextWindow: 128000 }],
     });
     const manager = SessionManager.create(dir, join(dir, "sessions"));
+    if (hooks.approvalWorkflow)
+      manager.appendMessage({
+        role: "user",
+        content:
+          "Owned covered SDK mechanism: plan only; permissions and Start remain separate native decisions.",
+        timestamp: Date.now(),
+      });
     if (kind === "journal-uncertain" || kind === "after-seal-write") {
       const append = manager.appendCustomEntry.bind(manager);
       manager.appendCustomEntry = (type, data) => {
@@ -156,8 +185,82 @@ export async function ownedCodemode(kind: OwnedCase, hooks: OwnedFixtureHooks = 
     }
     const rootCall = (code: string, id: string) =>
       fauxAssistantMessage(fauxToolCall("codemode", { code }, { id }), { stopReason: "toolUse" });
+    const workflow = hooks.approvalWorkflow;
+    const planning = workflow
+      ? [
+          fauxAssistantMessage(
+            fauxToolCall(
+              "propose_contract",
+              { proposal: workflow.contract(dir) },
+              { id: "owned-contract-proposal" },
+            ),
+            { stopReason: "toolUse" },
+          ),
+          () => {
+            const proposal = manager
+              .getBranch()
+              .find(
+                (row) =>
+                  row.type === "message" &&
+                  row.message.role === "toolResult" &&
+                  row.message.toolCallId === "owned-contract-proposal",
+              );
+            const text =
+              proposal?.type === "message" && proposal.message.role === "toolResult"
+                ? proposal.message.content.find((item) => item.type === "text")
+                : undefined;
+            const id =
+              text?.type === "text"
+                ? (JSON.parse(text.text) as { proposalId?: string }).proposalId
+                : undefined;
+            const stored = [...customRows(manager)]
+              .reverse()
+              .find((row) => row.customType === "continuous-tasks:preflight")?.data as
+              | { preflightId?: string; snapshot?: { preflightId?: string } }
+              | undefined;
+            const preflightId = stored?.snapshot?.preflightId ?? stored?.preflightId;
+            if (!id || !preflightId) throw Error("Actual planning references unavailable");
+            return fauxAssistantMessage(
+              fauxToolCall(
+                "submit_preflight",
+                { preflightId, proposal: { ...workflow.proposal(dir), contractProposalId: id } },
+                { id: "owned-preflight-submit" },
+              ),
+              { stopReason: "toolUse" },
+            );
+          },
+          fauxAssistantMessage(
+            "Owned consolidated approval checkpoint; no Start requested by model",
+          ),
+        ]
+      : [];
     faux.setResponses([
-      rootCall(plan, "owned-plan"),
+      ...planning,
+      ...(workflow?.prepareChecker
+        ? [
+            rootCall(
+              'await tools.write_tasks({mode:"replace",phases:[{title:"Owned",tasks:[{title:"Native check",prompt:"Finite native fixture check",profile:"main"}]}]}); await tools.owned_prepare({});',
+              "owned-preparation",
+            ),
+            fauxAssistantMessage(
+              "Owned concrete checker prepared; request only native definition review",
+            ),
+            fauxAssistantMessage(
+              JSON.stringify({
+                action: "hold",
+                message: "Wait for concrete native definition review",
+                taskIds: [],
+                evidenceRefs: [],
+              }),
+            ),
+          ]
+        : []),
+      rootCall(
+        workflow?.prepareChecker
+          ? 'await tools.compile_tasks({finalAcceptanceTaskId:"t-1.1"});'
+          : plan,
+        "owned-plan",
+      ),
       fauxAssistantMessage("Owned plan checkpoint"),
       fauxAssistantMessage(
         JSON.stringify({
@@ -277,6 +380,24 @@ export async function ownedCodemode(kind: OwnedCase, hooks: OwnedFixtureHooks = 
       noTools: "builtin",
       tools: ["+codemode"],
       customTools: [
+        ...(workflow?.prepareChecker
+          ? [
+              {
+                name: "owned_prepare",
+                label: "Owned checker preparation",
+                description: "Create only the exact approved owned checker fixture",
+                parameters: Type.Object({}),
+                execute: async () => {
+                  workflow.prepareChecker!(dir);
+                  return {
+                    content: [{ type: "text" as const, text: "Actual owned checker prepared" }],
+                    details: {},
+                    structuredContent: { exit_code: 0 },
+                  };
+                },
+              },
+            ]
+          : []),
         {
           name: "owned_check",
           label: "Owned check",
@@ -301,7 +422,8 @@ export async function ownedCodemode(kind: OwnedCase, hooks: OwnedFixtureHooks = 
           description: "Actually rewrites private input to identical bytes",
           parameters: Type.Object({}),
           execute: async () => {
-            writeFileSync(join(dir, "input.txt"), "owned\n");
+            if (hooks.approvalWorkflow) hooks.approvalWorkflow.produce(dir);
+            else writeFileSync(join(dir, "input.txt"), "owned\n");
             return {
               content: [{ type: "text", text: "Owned write" }],
               details: {},
@@ -345,10 +467,20 @@ export async function ownedCodemode(kind: OwnedCase, hooks: OwnedFixtureHooks = 
     if (created.extensionsResult.errors.length)
       throw Error(JSON.stringify(created.extensionsResult.errors));
     session = created.session;
+    const uiHost = createMockContext();
+    if (workflow) {
+      uiHost.ui.select = async (_title, options) =>
+        options.includes("开始执行")
+          ? "开始执行"
+          : (options.find((option) => /^选项 1(?:$| ·)/u.test(option)) ?? "确认提交所选方案");
+      uiDriver = installCustomUI(uiHost, (driver) => {
+        driver.reviewAll();
+      });
+    }
     await session.bindExtensions({
-      mode: "rpc",
+      mode: workflow ? "tui" : "rpc",
       uiContext: {
-        ...createMockContext().ui,
+        ...uiHost.ui,
         notify: (text) => {
           notices.push(text);
         },
@@ -365,12 +497,71 @@ export async function ownedCodemode(kind: OwnedCase, hooks: OwnedFixtureHooks = 
         reload: forbiddenNavigation,
       },
     });
+    const latest = () =>
+      [...customRows(manager)]
+        .reverse()
+        .find(
+          (row) =>
+            row.customType === "continuous-tasks:supervisor" &&
+            (row.data as { version?: number }).version === 3,
+        )?.data as { status: string; reason?: string } | undefined;
     const command = session.extensionRunner.getCommand("task-supervisor");
     if (!command) throw Error("Owned command missing");
     await command.handler(
-      "supervise-legacy Owned covered SDK mechanism",
+      workflow
+        ? "supervise Owned covered SDK mechanism"
+        : "supervise-legacy Owned covered SDK mechanism",
       session.extensionRunner.createCommandContext(),
     );
+    if (workflow) {
+      await session.waitForIdle();
+      const approval = [...customRows(manager)]
+        .reverse()
+        .find((row) => row.customType === "continuous-tasks:preflight")?.data as
+        | { phase?: string; snapshot?: { phase?: string } }
+        | undefined;
+      if ((approval?.snapshot?.phase ?? approval?.phase) !== "approved")
+        throw Error("Actual consolidated approval did not settle: " + JSON.stringify(notices));
+      await command.handler("start", session.extensionRunner.createCommandContext());
+      if (workflow.prepareChecker) {
+        const deadline = Date.now() + 5000;
+        while (latest()?.status !== "paused") {
+          if (Date.now() > deadline)
+            throw Error(
+              "Owned preparation did not reach a bounded native-review hold: " +
+                JSON.stringify(latest()),
+            );
+          await new Promise((resolve) => setTimeout(resolve, 5));
+        }
+        await session.waitForIdle();
+        const response = manager
+          .getBranch()
+          .find(
+            (row) =>
+              row.type === "message" &&
+              row.message.role === "toolResult" &&
+              row.message.toolCallId === "owned-contract-proposal",
+          );
+        const text =
+          response?.type === "message" && response.message.role === "toolResult"
+            ? response.message.content.find((item) => item.type === "text")
+            : undefined;
+        const proposalId =
+          text?.type === "text"
+            ? (JSON.parse(text.text) as { proposalId: string }).proposalId
+            : undefined;
+        if (!proposalId) throw Error("Original preparation proposal unavailable");
+        await command.handler(
+          `review-contract ${proposalId}`,
+          session.extensionRunner.createCommandContext(),
+        );
+        if (latest()?.status !== "paused")
+          throw Error("Definition review improperly cleared the prior hold");
+        // This is a Supervisor advisor hold over an uncompiled board, not a
+        // paused task board. Explicit recovery is the existing legal entry.
+        await command.handler("recover", session.extensionRunner.createCommandContext());
+      }
+    }
     const isWriting = () => writing;
     if (kind === "pause") {
       const waiting = Date.now() + 1500;
@@ -384,14 +575,6 @@ export async function ownedCodemode(kind: OwnedCase, hooks: OwnedFixtureHooks = 
         session.extensionRunner.createCommandContext(),
       );
     }
-    const latest = () =>
-      [...customRows(manager)]
-        .reverse()
-        .find(
-          (row) =>
-            row.customType === "continuous-tasks:supervisor" &&
-            (row.data as { version?: number }).version === 3,
-        )?.data as { status: string; reason?: string } | undefined;
     const deadline = Date.now() + 15000;
     while (!["paused", "fault", "completed"].includes(latest()?.status ?? "")) {
       if (
@@ -421,7 +604,7 @@ export async function ownedCodemode(kind: OwnedCase, hooks: OwnedFixtureHooks = 
     const branch = structuredClone(manager.getBranch()),
       file = manager.getSessionFile();
     if (!file) throw Error("Owned SDK did not produce a physical session file");
-    passed = true;
+    passed = !hooks.approvalWorkflow || latest()?.status === (accepts ? "completed" : "paused");
     return {
       branch,
       state: latest(),
@@ -435,10 +618,17 @@ export async function ownedCodemode(kind: OwnedCase, hooks: OwnedFixtureHooks = 
     };
   } finally {
     session?.dispose();
+    process.argv = argv;
+    [process.stdin, process.stdout].forEach((stream, index) => {
+      const descriptor = tty[index];
+      if (descriptor) Object.defineProperty(stream, "isTTY", descriptor);
+      else Reflect.deleteProperty(stream, "isTTY");
+    });
     globalThis.fetch = fetch;
     if (previous === undefined) delete process.env.PI_CODING_AGENT_DIR;
     else process.env.PI_CODING_AGENT_DIR = previous;
     if (passed) rmSync(dir, { recursive: true, force: true });
     else console.error("Owned covered SDK failure retained:", dir);
+    uiDriver?.assertNoScriptErrors();
   }
 }

@@ -68,6 +68,7 @@ export const CONTROL_FEATURES = [
   "invocation-tree-v1",
   "management-mode-v1",
   "progress-facts-v1",
+  "approval-workflow-v1",
 ] as const;
 export type ControlFeature = (typeof CONTROL_FEATURES)[number];
 const supportedControlFeatures = new Set<ControlFeature>([
@@ -79,6 +80,7 @@ const supportedControlFeatures = new Set<ControlFeature>([
   "invocation-tree-v1",
   "management-mode-v1",
   "progress-facts-v1",
+  "approval-workflow-v1",
 ]);
 const id = (maxLength: number) => Type.String({ minLength: 1, maxLength });
 const hash = Type.String({ pattern: "^[a-f0-9]{64}$" });
@@ -884,6 +886,7 @@ export const ControlFenceSchema = Type.Object(
         Type.Literal(CONTROL_FEATURES[5]),
         Type.Literal(CONTROL_FEATURES[6]),
         Type.Literal(CONTROL_FEATURES[7]),
+        Type.Literal(CONTROL_FEATURES[8]),
       ]),
       { maxItems: CONTROL_FEATURES.length },
     ),

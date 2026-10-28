@@ -1,7 +1,11 @@
 import { afterEach, beforeEach, expect, it, vi } from "vitest";
 import { appendFileSync, rmSync } from "node:fs";
-import { goalFixture } from "./helpers/goal";
-import { localProposal } from "./helpers/preflight";
+import {
+  goalFixture,
+  completeGoalProposal,
+  retainedGoalDoneFixture,
+  retainedGoalActiveFixture,
+} from "./helpers/goal";
 import { resetState, getBoard } from "../state";
 import { currentRuntime } from "../runtime";
 import { submitAndPresentPreflight } from "../preflight-human";
@@ -37,7 +41,7 @@ async function start(f: Awaited<ReturnType<typeof goalFixture>>, text: string) {
     f.ctx,
     `proposal-${text}`,
     currentRuntime().preflight!.preflightId,
-    localProposal,
+    await completeGoalProposal(f),
   );
   await f.fire("agent_settled", { type: "agent_settled", aborted: false });
   vi.mocked(f.ctx.ui.select).mockResolvedValue("开始执行");
@@ -45,7 +49,7 @@ async function start(f: Awaited<ReturnType<typeof goalFixture>>, text: string) {
   expect(currentRuntime().supervisor?.status).toBe("active");
 }
 it("persists actual write/compile/claim/edit/advance tool snapshots within the selected GoalRun and restores that board", async () => {
-  const f = await goalFixture();
+  const f = await goalFixture({ gitWorkspace: true });
   fixtures.push(f);
   await start(f, "Tool lifecycle");
   const goalId = currentRuntime().goal!.current!.scope.goalRunId;
@@ -104,10 +108,12 @@ it("persists actual write/compile/claim/edit/advance tool snapshots within the s
     status: "reviewing",
   });
 });
-it("keeps a late previous-goal read result out of the new ledger and new fault state", async () => {
-  const f = await goalFixture();
+it("keeps a late retained-owner read result out of the new Goal ledger and fault state", async () => {
+  // An actually retained old adapter context can have a late legacy callback.
+  // A fabricated successful SDK admission must not be used to create that history.
+  const f = await retainedGoalActiveFixture(true);
   fixtures.push(f);
-  await start(f, "First scoped goal");
+  expect(currentRuntime().supervisor?.status).toBe("active");
   await f.fire("tool_call", {
     type: "tool_call",
     toolName: "read",
@@ -146,7 +152,7 @@ it("keeps a late previous-goal read result out of the new ledger and new fault s
   expect(f.entries()).toHaveLength(entries);
 });
 it("uses physical old native call identity after cache loss and excludes the old transcript from the current advisor packet", async () => {
-  const f = await goalFixture();
+  const f = await goalFixture({ gitWorkspace: true });
   fixtures.push(f);
   appendFileSync(
     f.path,
@@ -172,8 +178,8 @@ it("uses physical old native call identity after cache loss and excludes the old
   expect(JSON.stringify(packet)).not.toContain("OLD_TRANSCRIPT_ONLY");
   expect(packet.goalScope.goalRunId).toBe(currentRuntime().goal?.current?.scope.goalRunId);
 });
-it("isolates repeated goal text/task IDs and refuses a prior goal's successful bound evidence", async () => {
-  const f = await goalFixture();
+it("isolates repeated goal text/task IDs and refuses a prior goal's retained legacy bound evidence", async () => {
+  const f = await retainedGoalDoneFixture();
   fixtures.push(f);
   const review = async () => {
     await createWriteTasksTool(f.api).execute(
@@ -214,24 +220,12 @@ it("isolates repeated goal text/task IDs and refuses a prior goal's successful b
     );
     expect(result.isError, JSON.stringify(result)).not.toBe(true);
   };
-  await start(f, "Repeated goal text");
-  await review();
+  // Recorded by the old producer at its old qualification level, not a forged
+  // successful current SDK invocation. The new Goal must not borrow this history.
   const oldId = currentRuntime().goal!.current!.scope.goalRunId;
-  await f.fire("tool_call", {
-    type: "tool_call",
-    toolName: "bash",
-    toolCallId: "old-success-proof",
-    input: { command: "unit validation" },
-  });
-  await f.fire("tool_result", {
-    type: "tool_result",
-    toolName: "bash",
-    toolCallId: "old-success-proof",
-    input: { command: "unit validation" },
-    content: [{ type: "text", text: "Unit host result" }],
-    structuredContent: { exit_code: 0 },
-    isError: false,
-  });
+  expect(currentRuntime().goal?.current?.seed.goal).toBe("Repeated goal text");
+  expect(getBoard().tasks[0]?.status).toBe("done");
+  expect(currentRuntime().supervisor?.bindings[0]?.refs).toContain("tool:old-success-proof");
   const evidence = {
     summary: "Original successful host validation",
     refs: [
@@ -244,16 +238,6 @@ it("isolates repeated goal text/task IDs and refuses a prior goal's successful b
       },
     ],
   };
-  const done = await createAdvanceTasksTool(f.api).execute(
-    "done",
-    { transitions: [{ id: "t-1.1", evidence }] },
-    undefined,
-    undefined,
-    f.ctx,
-  );
-  expect(done.isError, JSON.stringify(done)).not.toBe(true);
-  expect(getBoard().tasks[0]?.status).toBe("done");
-  await f.command("stop");
   await start(f, "Repeated goal text");
   expect(currentRuntime().goal?.current?.scope.goalRunId).not.toBe(oldId);
   expect(currentRuntime().supervisor?.bindings).toEqual([]);
@@ -273,10 +257,11 @@ it("isolates repeated goal text/task IDs and refuses a prior goal's successful b
   expect(getBoard().tasks[0]?.status).toBe("reviewing");
 });
 
-it("retains the same-goal late-mutation freshness barrier after restoration and explicit recovery", async () => {
-  const f = await goalFixture();
+it("retains the same-goal legacy late-mutation barrier after restoration and explicit recovery", async () => {
+  const f = await retainedGoalActiveFixture();
   fixtures.push(f);
-  await start(f, "Same goal unknown execution");
+  expect(currentRuntime().supervisor?.status).toBe("active");
+  const epoch = currentRuntime().supervisor!.epoch;
   await f.fire("tool_call", {
     type: "tool_call",
     toolName: "write",
@@ -287,7 +272,7 @@ it("retains the same-goal late-mutation freshness barrier after restoration and 
   await f.fire("session_tree");
   await f.command("recover");
   expect(currentRuntime().supervisor?.status).toBe("active");
-  expect(currentRuntime().supervisor?.epoch).toBe(2);
+  expect(currentRuntime().supervisor?.epoch).toBe(epoch + 2);
   await f.fire("tool_call", {
     type: "tool_call",
     toolName: "read",
@@ -311,13 +296,13 @@ it("retains the same-goal late-mutation freshness barrier after restoration and 
     content: [{ type: "text", text: "Late unit result" }],
     isError: false,
   });
-  expect(currentRuntime().supervisor?.epoch).toBe(3);
+  expect(currentRuntime().supervisor?.epoch).toBe(epoch + 3);
   expect(currentRuntime().receiptStore?.stats.count).toBe(1);
   expect(currentRuntime().supervisor?.status).toBe("fault");
 });
 
 it("bounds callback identities and rejects duplicate/blocked calls without treating eviction as positive old provenance", async () => {
-  const f = await goalFixture();
+  const f = await goalFixture({ gitWorkspace: true });
   fixtures.push(f);
   await f.command("supervise Bounded callback identities");
   const book = new GoalToolLeases();
@@ -336,7 +321,7 @@ it("bounds callback identities and rejects duplicate/blocked calls without treat
 });
 
 it("keeps a live parent callback identity through more than 512 completed siblings", async () => {
-  const f = await goalFixture();
+  const f = await goalFixture({ gitWorkspace: true });
   fixtures.push(f);
   await start(f, "Owned callback parent retention");
   const book = new GoalToolLeases();
@@ -351,7 +336,7 @@ it("keeps a live parent callback identity through more than 512 completed siblin
   expect(book.result("opaque-parent", f.ctx, "codemode")).toBe("current");
 });
 it("does not classify an unknown result as historical when the physical source cannot be read", async () => {
-  const f = await goalFixture();
+  const f = await goalFixture({ gitWorkspace: true });
   fixtures.push(f);
   await start(f, "Missing callback source");
   vi.spyOn(f.ctx.sessionManager, "getSessionFile").mockReturnValue(`${f.dir}/missing.jsonl`);
@@ -359,7 +344,7 @@ it("does not classify an unknown result as historical when the physical source c
 });
 
 it("holds an unexpected successful result after admission was blocked, without creating evidence or approving another goal", async () => {
-  const f = await goalFixture();
+  const f = await goalFixture({ gitWorkspace: true });
   fixtures.push(f);
   await f.command("supervise Read-only planning only");
   expect(
@@ -387,7 +372,7 @@ it("holds an unexpected successful result after admission was blocked, without c
 });
 
 it("does not let an old native settled notification settle a newly dispatched planning attempt", async () => {
-  const f = await goalFixture();
+  const f = await goalFixture({ gitWorkspace: true });
   fixtures.push(f);
   await f.command("supervise Older pure planning");
   await f.fire("agent_start");

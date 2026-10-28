@@ -1,6 +1,14 @@
 // Actual owned finite-process probes of the approved native check invocation seam.
 // These establish runner mechanics, not trusted-contract, human or Goal acceptance.
-import { mkdtempSync, rmSync, writeFileSync, unlinkSync, mkdirSync } from "node:fs";
+import {
+  mkdtempSync,
+  rmSync,
+  writeFileSync,
+  unlinkSync,
+  mkdirSync,
+  existsSync,
+  utimesSync,
+} from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, expect, it } from "vitest";
@@ -37,6 +45,334 @@ function invocation(code: string, timeoutMs = 1000): NativeCheckInvocation {
     timeoutMs,
   };
 }
+it("runs an actual bounded external Python method with SQLite and FD cleanup", async () => {
+  const product = invocation("0;"),
+    checker = invocation("0;");
+  writeFileSync(
+    join(checker.scope.root, "test_checker.py"),
+    `import contextlib,os,sqlite3,tempfile,unittest
+class Scope(unittest.TestCase):
+ def test_owned(self):
+  before=len(os.listdir('/proc/self/fd'))
+  with tempfile.TemporaryDirectory() as directory:
+   with contextlib.closing(sqlite3.connect(os.path.join(directory,'owned.db'))) as connection:
+    connection.execute('create table v(x integer)')
+    connection.execute('insert into v values (7)')
+    self.assertEqual(connection.execute('select x from v').fetchone(),(7,))
+   parent=os.open(directory,os.O_RDONLY|os.O_DIRECTORY)
+   try:
+    fd=os.open('owned.txt',os.O_WRONLY|os.O_CREAT,0o600,dir_fd=parent)
+    os.write(fd,b'owned');os.close(fd)
+   finally: os.close(parent)
+  self.assertEqual(len(os.listdir('/proc/self/fd')),before)
+`,
+  );
+  const input = {
+    ...product,
+    checkId: "python",
+    runtime: "python-unittest-v1" as const,
+    script: "test_checker.py",
+    tests: ["test_checker.Scope.test_owned"],
+    scope: {
+      ...product.scope,
+      checkerScopes: [{ checkId: "python", root: checker.scope.root, inputs: ["test_checker.py"] }],
+    },
+  };
+  const result = await runNativeCheck(input);
+  expect(result, result.stderr).toMatchObject({
+    closed: true,
+    exitCode: 0,
+    termination: "exited",
+    temporary: { cleanup: "removed" },
+  });
+  expect(result.pid).toBeGreaterThan(0);
+  expect(result.invocation.executable).toBe("/usr/bin/python3.13");
+  expect(JSON.parse(result.stdout)).toMatchObject({
+    tests: 1,
+    passed: 1,
+    failed: 0,
+    requiredCases: { "test_checker.Scope.test_owned": "passed" },
+  });
+  expect(result.after.status).toBe("known");
+  expect(result.temporary && existsSync(result.temporary.root)).toBe(false);
+  expect(nativeCheckExecution(result)).toBe(result);
+  expect(nativeCheckExecution(structuredClone(result))).toBeUndefined();
+});
+it("observes actual finite Python read/write/network/process and SQLite denials", async () => {
+  const input = pythonInvocation(`import contextlib,os,pathlib,socket,sqlite3,tempfile,unittest
+class Scope(unittest.TestCase):
+ def test_owned(self):
+  with self.assertRaises(PermissionError): pathlib.Path('undeclared.txt').read_text()
+  with self.assertRaises(PermissionError): pathlib.Path('outside.txt').write_text('no')
+  with self.assertRaises(PermissionError): os.listdir('.')
+  with self.assertRaises(PermissionError): socket.socket()
+  with self.assertRaises(PermissionError): os.system('true')
+  with self.assertRaises(PermissionError): os.environ['INJECTED']='no'
+  with self.assertRaises(PermissionError): os.symlink('missing',tempfile.gettempdir()+'/link')
+  with self.assertRaises(PermissionError): __import__('subprocess')
+  with contextlib.closing(sqlite3.connect(':memory:')) as db:
+   with self.assertRaises(PermissionError): db.set_authorizer(None)
+   with self.assertRaises(PermissionError): db.enable_load_extension(True)
+   with self.assertRaises(sqlite3.DatabaseError): db.execute("ATTACH DATABASE 'outside.db' AS other")
+   with self.assertRaises(sqlite3.DatabaseError): db.execute("VACUUM INTO 'outside.db'")
+   with self.assertRaises(sqlite3.DatabaseError): db.execute("PRAGMA temp_store_directory='/tmp'")
+`);
+  writeFileSync(join(input.scope.root, "undeclared.txt"), "private, not a declared read");
+  const result = await runNativeCheck(input);
+  expect(result, result.stderr).toMatchObject({
+    closed: true,
+    exitCode: 0,
+    after: { status: "known" },
+    temporary: { cleanup: "removed" },
+  });
+  expect(JSON.parse(result.stdout)).toMatchObject({ tests: 1, passed: 1, failed: 0 });
+  expect(existsSync(join(input.scope.root, "outside.txt"))).toBe(false);
+  expect(existsSync(join(input.scope.root, "outside.db"))).toBe(false);
+});
+function pythonInvocation(code: string): NativeCheckInvocation {
+  const base = invocation("0;");
+  writeFileSync(join(base.scope.root, "test_scope.py"), code);
+  return {
+    ...base,
+    checkId: "python",
+    runtime: "python-unittest-v1",
+    script: "test_scope.py",
+    tests: ["test_scope.Scope.test_owned"],
+    scope: {
+      ...base.scope,
+      checkerScopes: [{ checkId: "python", root: base.scope.root, inputs: ["test_scope.py"] }],
+    },
+  };
+}
+it.each([
+  "async",
+  "generator",
+  "async-generator",
+  "factory",
+  "async-setup",
+  "async-cleanup",
+  "custom-dispatch",
+])("does not count an unsupported %s unittest method as a passing actual test", async (kind) => {
+  const method =
+    kind === "async-setup"
+      ? "def test_owned(self): pass\n async def setUp(self): self.fail('must not be ignored')"
+      : kind === "async-cleanup"
+        ? "def test_owned(self): self.addCleanup(self.cleanup)\n async def cleanup(self): self.fail('must not be ignored')"
+        : kind === "custom-dispatch"
+          ? "def test_owned(self): self.fail('must not be ignored')\n def _callTestMethod(self, method): pass"
+          : kind === "async"
+            ? "async def test_owned(self): self.fail('must not be ignored')"
+            : kind === "generator"
+              ? "def test_owned(self): yield self.fail('must not be ignored')"
+              : kind === "async-generator"
+                ? "async def test_owned(self): yield self.fail('must not be ignored')"
+                : "def test_owned(self): return unittest.TestSuite()";
+  const result = await runNativeCheck(
+    pythonInvocation(`import unittest\nclass Scope(unittest.TestCase):\n ${method}\n`),
+  );
+  expect(result.closed).toBe(true);
+  expect(result.exitCode, result.stdout).not.toBe(0);
+  expect(result.temporary).toMatchObject({ cleanup: "removed" });
+});
+
+it("does not silently skip an asynchronous module fixture before a passing method", async () => {
+  const result = await runNativeCheck(
+    pythonInvocation(
+      "import unittest\nasync def setUpModule(): raise AssertionError('async module must not be ignored')\nclass Scope(unittest.TestCase):\n def test_owned(self): self.assertEqual(7,7)\n",
+    ),
+  );
+  expect(result.closed).toBe(true);
+  expect(result.exitCode, result.stdout).not.toBe(0);
+  expect(result.temporary).toMatchObject({ cleanup: "removed" });
+});
+
+function fixtureChecker(target: string, body: string): string {
+  const moduleHook =
+    target === "module-setup"
+      ? "setUpModule=fixture\n"
+      : target === "module-teardown"
+        ? "tearDownModule=fixture\n"
+        : target === "module-cleanup"
+          ? "unittest.addModuleCleanup(fixture)\n"
+          : "";
+  const classHook =
+    target === "class-teardown"
+      ? " tearDownClass=staticmethod(fixture)\n"
+      : target === "class-cleanup"
+        ? " @classmethod\n def setUpClass(cls): cls.addClassCleanup(fixture)\n"
+        : "";
+  return `import unittest\n${body}\n${moduleHook}class Scope(unittest.TestCase):\n def test_owned(self): self.assertEqual(7,7)\n${classHook}`;
+}
+it.each(["class-teardown", "module-teardown", "class-cleanup", "module-cleanup"])(
+  "does not report successful execution when %s fails after a passing method",
+  async (target) => {
+    const result = await runNativeCheck(
+      pythonInvocation(
+        fixtureChecker(
+          target,
+          "def fixture(): raise AssertionError('fixture-teardown-regression')",
+        ),
+      ),
+    );
+    expect(result.closed).toBe(true);
+    expect(result.exitCode, result.stdout).not.toBe(0);
+    expect(result.stderr).toContain("fixture-teardown-regression");
+    expect(result.temporary).toMatchObject({ cleanup: "removed" });
+  },
+);
+it.each(
+  ["module-setup", "module-teardown", "class-teardown", "class-cleanup", "module-cleanup"].flatMap(
+    (target) => ["async", "generator", "awaitable", "iterator"].map((form) => ({ target, form })),
+  ),
+)(
+  "rejects $form returned through $target rather than ignoring its fixture",
+  async ({ target, form }) => {
+    const body =
+      form === "async"
+        ? "async def fixture(): raise AssertionError('must execute')"
+        : form === "generator"
+          ? "def fixture(): yield 1"
+          : form === "awaitable"
+            ? "async def pending(): raise AssertionError('must execute')\ndef fixture(): return pending()"
+            : "def fixture(): return iter([1])";
+    const result = await runNativeCheck(pythonInvocation(fixtureChecker(target, body)));
+    expect(result.closed).toBe(true);
+    expect(result.exitCode, result.stdout).not.toBe(0);
+    expect(result.temporary).toMatchObject({ cleanup: "removed" });
+  },
+);
+it("forwards cleanup keywords named function, cls and method without consuming them as wrapper parameters", async () => {
+  const result = await runNativeCheck(
+    pythonInvocation(`import unittest
+values=dict(function=7,cls=8,method=9)
+def cleanup(**kwargs): assert kwargs==values
+unittest.addModuleCleanup(cleanup,**values)
+class Scope(unittest.TestCase):
+ @classmethod
+ def setUpClass(cls): cls.addClassCleanup(cleanup,**values)
+ def test_owned(self): self.addCleanup(cleanup,**values)
+`),
+  );
+  expect(result, result.stderr).toMatchObject({
+    closed: true,
+    exitCode: 0,
+    temporary: { cleanup: "removed" },
+  });
+  expect(JSON.parse(result.stdout)).toMatchObject({ tests: 1, passed: 1, failed: 0 });
+});
+
+it("preserves standard unittest's explicitly absent optional class hooks", async () => {
+  const result = await runNativeCheck(
+    pythonInvocation(
+      "import unittest\nclass Scope(unittest.TestCase):\n setUpClass=None\n tearDownClass=staticmethod(None)\n def test_owned(self): self.assertEqual(7,7)\n",
+    ),
+  );
+  expect(result, result.stderr).toMatchObject({ closed: true, exitCode: 0 });
+});
+
+it("preserves real synchronous module/class fixtures, cleanup arguments and inherited class binding", async () => {
+  const input = pythonInvocation(`import unittest
+seen=[]
+def setUpModule(): seen.append('module')
+def module_cleanup(token,*,value):
+ assert token=='module' and value==7 and seen==['module','Scope','Scope-cleanup','Child','Child-cleanup','teardown']
+def tearDownModule(): seen.append('teardown')
+unittest.addModuleCleanup(module_cleanup,'module',value=7)
+class Scope(unittest.TestCase):
+ @classmethod
+ def setUpClass(cls):
+  seen.append(cls.__name__)
+  cls.addClassCleanup(cls.cleanup,cls.__name__,value=7)
+ @staticmethod
+ def cleanup(token,*,value):
+  assert value==7
+  seen.append(token+'-cleanup')
+ def test_owned(self): self.assertIn(type(self).__name__,seen)
+class Child(Scope): pass
+`);
+  input.tests = ["test_scope.Scope.test_owned", "test_scope.Child.test_owned"];
+  const result = await runNativeCheck(input);
+  expect(result, result.stderr).toMatchObject({
+    closed: true,
+    exitCode: 0,
+    temporary: { cleanup: "removed" },
+  });
+  expect(JSON.parse(result.stdout)).toMatchObject({ tests: 2, passed: 2, failed: 0 });
+});
+
+it("does not qualify a closed successful Python process whose actual temporary cleanup fails", async () => {
+  const input = pythonInvocation(
+    "import os,tempfile,unittest\nclass Scope(unittest.TestCase):\n def test_owned(self): os.rmdir(tempfile.gettempdir())\n",
+  );
+  const result = await runNativeCheck(input);
+  expect(result, result.stderr).toMatchObject({
+    closed: true,
+    exitCode: 0,
+    temporary: { cleanup: "failed" },
+    after: { status: "unknown", reason: "CHECK_TEMPORARY_CLEANUP_UNAVAILABLE" },
+  });
+  expect(result.temporary && existsSync(result.temporary.root)).toBe(false);
+});
+it("cleans Python temporary metadata on pre-dispatch cancellation without inventing a process", async () => {
+  const input = pythonInvocation(
+    "import unittest\nclass Scope(unittest.TestCase):\n def test_owned(self): self.fail('must not execute')\n",
+  );
+  const controller = new AbortController();
+  controller.abort();
+  const result = await runNativeCheck(input, controller.signal);
+  expect(result).toMatchObject({
+    pid: null,
+    closed: true,
+    exitCode: null,
+    termination: "cancelled",
+    temporary: { cleanup: "removed" },
+  });
+});
+it("retains a changed invocation profile after the actual process rather than returning known evidence", async () => {
+  const input = invocation("setTimeout(()=>{},30);");
+  const pending = runNativeCheck(input);
+  input.args = ["not-the-started-invocation"];
+  const result = await pending;
+  expect(result).toMatchObject({
+    closed: true,
+    exitCode: 0,
+    after: { status: "unknown", reason: "CHECK_PROFILE_CHANGED" },
+  });
+});
+it("retains unavailable runtime qualification after an actual process close", async () => {
+  const input = invocation("setTimeout(()=>{},30);"),
+    descriptor = Object.getOwnPropertyDescriptor(process, "version");
+  if (!descriptor) throw Error("No original runtime capability");
+  try {
+    const pending = runNativeCheck(input);
+    Object.defineProperty(process, "version", { value: "unqualified", configurable: true });
+    expect(await pending).toMatchObject({
+      closed: true,
+      exitCode: 0,
+      after: { status: "unknown", reason: "CHECK_PROFILE_UNAVAILABLE" },
+    });
+  } finally {
+    Object.defineProperty(process, "version", descriptor);
+  }
+});
+it("tracks an external checker's actual generation even when its restored bytes hash identically", () => {
+  const product = invocation("0;"),
+    checker = invocation("0;");
+  const scope = {
+    ...product.scope,
+    inputs: [],
+    checkerScopes: [{ checkId: "outside", root: checker.scope.root, inputs: ["check.mjs"] }],
+  };
+  const before = captureCheckVersion(scope, {});
+  expect(before.status).toBe("known");
+  writeFileSync(join(checker.scope.root, "check.mjs"), "0;");
+  utimesSync(join(checker.scope.root, "check.mjs"), 1, 2);
+  const after = captureCheckVersion(scope, {});
+  if (before.status !== "known" || after.status !== "known")
+    throw Error("No original multi-root versions");
+  expect(after.version.versionId).toBe(before.version.versionId);
+  expect(after.inputGeneration).not.toBe(before.inputGeneration);
+});
 it.each([
   "zero-timeout",
   "long-timeout",

@@ -3,6 +3,7 @@ import {
   acceptanceContractIssue,
   cachedAcceptanceReviewMaterial,
   cachedAcceptanceLayers,
+  preflightAssociationIssue,
 } from "./acceptance-runtime";
 import { randomUUID } from "node:crypto";
 import {
@@ -119,6 +120,7 @@ function supervisorSchema() {
         "run_aborted",
         "run_failed",
         "advisor_hold",
+        "acceptance_pending",
         "review_failed",
         "budget_exhausted",
         "stagnant",
@@ -852,6 +854,8 @@ export function recoverSupervisor(pi: ExtensionAPI, ctx?: ExtensionContext): voi
     const issue = preflightAuthorizationIssue(ctx, state.preflightBinding);
     if (issue) throw new Error(issue);
   }
+  const association = preflightAssociationIssue(ctx);
+  if (association) throw Error(association);
   try {
     const store = receiptRecoveryStore(pi, ctx, state);
     store.promoteV2();
@@ -1869,6 +1873,11 @@ export async function reviewSupervisor(
       holdSupervisor(pi, ctx, "paused", issue, "authorization_revoked");
       return undefined;
     }
+  }
+  const association = preflightAssociationIssue(ctx);
+  if (association) {
+    holdSupervisor(pi, ctx, "paused", association, "acceptance_pending");
+    return undefined;
   }
   if (boardComplete(board) && ctx.sessionManager.getSessionFile())
     return requestFinalReview(pi, ctx, signal, advisor);

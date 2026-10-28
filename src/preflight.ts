@@ -15,6 +15,7 @@ import {
   journalDigest,
   type ReadbackFrame,
   type ReadbackProof,
+  type SessionJournal,
 } from "./human-journal";
 import {
   sessionJournalView,
@@ -29,6 +30,18 @@ import {
   type SupervisorState,
 } from "./supervisor";
 import { currentRuntime } from "./runtime";
+import {
+  captureApprovalContract,
+  approvalContractProposal,
+  ensureApprovalWorkflowFence,
+  approvalAction,
+} from "./approval-bundle";
+import {
+  ApprovalContractCaptureSchema,
+  ApprovalPreparationSchema,
+  ApprovalReferenceSchema,
+} from "./approval-schema";
+import { acceptanceLayersFromCache } from "./acceptance-contract";
 import { getBoardRef } from "./state";
 import { isSafeBoundedText } from "./validation";
 
@@ -40,7 +53,13 @@ import {
   goalStartIdentityIssue,
   goalPreflightControlIssue,
 } from "./goal-scope";
-import { supervisorPayload, isGoalRecord, scopeEqual, type GoalCurrent } from "./goal-records";
+import {
+  supervisorPayload,
+  isGoalRecord,
+  isGoalCarrier,
+  scopeEqual,
+  type GoalCurrent,
+} from "./goal-records";
 import { readGoalJournal } from "./goal-journal";
 
 export const PREFLIGHT_ENTRY = "continuous-tasks:preflight";
@@ -72,6 +91,8 @@ export const PreflightProposalSchema = Type.Object(
     permissions: Type.Array(PermissionSchema, { maxItems: 20 }),
     prohibitions: strings(),
     reconfirm: strings(),
+    contractProposalId: Type.Optional(text(200)),
+    preparation: Type.Optional(ApprovalPreparationSchema),
   },
   strict,
 );
@@ -148,6 +169,9 @@ export const PreflightRequestSchema = Type.Object(
     id: uuid,
     supersedes: Type.Optional(PreflightSupersedesSchema),
     permissionIds: Type.Optional(Type.Array(text(64), { maxItems: 20 })),
+    purpose: Type.Optional(Type.Union([Type.Literal("bundle"), Type.Literal("definitions")])),
+    acceptance: Type.Optional(ApprovalContractCaptureSchema),
+    businessApproval: Type.Optional(ApprovalReferenceSchema),
   },
   strict,
 );
@@ -172,6 +196,18 @@ export const NativePreflightControlSchema = Type.Union([
     strict,
   ),
   Type.Object(
+    { ...nativeCommon, kind: Type.Literal("define"), answer: Type.Literal("Confirm definitions") },
+    strict,
+  ),
+  Type.Object(
+    {
+      ...nativeCommon,
+      kind: Type.Literal("decline-definition"),
+      answer: Type.Literal("Decline definitions"),
+    },
+    strict,
+  ),
+  Type.Object(
     {
       ...nativeCommon,
       kind: Type.Literal("start"),
@@ -188,6 +224,13 @@ export const NativePreflightStateSchema = Type.Object(
     version: Type.Literal(2),
     permissionRequest: Type.Optional(PreflightRequestSchema),
     startRequest: Type.Optional(PreflightRequestSchema),
+    approvalFlow: Type.Optional(Type.Literal("consolidated-v1")),
+    permissionDisposition: Type.Optional(
+      Type.Union([Type.Literal("approved"), Type.Literal("rejected")]),
+    ),
+    definitionApproval: Type.Optional(
+      Type.Object({ requestId: uuid, controlEntryId: text(200), createdAt: text(100) }, strict),
+    ),
     started: Type.Optional(
       Type.Union([
         Type.Object(
@@ -216,7 +259,7 @@ export const PreflightControlSchema = Type.Union([
 export type NativePreflightControl = Static<typeof NativePreflightControlSchema>;
 export type NativePermissionControl = Extract<
   NativePreflightControl,
-  { kind: "approve" | "reject" }
+  { kind: "approve" | "reject" | "define" | "decline-definition" }
 >;
 export type NativeStartControl = Extract<NativePreflightControl, { kind: "start" }>;
 export type PreflightControl = Static<typeof PreflightControlSchema>;
@@ -281,6 +324,18 @@ function normalizedProposal(proposal: PreflightProposal): PreflightProposal {
       .sort((a, b) => (a.id < b.id ? -1 : a.id > b.id ? 1 : 0)),
     prohibitions: proposal.prohibitions.map((s) => s.trim()),
     reconfirm: proposal.reconfirm.map((s) => s.trim()),
+    ...(proposal.contractProposalId
+      ? { contractProposalId: proposal.contractProposalId.trim() }
+      : {}),
+    ...(proposal.preparation
+      ? {
+          preparation: {
+            checkIds: [...proposal.preparation.checkIds].sort(),
+            steps: proposal.preparation.steps.map((s) => s.trim()),
+            permissionIds: [...proposal.preparation.permissionIds].sort(),
+          },
+        }
+      : {}),
   };
 }
 export function canonicalPreflightProposal(goal: string, proposal: PreflightProposal): string {
@@ -316,6 +371,7 @@ export function beginPreflight(
   pi: ExtensionAPI,
   ctx: ExtensionCommandContext,
   goal: string,
+  options: { consolidated?: boolean } = {},
 ): PreflightState {
   if (currentRuntime().goal)
     throw new Error(
@@ -338,6 +394,7 @@ export function beginPreflight(
   goal = normalizeGoal(goal);
   if (!isSafeBoundedText(goal, 4000))
     throw new Error("A bounded non-secret preflight goal is required");
+  if (options.consolidated) ensureApprovalWorkflowFence(pi, ctx);
   return savePreflight(pi, {
     version: 2,
     sessionId: ctx.sessionManager.getSessionId(),
@@ -345,7 +402,15 @@ export function beginPreflight(
     goal,
     phase: "planning",
     revision: 0,
+    ...(options.consolidated ? { approvalFlow: "consolidated-v1" as const } : {}),
   });
+}
+function replaceableProposal(state: PreflightState, preflightId: string): boolean {
+  return (
+    preflightId === state.preflightId &&
+    !state.started &&
+    !["revoked", "interrupted"].includes(state.phase)
+  );
 }
 export function submitPreflight(
   pi: ExtensionAPI,
@@ -360,12 +425,7 @@ export function submitPreflight(
   const current = currentRuntime().goal?.current;
   if (current && (current.phase !== "planning" || current.planning.preflightId !== preflightId))
     throw new Error("Proposal is outside the live current GoalRun planning attempt");
-  if (
-    preflightId !== state.preflightId ||
-    state.started ||
-    state.phase === "revoked" ||
-    state.phase === "interrupted"
-  )
+  if (!replaceableProposal(state, preflightId))
     throw new Error(
       "Stale, revoked, interrupted or already-started preflight cannot be replaced by a model proposal",
     );
@@ -374,18 +434,30 @@ export function submitPreflight(
   const planDigest = preflightDigest(state.sessionId, state.goal, normalized);
   if (state.planDigest === planDigest) return structuredClone(state);
   const revision = state.revision + 1;
+  const acceptance = normalized.contractProposalId
+    ? captureApprovalContract(ctx, { ...state, proposal: normalized })
+    : undefined;
+  const needsMaterial =
+    state.version === 2 && state.approvalFlow === "consolidated-v1" && !acceptance;
+  if ([normalized.contractProposalId, normalized.preparation].some(Boolean))
+    ensureApprovalWorkflowFence(pi, ctx);
   return savePreflight(pi, {
     ...state,
     version: 2,
-    permissionRequest: {
-      id: randomUUID(),
-      supersedes: preflightRequestPredecessor(ctx, state, "permission"),
-      permissionIds: normalized.permissions
-        .filter((p) => p.required)
-        .map((p) => p.id)
-        .sort(),
-    },
+    permissionRequest: needsMaterial
+      ? undefined
+      : {
+          id: randomUUID(),
+          supersedes: preflightRequestPredecessor(ctx, state, "permission"),
+          permissionIds: normalized.permissions
+            .filter((p) => acceptance || p.required)
+            .map((p) => p.id)
+            .sort(),
+          ...(acceptance ? { purpose: "bundle" as const, acceptance } : {}),
+        },
     startRequest: undefined,
+    definitionApproval: undefined,
+    permissionDisposition: undefined,
     proposal: normalized,
     revision,
     planId: `${state.preflightId}.r${revision}`,
@@ -472,22 +544,24 @@ export function preflightRequestPredecessor(
     .at(-1);
   return legacy ? { legacyControlEntryId: legacy.id } : undefined;
 }
+export function preflightPermissionPayload(base: PreflightState, ids: string[]): object {
+  const request = base.version === 2 ? base.permissionRequest : undefined;
+  return {
+    action: request?.purpose === "definitions" ? "definitions" : "permissions",
+    sessionId: base.sessionId,
+    goal: base.goal,
+    preflightId: base.preflightId,
+    revision: base.revision,
+    planId: base.planId,
+    planDigest: base.planDigest,
+    proposal: base.proposal,
+    request,
+    permissionIds: request?.purpose === "bundle" ? request.permissionIds : ids,
+    ...(request?.purpose === "definitions" ? { businessApproval: base.approval } : {}),
+  };
+}
 export function preflightPermissionScope(base: PreflightState, ids: string[]): object {
-  return goalLogicalScope(
-    {
-      action: "permissions",
-      sessionId: base.sessionId,
-      goal: base.goal,
-      preflightId: base.preflightId,
-      revision: base.revision,
-      planId: base.planId,
-      planDigest: base.planDigest,
-      proposal: base.proposal,
-      request: base.version === 2 ? base.permissionRequest : undefined,
-      permissionIds: ids,
-    },
-    "preflight",
-  );
+  return goalLogicalScope(preflightPermissionPayload(base, ids), "preflight");
 }
 export function preflightStartScope(base: PreflightState, approvalEntryDigest: string): object {
   return goalLogicalScope(
@@ -516,6 +590,20 @@ function nativeSnapshot(data: unknown): boolean {
   data = ownerSnapshot(data, "preflight");
   return Boolean(data && typeof data === "object" && "version" in data && data.version === 2);
 }
+function nativeSelectionMatches(
+  base: PreflightState,
+  control: NativePreflightControl,
+  request: PreflightRequest,
+): boolean {
+  if (!validSelection(base, control.permissionIds)) return false;
+  if (control.kind === "start") return true;
+  if (
+    (request.purpose === "definitions") !==
+    ["define", "decline-definition"].includes(control.kind)
+  )
+    return false;
+  return request.purpose === "bundle" || same(request.permissionIds, control.permissionIds);
+}
 function nativeIdentity(base: PreflightState, control: NativePreflightControl): void {
   const request = nativeRequest(base, control.kind === "start");
   if (
@@ -535,8 +623,7 @@ function nativeIdentity(base: PreflightState, control: NativePreflightControl): 
       { owner: "preflight", sessionId: base.sessionId, requestId: request.id },
     ) ||
     JSON.stringify(control.supersedes) !== JSON.stringify(request.supersedes) ||
-    !validSelection(base, control.permissionIds) ||
-    (control.kind !== "start" && !same(request.permissionIds, control.permissionIds))
+    !nativeSelectionMatches(base, control, request)
   )
     throw new Error("Invalid native preflight identity/selection");
   const scope =
@@ -554,6 +641,8 @@ export function projectPreflightPermissions(
   nativeIdentity(base, control);
   const persistedBase = structuredClone(base);
   if (!persistedBase.approval) delete persistedBase.approval;
+  if (control.kind === "define" || control.kind === "decline-definition")
+    return projectDefinitionApproval(base, control, controlEntryId);
   const next: PreflightState = {
     ...persistedBase,
     version: 2,
@@ -569,10 +658,149 @@ export function projectPreflightPermissions(
         : undefined,
     phase: "awaiting_authorization",
   };
+  if (next.permissionRequest?.acceptance) {
+    next.permissionDisposition = control.kind === "approve" ? "approved" : "rejected";
+    next.definitionApproval =
+      control.kind === "approve"
+        ? {
+            requestId: control.humanInteraction.requestId,
+            controlEntryId,
+            createdAt: control.createdAt,
+          }
+        : undefined;
+  }
   if (!base.started) next.startRequest = undefined;
   if (control.kind === "approve" && !missingRequired(next).length)
     next.phase = next.started ? "started" : "approved";
   return next;
+}
+function projectDefinitionApproval(
+  base: PreflightState,
+  control: Extract<NativePermissionControl, { kind: "define" | "decline-definition" }>,
+  controlEntryId: string,
+): PreflightState {
+  if (
+    base.version !== 2 ||
+    base.permissionRequest?.purpose !== "definitions" ||
+    !base.approval ||
+    base.permissionRequest.businessApproval?.entryId !== base.approval.controlEntryId ||
+    !same(control.permissionIds, base.approval.permissionIds)
+  )
+    throw Error("Definition confirmation cannot create or alter business permissions");
+  return {
+    ...structuredClone(base),
+    definitionApproval:
+      control.kind === "define"
+        ? {
+            requestId: control.humanInteraction.requestId,
+            controlEntryId,
+            createdAt: control.createdAt,
+          }
+        : undefined,
+  };
+}
+function definitionAuthorityBase(
+  stored: unknown,
+  control: NativePreflightControl,
+  sessionId: string,
+) {
+  const base = isGoalCarrier(stored) ? stored.snapshot : stored;
+  if (!Check(NativePreflightStateSchema, base) || proposalIssue(base))
+    throw Error("Approval definition authority belongs to another plan or selection");
+  const request = base.permissionRequest;
+  if (
+    !request ||
+    control.sessionId !== sessionId ||
+    control.preflightId !== base.preflightId ||
+    control.planId !== base.planId ||
+    control.planDigest !== base.planDigest ||
+    control.humanInteraction.requestId !== request.id ||
+    !validSelection(base, control.permissionIds) ||
+    !same(control.supersedes, request.supersedes)
+  )
+    throw Error("Approval definition authority belongs to another plan or selection");
+  return { base, request };
+}
+function assertDefinitionBusinessGrant(
+  journal: SessionJournal,
+  base: Extract<PreflightState, { version: 2 }>,
+  request: NonNullable<Extract<PreflightState, { version: 2 }>["permissionRequest"]>,
+  control: NativePreflightControl,
+  proof: Extract<ReadbackProof, { status: "confirmed" }>,
+): void {
+  if (control.kind === "define") {
+    const reference = request.businessApproval;
+    if (!reference || reference.entryId !== base.approval?.controlEntryId)
+      throw Error("Definition authority lacks its original business grant");
+    const original = journal.nodes.get(reference.entryId);
+    if (
+      !original ||
+      !Check(NativePreflightControlSchema, original.data) ||
+      original.data.kind !== "approve"
+    )
+      throw Error("A definition confirmation cannot stand in for the original business grant");
+    const business = confirmedApprovalDefinitionSource(journal, reference);
+    if (
+      business.base.preflightId !== base.preflightId ||
+      business.base.planDigest !== base.planDigest ||
+      !same(business.control.permissionIds, control.permissionIds) ||
+      journal.branch.findIndex((node) => node.id === business.proof.witness.id) >=
+        journal.branch.findIndex((node) => node.id === proof.base.id)
+    )
+      throw Error("Definition authority changed or replayed its business grant");
+  }
+}
+function definitionAuthorityProposal(
+  journal: SessionJournal,
+  base: Extract<PreflightState, { version: 2 }>,
+  capture: NonNullable<
+    NonNullable<Extract<PreflightState, { version: 2 }>["permissionRequest"]>["acceptance"]
+  >,
+) {
+  const proposal = approvalContractProposal(journal, base);
+  if (
+    capture.proposalId !== proposal.data.proposalId ||
+    !same(capture.proposalRef, { entryId: proposal.entryId, digest: proposal.digest }) ||
+    capture.workspace.root !== journal.cwd
+  )
+    throw Error("Approval definition proposal or workspace source changed");
+  return proposal;
+}
+/** Actual prior source only. Returns verified metadata, never creates a grant or dispatch. */
+export function confirmedApprovalDefinitionSource(
+  journal: SessionJournal,
+  reference: { entryId: string; digest: string },
+) {
+  const source = journal.nodes.get(reference.entryId);
+  if (
+    !source ||
+    source.digest !== reference.digest ||
+    !Check(NativePreflightControlSchema, source.data) ||
+    !["approve", "define"].includes(source.data.kind)
+  )
+    throw Error("Approval definition authority is not an original confirming control");
+  const control = source.data;
+  const proof = findReadbackProof(journal, "preflight", control.humanInteraction.requestId);
+  if (proof.status !== "confirmed" || proof.control.id !== source.id)
+    throw Error("Approval definition authority lacks its actual physical witness");
+  const stored = proof.base.data;
+  const { base, request } = definitionAuthorityBase(stored, control, journal.sessionId);
+  const payload = preflightPermissionPayload(base, control.permissionIds);
+  const goalScope = isGoalCarrier(stored)
+    ? { goalRunId: stored.goalRunId, lifecycleCommitId: stored.lifecycleCommitId }
+    : undefined;
+  if (
+    journalDigest(goalScope ? { goalScope, payload } : payload) !==
+    control.humanInteraction.scopeDigest
+  )
+    throw Error("Approval definition material differs from its native scope");
+  const capture = request.acceptance;
+  if (!capture) throw Error("Old permission approval cannot confirm acceptance definitions");
+  if (control.kind === "approve" ? request.purpose !== "bundle" : request.purpose !== "definitions")
+    throw Error("Definition authority has the wrong native question meaning");
+  assertDefinitionBusinessGrant(journal, base, request, control, proof);
+  const proposal = definitionAuthorityProposal(journal, base, capture);
+  return { base, control, proof, capture, proposal, goalScope };
 }
 export function projectPreflightStart(
   base: PreflightState,
@@ -611,9 +839,25 @@ function associationIssue(state: PreflightState): string | undefined {
     ? "Inconsistent preflight phase/goal association"
     : undefined;
 }
+// A material-only row has no authority. A later revocation may retain it, but
+// the fold still requires that original revoke control before accepting the transition.
+function materialOnlyProposal(state: Extract<PreflightState, { version: 2 }>): boolean {
+  return (
+    state.approvalFlow === "consolidated-v1" &&
+    ["awaiting_authorization", "revoked"].includes(state.phase) &&
+    !!state.proposal &&
+    !state.proposal.contractProposalId &&
+    !state.approval &&
+    !state.started &&
+    !state.startRequest &&
+    !state.definitionApproval &&
+    !state.permissionDisposition
+  );
+}
 function proposalRequestIssue(state: PreflightState): string | undefined {
   if (state.version !== 2) return undefined;
-  if (!state.permissionRequest) return "Native proposal needs permission request";
+  if (!state.permissionRequest)
+    return materialOnlyProposal(state) ? undefined : "Native proposal needs permission request";
   if (
     !state.permissionRequest.permissionIds ||
     !validSelection(state, state.permissionRequest.permissionIds) ||
@@ -695,7 +939,11 @@ function controlClosureIssue(
   }
   const latest = controls
     .reverse()
-    .find((entry) => entry.data.preflightId === state.preflightId && entry.data.kind !== "start");
+    .find(
+      (entry) =>
+        entry.data.preflightId === state.preflightId &&
+        ["approve", "reject", "revoke"].includes(entry.data.kind),
+    );
   const approval = state.approval;
   if (!approval || !latest || latest.id !== approval.controlEntryId)
     return "No current-branch human control closure for preflight approval";
@@ -751,7 +999,8 @@ function approvalIssue(
     ? `Preflight missing required permissions: ${missing.join(", ")}`
     : undefined;
 }
-function bindingOf(state: PreflightState): PreflightBinding {
+/** Identity only; does not prove approval, Start, or admission. */
+export function preflightPlanBinding(state: PreflightState): PreflightBinding {
   if (!state.planId || !state.planDigest) throw new Error("No complete preflight proposal");
   return { preflightId: state.preflightId, planId: state.planId, planDigest: state.planDigest };
 }
@@ -788,7 +1037,7 @@ export function inspectPreflightStart(
   if (issue) throw new Error(issue);
   if (state.phase !== "approved" || state.started)
     throw new Error("This preflight is not an unused approved plan; do not start it twice");
-  return bindingOf(state);
+  return preflightPlanBinding(state);
 }
 export function preflightStartBinding(
   ctx: ExtensionContext,
@@ -955,7 +1204,7 @@ function readPreflightStartup(
   if (
     state.sessionId !== base.sessionId ||
     state.goal !== base.goal ||
-    journalDigest(state.preflightBinding) !== journalDigest(bindingOf(base)) ||
+    journalDigest(state.preflightBinding) !== journalDigest(preflightPlanBinding(base)) ||
     !initialStartupState(state)
   )
     throw new Error("Contradictory preflight startup record");
@@ -1102,7 +1351,22 @@ function requestPreparation(before: PreflightState, after: PreflightState): bool
     delete c.startRequest;
     return c;
   };
-  return same(strip(before), strip(after));
+  const previous = strip(before),
+    next = strip(after);
+  // A new metadata-only question may invalidate the old current definition, but
+  // cannot write a new confirmation or change the original business grant.
+  if (
+    before.version === 2 &&
+    after.permissionRequest?.purpose === "definitions" &&
+    after.definitionApproval === undefined &&
+    after.approval &&
+    after.permissionRequest.businessApproval?.entryId === after.approval.controlEntryId &&
+    same(before.approval, after.approval)
+  ) {
+    delete previous.definitionApproval;
+    delete next.definitionApproval;
+  }
+  return same(previous, next);
 }
 function validProposalTransition(before: PreflightState, after: PreflightState): boolean {
   return (
@@ -1576,6 +1840,20 @@ function permissionResponseText(ctx: ExtensionContext, state: PreflightState): s
 }
 
 function permissionContext(ctx: ExtensionContext, state: PreflightState): string | undefined {
+  const runtime = currentRuntime(),
+    block = runtime.preflightDefinitionBlock;
+  const stale =
+    state.version === 2 &&
+    block?.preflightId === state.preflightId &&
+    block.planDigest === state.planDigest &&
+    block.controlEntryId === state.definitionApproval?.controlEntryId;
+  const action = approvalAction(
+    state,
+    Boolean(acceptanceLayersFromCache(runtime).contractId),
+    stale,
+  );
+  if (action && !state.started)
+    return `Preflight ${state.preflightId}; original goal: ${state.goal}. ${action.kind === "start" ? "Approved, not started. " : ""}Next actor: ${action.actor}. ${action.command ?? ""} ${action.effect} Prepare a complete read-only proposal; no business implementation, Start or result acceptance from this text. Complete material must use propose_contract and submit_preflight, not chat approval. Recorded scope: ${JSON.stringify({ planId: state.planId, proposal: state.proposal })}`;
   if (state.phase === "approved")
     return `Preflight permissions are approved, not started. No execution has been authorized by this approval alone. Remain read-only until startup. Wait for the human's separate /task-supervisor start (no plan ID needed); do not resubmit the same proposal. Recorded scope: ${JSON.stringify({ goal: state.goal, planId: state.planId, planDigest: state.planDigest, proposal: state.proposal, selectedPermissionIds: state.approval?.permissionIds ?? [] })}`;
   if (state.phase === "awaiting_authorization")
@@ -1583,6 +1861,15 @@ function permissionContext(ctx: ExtensionContext, state: PreflightState): string
   return undefined;
 }
 
+function executionAgreement(state: PreflightState): string {
+  if (
+    state.version === 2 &&
+    state.proposal?.contractProposalId &&
+    !acceptanceLayersFromCache(currentRuntime()).contractId
+  )
+    return `Confirmed original Start covers only explicitly approved preparation until concrete definitions are natively bound. Do not compile, claim, advance managed tasks or run_check yet. Preserve the original Goal and Start; user reviews ${state.proposal.contractProposalId} with review-contract after preparation. Agreement: ${JSON.stringify(state.proposal)}`;
+  return `Confirmed preflight execution agreement (not a sandbox): ${JSON.stringify({ goal: state.goal, phase: state.phase, planId: state.planId, planDigest: state.planDigest, proposal: state.proposal, selectedPermissionIds: state.approval?.permissionIds ?? [] })}\nMain must verify natural-language limits, prohibitions and reconfirmation conditions before every relevant action. A tool, advisor, READY or review result never grants permissions.`;
+}
 export function preflightContext(ctx: ExtensionContext): string | undefined {
   const state = currentRuntime().preflight;
   if (!state || state.sessionId !== ctx.sessionManager.getSessionId()) return undefined;
@@ -1593,8 +1880,7 @@ export function preflightContext(ctx: ExtensionContext): string | undefined {
     return `Recorded preflight result is held: ${fault ?? "projection repair pending"}. Do not execute or request the same approval again. Inspect and use /task-supervisor repair-preflight only for its confirmed pending cache; other holds remain.`;
   const permissions = permissionContext(ctx, state);
   if (permissions) return permissions;
-  if (state.started)
-    return `Confirmed preflight execution agreement (not a sandbox): ${JSON.stringify({ goal: state.goal, phase: state.phase, planId: state.planId, planDigest: state.planDigest, proposal: state.proposal, selectedPermissionIds: state.approval?.permissionIds ?? [] })}\nMain must verify natural-language limits, prohibitions and reconfirmation conditions before every relevant action. A tool, advisor, READY or review result never grants permissions.`;
+  if (state.started) return executionAgreement(state);
   if (state.phase === "interrupted" || state.phase === "revoked")
     return `Preflight ${state.phase}; no execution permission. Inspect history and use a new human preflight command before planning again.`;
   return `Preflight ${state.preflightId}; user-recorded goal: ${state.goal}\nPrepare a read-only proposal with scope, permissions, prohibitions and validation. Submit it through submit_preflight using this exact preflightId. Do not implement or start supervision. A proposal is not user approval. Current preflight phase: ${state.phase}.`;
@@ -1615,6 +1901,17 @@ export function preflightStatusLines(ctx: ExtensionContext): string[] {
     lines.push(
       "Confirmed preflight result saved; projection repair pending; execution held.",
       "Next preflight: inspect, then /task-supervisor repair-preflight (cache only; no restart)",
+    );
+    return lines;
+  }
+  const action = approvalAction(
+    state,
+    Boolean(acceptanceLayersFromCache(currentRuntime()).contractId),
+  );
+  if (action && !state.started) {
+    lines.push(
+      `Next preflight actor: ${action.actor}`,
+      `Next preflight: ${action.command ?? action.effect}`,
     );
     return lines;
   }

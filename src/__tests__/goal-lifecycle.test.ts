@@ -1,6 +1,6 @@
 import { afterEach, beforeEach, expect, it, vi } from "vitest";
 import { rmSync } from "node:fs";
-import { goalFixture } from "./helpers/goal";
+import { goalFixture, completeGoalProposal } from "./helpers/goal";
 import { resetState, getBoard } from "../state";
 import { currentRuntime } from "../runtime";
 import {
@@ -14,7 +14,6 @@ import {
 import { journalDigest } from "../human-journal";
 import { submitAndPresentPreflight, startApprovedPreflight } from "../preflight-human";
 import { restorePreflight } from "../preflight";
-import { localProposal } from "./helpers/preflight";
 
 const fixtures: Awaited<ReturnType<typeof goalFixture>>[] = [];
 beforeEach(() => {
@@ -172,7 +171,7 @@ it("repairs the exact written planning attempt after acknowledgement loss instea
 });
 
 it("rejects a changed pinned model before saving native first-start authority", async () => {
-  const f = await goalFixture();
+  const f = await goalFixture({ gitWorkspace: true });
   fixtures.push(f);
   await requestGoalTransition(f.api, f.ctx, { goal: "Pinned model goal", intent: "supervise" });
   vi.mocked(f.ctx.ui.select).mockResolvedValue("允许上述范围");
@@ -181,7 +180,7 @@ it("rejects a changed pinned model before saving native first-start authority", 
     f.ctx,
     "proposal-call",
     currentRuntime().preflight!.preflightId,
-    localProposal,
+    await completeGoalProposal(f),
   );
   Object.assign(f.ctx, { model: { provider: "faux", id: "different" } });
   vi.mocked(f.ctx.ui.select).mockResolvedValue("开始执行");
@@ -198,7 +197,7 @@ it("rejects a changed pinned model before saving native first-start authority", 
 });
 
 it("requires and restores a fresh scope-bound preflight approval for the new goal without starting execution", async () => {
-  const f = await goalFixture();
+  const f = await goalFixture({ gitWorkspace: true });
   fixtures.push(f);
   await requestGoalTransition(f.api, f.ctx, { goal: "New authorized plan", intent: "supervise" });
   const goal = structuredClone(currentRuntime().goal!.current!);
@@ -209,7 +208,7 @@ it("requires and restores a fresh scope-bound preflight approval for the new goa
     f.ctx,
     "proposal-call",
     preflightId,
-    localProposal,
+    await completeGoalProposal(f),
   );
   expect(result.status).toBe("approved");
   expect(currentRuntime().preflight?.phase).toBe("approved");

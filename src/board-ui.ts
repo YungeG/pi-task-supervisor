@@ -8,7 +8,8 @@ import { hasActiveNativeQuestion } from "./human-ui";
 import { beginReadOnlyView } from "./ui-view-lifecycle";
 import { showGoalHistory } from "./goal-history-ui";
 import { phaseLabel } from "./formatting";
-import { flowFacts, nextFlowStep } from "./flow";
+import { flowFacts, nextFlowStep, cachedApprovalAction } from "./flow";
+import { PREFLIGHT_ASSOCIATION_FAULT } from "./approval-bundle";
 import { currentRuntime } from "./runtime";
 import { preflightSummary } from "./human-presentation";
 import type { PreflightState } from "./preflight";
@@ -179,7 +180,14 @@ function preflightView(ctx: ExtensionContext) {
   const repair = runtime.preflightRepair?.sessionId === ctx.sessionManager.getSessionId();
   const summary = preflightSummary(
     state,
-    repair ? "repair" : runtime.journalFault ? "fault" : undefined,
+    repair
+      ? "repair"
+      : runtime.journalFault === PREFLIGHT_ASSOCIATION_FAULT
+        ? "association"
+        : runtime.journalFault
+          ? "fault"
+          : undefined,
+    cachedApprovalAction(ctx.sessionManager.getSessionId()),
   );
   return { state, repair, summary };
 }

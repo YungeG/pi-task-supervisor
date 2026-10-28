@@ -42,6 +42,7 @@ let releaseInterruptedReview;
 let completedCompactions = 0;
 let advisoryChecks = 0;
 const goal = "Verify the approved local smoke work";
+const preflightContract = (await import("./preflight-contract.mjs")).preflightContract;
 const preflightProposal = {
   summary: "Verify local SDK fixtures without external effects",
   steps: ["Run the two-task SDK fixture"],
@@ -61,10 +62,11 @@ const preflightProposal = {
   reconfirm: ["Material proposal changes"],
 };
 function latestPreflight(manager) {
-  return [...manager.getBranch()]
+  const value = [...manager.getBranch()]
     .reverse()
     .find((entry) => entry.type === "custom" && entry.customType === "continuous-tasks:preflight")
     ?.data;
+  return value?.snapshot ?? value;
 }
 import {
   createAgentSession,
@@ -282,6 +284,7 @@ try {
   writeFileSync(join(sandbox, "review-input.txt"), "Fixed owned smoke validation input\n");
   if(preflight)writeFileSync(join(sandbox,"acceptance-check.mjs"),"import assert from 'node:assert/strict';import{readFileSync}from'node:fs';assert.equal(readFileSync(new URL('./review-input.txt',import.meta.url),'utf8'),'Fixed owned smoke validation input\\n');console.log(JSON.stringify({protocol:'check-result-v1',tests:1,passed:1,failed:0,skipped:0,requiredCases:{'smoke-input':'passed'},skippedIds:[]}));\n");
   const sessionManager = SessionManager.create(sandbox, join(sandbox, "sessions"));
+  if(preflight) sessionManager.appendMessage({role:"user",content:"Owned offline request for this isolated preflight smoke only",timestamp:Date.now()});
   writeFileSync(
     join(sandbox, "continuous-tasks.json"),
     JSON.stringify({
@@ -446,7 +449,13 @@ try {
   faux.setResponses([
     ...(preflight
       ? [
+          tool("propose_contract", {proposal:preflightContract}, "preflight-contract-proposal"),
           (context) => {
+            const result=sessionManager.getBranch().find(row=>row.type==="message"&&row.message.role==="toolResult"&&row.message.toolCallId==="preflight-contract-proposal");
+            const text=result?.message.content.find(part=>part.type==="text")?.text;
+            const proposalId=text?JSON.parse(text).proposalId:undefined;
+            if(!proposalId) throw Error("Actual owned planning contract result is missing");
+            preflightProposal.contractProposalId=proposalId;
             const plan = latestPreflight(sessionManager);
             if (
               !plan ||
@@ -655,6 +664,13 @@ try {
           if (customMode === "scope") {
             for (let page = 0; page < 10000 && !completed; page++) {
               const header = render().split("\n")[0];
+              if(header.includes("集中审核")) {
+                if(!preflightApprovalEnabled) {press("\u001b");continue;}
+                originalRendered=true;scopeMaterial.push(render());press("a");
+                if(render().includes("完整材料已核对")) press("\r");
+                else press("\u001b[6~");
+                continue;
+              }
               if (header.includes("需要你回应")) {
                 const card = render();
                 if (/→\s*稍后决定（不提交）/u.test(card)) press("\u001b[B");
@@ -666,7 +682,7 @@ try {
                 throw new Error("Expected actual formatted/original scope-review page");
               press("\r");
             }
-            if (!originalRendered)
+            if (!originalRendered && !(preflight && !preflightApprovalEnabled))
               throw new Error("Formatted browsing cannot replace original review");
           } else {
             const detail = () => {
@@ -954,7 +970,7 @@ try {
   const branch = sessionManager.getBranch();
   if(preflight){
     const facts=branch.filter(entry=>entry.type==="custom"&&entry.customType==="continuous-tasks:acceptance-facts"),bound=facts.findLast(entry=>entry.data.kind==="acceptance-contract-bound"),start=facts.find(entry=>entry.data.kind==="acceptance-check-started"&&entry.data.callId==="contract-validation"),observed=facts.find(entry=>entry.data.kind==="acceptance-check-observed"&&entry.data.startedRef.entryId===start?.id);
-    if(bound?.data.authority.kind!=="recognized-host"||!start||!observed||observed.data.closed!==true||observed.data.exitCode!==0||observed.data.termination!=="exited"||!Number.isSafeInteger(observed.data.pid)||observed.data.pid<=0||observed.data.result?.tests!==1||observed.data.result?.requiredCases?.["smoke-input"]!=="passed"||!observed.data.invocation.args.includes(join(sandbox,"acceptance-check.mjs")))throw Error("Preflight smoke lacks actual source-bound fixed-specification contract/check");
+    if(bound?.data.authority.kind!=="preflight-reviewed"||!start||!observed||observed.data.closed!==true||observed.data.exitCode!==0||observed.data.termination!=="exited"||!Number.isSafeInteger(observed.data.pid)||observed.data.pid<=0||observed.data.result?.tests!==1||observed.data.result?.requiredCases?.["smoke-input"]!=="passed"||!observed.data.invocation.args.includes(join(sandbox,"acceptance-check.mjs")))throw Error("Preflight smoke lacks actual source-bound fixed-specification contract/check");
   }
   const userMessages = branch.filter(
     (entry) => entry.type === "message" && entry.message.role === "user",
@@ -976,7 +992,7 @@ try {
   if (completedCompactions !== ((compaction || interruptCompaction) && !ordinaryPause ? 1 : 0))
     throw new Error("Unexpected automatic compaction count");
   if (faux.getPendingResponseCount() !== 0) throw new Error("Faux responses were not exhausted");
-  if (userMessages.length !== (supervised ? 0 : 1))
+  if (userMessages.length !== (preflight ? 1 : supervised ? 0 : 1))
     throw new Error("Auto-continuation forged a user message");
   if (
     continuationMessages.length !==
@@ -994,7 +1010,7 @@ try {
     throw new Error("Completed tasks are missing evidence");
   }
   const expectedTools = [
-    ...(preflight ? ["submit_preflight"] : []),
+    ...(preflight ? ["propose_contract", "submit_preflight"] : []),
     "write_tasks",
     "edit_tasks",
     "compile_tasks",
@@ -1281,7 +1297,7 @@ try {
       uiStubNotRealTerminal: true,
       preflightExecutionContractCombination:preflight&&asyncExecution,
       preflightSourceBoundarySimulated: preflight,
-      preflightContractAuthority:preflight?"recognized-host-fixed-specification":"not-in-this-arm",
+      preflightContractAuthority:preflight?"source-verified-preflight-reviewed":"not-in-this-arm",
       preflightActualRegisteredCheck:preflight,
       nativeContractReviewInThisArm:false,
       productionHumanProof: false,

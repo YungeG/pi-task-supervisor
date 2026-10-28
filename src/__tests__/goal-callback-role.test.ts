@@ -1,7 +1,6 @@
 import { afterEach, beforeEach, expect, it, vi } from "vitest";
 import { appendFileSync, readFileSync, writeFileSync, rmSync } from "node:fs";
-import { goalFixture } from "./helpers/goal";
-import { localProposal } from "./helpers/preflight";
+import { goalFixture, completeGoalProposal } from "./helpers/goal";
 import { resetState } from "../state";
 import { currentRuntime } from "../runtime";
 import { submitAndPresentPreflight } from "../preflight-human";
@@ -25,8 +24,9 @@ afterEach(() => {
 async function startedAfterPlanningCall(
   calls: Array<{ id: string; name?: string }> = [{ id: "planning-read", name: "read" }],
   admit = false,
+  book?: GoalToolLeases,
 ) {
-  const f = await goalFixture();
+  const f = await goalFixture({ gitWorkspace: true });
   fixtures.push(f);
   await f.command("supervise Cold planning role");
   await f.fire("agent_start");
@@ -45,6 +45,10 @@ async function startedAfterPlanningCall(
     }) + "\n",
   );
   f.reload();
+  if (book) {
+    expect(book.begin("planning-read", f.ctx, "read")).toBeUndefined();
+    book.allow("planning-read");
+  }
   if (admit)
     await f.fire("tool_call", {
       type: "tool_call",
@@ -58,7 +62,7 @@ async function startedAfterPlanningCall(
     f.ctx,
     "cold-plan",
     currentRuntime().preflight!.preflightId,
-    localProposal,
+    await completeGoalProposal(f),
   );
   await f.fire("agent_settled", { type: "agent_settled", aborted: false });
   vi.mocked(f.ctx.ui.select).mockResolvedValue("开始执行");
@@ -105,15 +109,18 @@ it.each([false, true])(
   },
 );
 
-it("preserves the same planning role when active callback capacity is reached without evicting it", async () => {
-  const f = await startedAfterPlanningCall(undefined, true);
-  for (let i = 0; i < 512; i++)
-    await f.fire("tool_call", {
-      type: "tool_call",
-      toolCallId: `other-read-${i}`,
-      toolName: "read",
-      input: { path: "synthetic" },
-    });
+it("preserves the same planning role at unit role-cache capacity without claiming fake SDK admissions", async () => {
+  const book = new GoalToolLeases();
+  const f = await startedAfterPlanningCall(undefined, true, book);
+  // Existing public cache mechanics, not fabricated successful SDK tool executions.
+  let limit: string | undefined;
+  for (let i = 0; i < 512; i++) {
+    const id = `other-read-${i}`;
+    limit = book.begin(id, f.ctx, "read");
+    if (!limit) book.allow(id);
+  }
+  expect(limit).toContain("limit");
+  expect(book.result("planning-read", f.ctx, "read")).toBe("historical");
   const before = currentRuntime().receiptStore!.checkpoint();
   const writes = f.entries().length;
   const result = await f.fire("tool_result", {

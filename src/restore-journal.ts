@@ -168,7 +168,7 @@ class Restoration implements RestoreJournalCycle {
         return this.makeRead(
           context,
           {
-            sessionId: this.sessionId,
+            ...value,
             branch,
             nodes: new Map(branch.map((node) => [node.id, node])),
           },

@@ -337,6 +337,76 @@ describe("requestNativeAnswer - positive mechanism tests", () => {
     process.argv = ["node", trustedCliPath];
   }
 
+  it.each([
+    "missing",
+    "wrong-kind",
+    "too-many",
+    "duplicate-ids",
+    "unsafe-id",
+    "unsafe-label",
+    "nonboolean-required",
+    "duplicate-selection",
+    "foreign-selection",
+    "tab-body",
+    "nul-body",
+    "format-body",
+  ])("rejects malformed bundled metadata before original UI completion: %s", async (kind) => {
+    setupTrustedTui();
+    const ctx = createMockContext();
+    const question: any = {
+      frame: createMockFrame({ owner: "preflight" }),
+      kind: "authorization",
+      purpose: "approval-bundle",
+      title: "明确范围",
+      body: "完整范围与条件",
+      approval: {
+        permissions: [{ id: "A1", label: "只读声明文件", required: true }],
+        selectedIds: ["A1"],
+      },
+    };
+    if (kind === "missing") delete question.approval;
+    if (kind === "wrong-kind") question.kind = "choice";
+    if (kind === "too-many")
+      question.approval.permissions = Array.from({ length: 21 }, (_, index) => ({
+        id: `A${index}`,
+        label: "bounded",
+        required: false,
+      }));
+    if (kind === "duplicate-ids")
+      question.approval.permissions.push({ ...question.approval.permissions[0] });
+    if (kind === "unsafe-id") question.approval.permissions[0].id = "\u001b[31m";
+    if (kind === "unsafe-label") question.approval.permissions[0].label = "x".repeat(501);
+    if (kind === "nonboolean-required") question.approval.permissions[0].required = "yes";
+    if (kind === "duplicate-selection") question.approval.selectedIds = ["A1", "A1"];
+    if (kind === "foreign-selection") question.approval.selectedIds = ["A999"];
+    if (kind === "tab-body") question.body = "Unsafe\t";
+    if (kind === "nul-body") question.body = "Unsafe\u0000";
+    if (kind === "format-body") question.body = "Unsafe\u200b";
+    expect(await requestNativeAnswer(ctx, question, () => true)).toBeUndefined();
+    expect(ctx.ui.custom).not.toHaveBeenCalled();
+    expect(ctx.ui.select).not.toHaveBeenCalled();
+  });
+
+  it("issues only the actual private bundled answer after the valid original component completes", async () => {
+    setupTrustedTui();
+    const ctx = createMockContext();
+    const question: NativeQuestion = {
+      frame: createMockFrame({ owner: "preflight" }),
+      kind: "authorization",
+      purpose: "approval-bundle",
+      title: "明确范围",
+      body: "完整范围与条件",
+      approval: {
+        permissions: [{ id: "A1", label: "只读声明文件", required: true }],
+        selectedIds: ["A1"],
+      },
+    };
+    const answer = await requestNativeAnswer(ctx, question, () => true);
+    expect(answer).toMatchObject({ outcome: "approve", value: '["A1"]' });
+    expect(requireNativeAnswer(ctx, answer, question.frame)).toBe(answer);
+    expect(() => requireNativeAnswer(ctx, { ...answer }, question.frame)).toThrow();
+  });
+
   it("issues a private goal-frame2 archive-and-plan answer without treating it as business approval", async () => {
     setupTrustedTui();
     const ctx = createMockContext();

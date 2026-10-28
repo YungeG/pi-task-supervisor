@@ -46,6 +46,7 @@ export function getBoardRef(): Readonly<TaskBoardSnapshot> {
 export function resetState(): void {
   currentRuntime().sessionId = undefined;
   currentRuntime().executionMemoryBindings = undefined;
+  currentRuntime().preflightDefinitionBlock = undefined;
   currentRuntime().board = createEmptyBoard();
   currentRuntime().goal = undefined;
   currentRuntime().controlJournal = undefined;

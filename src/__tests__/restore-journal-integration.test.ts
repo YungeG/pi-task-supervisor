@@ -11,8 +11,7 @@ import type * as NodeFs from "node:fs";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
 import { afterEach, beforeEach, expect, it, vi } from "vitest";
-import { goalFixture } from "./helpers/goal";
-import { localProposal } from "./helpers/preflight";
+import { goalFixture, completeGoalProposal } from "./helpers/goal";
 import { createMockAPI, createMockContext } from "./helpers/mocks";
 import { getHandler, lifecycle } from "./helpers/lifecycle";
 import { currentRuntime } from "../runtime";
@@ -53,7 +52,7 @@ function resetReads() {
   vi.mocked(readSync).mockClear();
 }
 async function scoped(start = false) {
-  const h = await goalFixture();
+  const h = await goalFixture(start ? { gitWorkspace: true } : {});
   fixtures.push(h);
   await h.command("supervise Shared restore fixture");
   if (start) {
@@ -64,7 +63,7 @@ async function scoped(start = false) {
       h.ctx,
       "synthetic-proposal",
       currentRuntime().preflight!.preflightId,
-      localProposal,
+      await completeGoalProposal(h),
     );
     await h.fire("agent_settled", { type: "agent_settled", aborted: false });
     vi.mocked(h.ctx.ui.select).mockResolvedValue("开始执行");

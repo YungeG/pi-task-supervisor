@@ -1,9 +1,17 @@
 import { spawn } from "node:child_process";
 import { createHash } from "node:crypto";
-import { lstatSync } from "node:fs";
-import { join, resolve } from "node:path";
+import { lstatSync, mkdtempSync, chmodSync, rmSync } from "node:fs";
+import { join } from "node:path";
+import {
+  nativePlanDescriptor,
+  prepareNativePlan,
+  type NativeCheckPlan,
+  type ExecutionDescriptor,
+} from "./check-profile";
 import {
   captureArtifactVersion,
+  captureDefinitionVersion,
+  artifactInputLocation,
   type ArtifactScope,
   type ArtifactVersionResult,
   type ArtifactVersionV1,
@@ -11,15 +19,11 @@ import {
 
 /** Native finite-check mechanics only. No caller of this function obtains a trusted
  * contract, permission, source qualification, task completion or acceptance. */
-export interface NativeCheckInvocation {
+export interface NativeCheckInvocation extends Omit<NativeCheckPlan, "scope"> {
   scope: ArtifactScope;
-  script: string;
-  args: readonly string[];
-  environment: Readonly<Record<string, string>>;
-  timeoutMs: number;
 }
 export interface NativeCheckExecution {
-  invocation: { executable: string; args: string[]; cwd: string; environmentDigest: string };
+  invocation: ExecutionDescriptor;
   pid: number | null;
   closed: boolean;
   exitCode: number | null;
@@ -31,27 +35,32 @@ export interface NativeCheckExecution {
   before: ArtifactVersionV1;
   beforeGeneration: string;
   after: CheckVersionResult;
+  temporary?: { root: string; inputDigest: string; cleanup: "removed" | "retained" | "failed" };
 }
 export type CheckVersionResult =
   | { status: "known"; version: ArtifactVersionV1; inputGeneration: string }
   | Extract<ArtifactVersionResult, { status: "unknown" }>;
 function inputGeneration(version: ArtifactVersionV1): string {
-  const root = version.workspace.root,
-    rootStat = lstatSync(root, { bigint: true });
-  if (
-    !rootStat.isDirectory() ||
-    rootStat.isSymbolicLink() ||
-    String(rootStat.dev) !== version.workspace.device ||
-    String(rootStat.ino) !== version.workspace.inode
-  )
-    throw Error("Input workspace identity changed");
-  const entries: unknown[] = [
-    [root, String(rootStat.dev), String(rootStat.ino), String(rootStat.mode)],
+  const workspaces = [
+    version.workspace,
+    ...(version.checkerWorkspaces?.map((entry) => entry.workspace) ?? []),
   ];
+  const entries: unknown[] = workspaces.map((workspace) => {
+    const stat = lstatSync(workspace.root, { bigint: true });
+    if (
+      !stat.isDirectory() ||
+      stat.isSymbolicLink() ||
+      String(stat.dev) !== workspace.device ||
+      String(stat.ino) !== workspace.inode
+    )
+      throw Error("Input workspace identity changed");
+    return [workspace.root, String(stat.dev), String(stat.ino), String(stat.mode)];
+  });
   const paths = [...version.inputs, ...version.artifacts].map((file) => file.path).sort();
   for (const path of paths) {
-    let full = root;
-    const parts = path.split("/");
+    const source = artifactInputLocation(version, path);
+    let full = source.root;
+    const parts = source.path.split("/");
     parts.forEach((part, index) => {
       full = join(full, part);
       const stat = lstatSync(full, { bigint: true }),
@@ -68,7 +77,15 @@ function inputGeneration(version: ArtifactVersionV1): string {
     });
   }
   return createHash("sha256")
-    .update(JSON.stringify(["check-input-generation-v1", version.scopeDigest, entries]))
+    .update(
+      JSON.stringify([
+        version.checkerWorkspaces === undefined
+          ? "check-input-generation-v1"
+          : "check-input-generation-checkers-v1",
+        version.scopeDigest,
+        entries,
+      ]),
+    )
     .digest("hex");
 }
 /** Separate generation observations preserve the old P0 byte/hash contract. They are
@@ -77,11 +94,24 @@ export function captureCheckVersion(
   scope: ArtifactScope,
   environment: Readonly<Record<string, string>>,
 ): CheckVersionResult {
-  const before = captureArtifactVersion(scope, environment);
+  return stableCapture(scope, environment, captureArtifactVersion);
+}
+export function captureCheckDefinitionVersion(
+  scope: ArtifactScope,
+  environment: Readonly<Record<string, string>>,
+): CheckVersionResult {
+  return stableCapture(scope, environment, captureDefinitionVersion);
+}
+function stableCapture(
+  scope: ArtifactScope,
+  environment: Readonly<Record<string, string>>,
+  capture: typeof captureArtifactVersion,
+): CheckVersionResult {
+  const before = capture(scope, environment);
   if (before.status !== "known") return before;
   try {
     const first = inputGeneration(before.version),
-      after = captureArtifactVersion(scope, environment);
+      after = capture(scope, environment);
     if (after.status !== "known") return after;
     const last = inputGeneration(after.version);
     if (first !== last || before.version.versionId !== after.version.versionId)
@@ -103,42 +133,6 @@ function freezeExecution<T>(value: T): T {
   }
   return value;
 }
-function invocationArguments(input: NativeCheckInvocation, root: string): string[] {
-  const paths = [...input.scope.inputs, ...input.scope.artifacts];
-  if (
-    !input.scope.inputs.includes(input.script) ||
-    paths.length > 512 ||
-    paths.some((path) => /[*?{},[\]]/.test(resolve(root, path)))
-  )
-    throw Error("Native check needs an exact bounded captured script/read-file inventory");
-  if (
-    !Number.isSafeInteger(input.timeoutMs) ||
-    input.timeoutMs < 1 ||
-    input.timeoutMs > 30000 ||
-    input.args.length > 64 ||
-    input.args.some(
-      (arg) =>
-        typeof arg !== "string" ||
-        Buffer.byteLength(arg) > 1000 ||
-        /[\p{Cc}\p{Cf}\p{Cs}]/u.test(arg),
-    )
-  )
-    throw Error("Native check invocation exceeds its declared finite bounds");
-  if (
-    input.scope.environmentKeys.some((key) =>
-      /^(NODE_OPTIONS|NODE_PATH|LD_PRELOAD|LD_LIBRARY_PATH|BASH_ENV|ENV|SHELLOPTS|BASHOPTS)$/i.test(
-        key,
-      ),
-    )
-  )
-    throw Error("Native check environment may not inject another execution profile");
-  return [
-    "--permission",
-    ...paths.map((path) => `--allow-fs-read=${resolve(root, path)}`),
-    resolve(root, input.script),
-    ...input.args,
-  ];
-}
 interface ProcessResult {
   pid: number | null;
   closed: boolean;
@@ -149,30 +143,33 @@ interface ProcessResult {
   stderr: string;
   outputDigest: string;
 }
-function executeFiniteNode(
+function cancelledBeforeDispatch(): ProcessResult {
+  return {
+    pid: null,
+    closed: true,
+    exitCode: null,
+    signal: null,
+    termination: "cancelled",
+    stdout: "",
+    stderr: "",
+    outputDigest: createHash("sha256").digest("hex"),
+  };
+}
+function executeFiniteProcess(
   executable: string,
   args: string[],
   cwd: string,
   environment: Record<string, string>,
   timeoutMs: number,
   signal?: AbortSignal,
+  stdinData?: string,
 ): Promise<ProcessResult> {
-  if (signal?.aborted)
-    return Promise.resolve({
-      pid: null,
-      closed: true,
-      exitCode: null,
-      signal: null,
-      termination: "cancelled",
-      stdout: "",
-      stderr: "",
-      outputDigest: createHash("sha256").digest("hex"),
-    });
+  if (signal?.aborted) return Promise.resolve(cancelledBeforeDispatch());
   return new Promise((resolveResult) => {
     const child = spawn(executable, args, {
       cwd,
       env: environment,
-      stdio: ["ignore", "pipe", "pipe"],
+      stdio: [stdinData === undefined ? "ignore" : "pipe", "pipe", "pipe"],
       shell: false,
     });
     let termination: ProcessResult["termination"] = "exited",
@@ -222,10 +219,10 @@ function executeFiniteNode(
       bytes += data.length;
       if (bytes > 65536) stop("output_limit");
     };
-    child.stdout.on("data", (data: Buffer) => {
+    child.stdout?.on("data", (data: Buffer) => {
       output("stdout", data);
     });
-    child.stderr.on("data", (data: Buffer) => {
+    child.stderr?.on("data", (data: Buffer) => {
       output("stderr", data);
     });
     child.once("error", () => {
@@ -247,6 +244,12 @@ function executeFiniteNode(
     );
     signal?.addEventListener("abort", abort, { once: true });
     if (signal?.aborted) abort();
+    if (stdinData !== undefined && child.stdin) {
+      child.stdin.on("error", () => {
+        stop("spawn_error");
+      });
+      child.stdin.end(stdinData);
+    }
   });
 }
 /** Metadata preview shares the real argument encoder; it does not execute or grant trust. */
@@ -256,12 +259,7 @@ export function nativeCheckDescriptor(
 ): NativeCheckExecution["invocation"] {
   if (process.version !== "v25.9.0" || process.platform !== "linux")
     throw Error("Native check process capability is unqualified on this runtime");
-  return {
-    executable: process.execPath,
-    args: invocationArguments(input, version.workspace.root),
-    cwd: version.workspace.root,
-    environmentDigest: version.environmentDigest,
-  };
+  return nativePlanDescriptor(input, version.workspace, version.environmentDigest);
 }
 /** Initial capability is fixed Node25.9/Linux, read-only files and no child/worker/addon
  * permission. It is for recognized benign frozen checkers, not a hostile-code sandbox. */
@@ -274,7 +272,8 @@ export async function runNativeCheck(
   const before = captureCheckVersion(input.scope, input.environment);
   if (before.status !== "known")
     throw Error(`Native check input capture is unknown: ${before.reason}`);
-  const invocation = nativeCheckDescriptor(input, before.version);
+  const plan = prepareNativePlan(input, before.version.workspace, before.version.environmentDigest);
+  const invocation = plan.invocation;
   const environment = Object.fromEntries(
     input.scope.environmentKeys.map((key) => {
       const value: unknown = Object.getOwnPropertyDescriptor(input.environment, key)?.value;
@@ -282,20 +281,49 @@ export async function runNativeCheck(
       return [key, value] as const;
     }),
   );
-  const execution = await executeFiniteNode(
+  let temporary: NativeCheckExecution["temporary"], stdinData: string | undefined;
+  if (plan.python) {
+    const root = mkdtempSync("/tmp/pi-supervisor-check-");
+    chmodSync(root, 0o700);
+    stdinData = JSON.stringify({ ...plan.python, temporaryRoot: root });
+    temporary = {
+      root,
+      inputDigest: createHash("sha256").update(stdinData).digest("hex"),
+      cleanup: "retained",
+    };
+  }
+  const execution = await executeFiniteProcess(
     invocation.executable,
     invocation.args,
     invocation.cwd,
     environment,
     input.timeoutMs,
     signal,
+    stdinData,
   );
+  let after = captureCheckVersion(input.scope, input.environment);
+  if (temporary && execution.closed) {
+    try {
+      rmSync(temporary.root, { recursive: true });
+      temporary.cleanup = "removed";
+    } catch {
+      temporary.cleanup = "failed";
+      after = { status: "unknown", reason: "CHECK_TEMPORARY_CLEANUP_UNAVAILABLE" };
+    }
+  }
+  try {
+    if (JSON.stringify(nativeCheckDescriptor(input, before.version)) !== JSON.stringify(invocation))
+      after = { status: "unknown", reason: "CHECK_PROFILE_CHANGED" };
+  } catch {
+    after = { status: "unknown", reason: "CHECK_PROFILE_UNAVAILABLE" };
+  }
   const result = freezeExecution({
     ...execution,
     invocation,
     before: before.version,
     beforeGeneration: before.inputGeneration,
-    after: captureCheckVersion(input.scope, input.environment),
+    after,
+    ...(temporary ? { temporary } : {}),
   });
   originalExecutions.set(result, result);
   return result;

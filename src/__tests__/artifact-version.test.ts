@@ -19,7 +19,11 @@ vi.mock("node:fs", async (importOriginal) => {
   const fs = await importOriginal<typeof Fs>();
   return { ...fs, readSync: vi.fn(fs.readSync) };
 });
-import { captureArtifactVersion, verifyArtifactVersion } from "../artifact-version";
+import {
+  captureArtifactVersion,
+  captureDefinitionVersion,
+  verifyArtifactVersion,
+} from "../artifact-version";
 
 const directories: string[] = [];
 afterEach(() => {
@@ -50,6 +54,57 @@ function fixture() {
   };
   return { root, scope, environment: { node: "25.9.0", sdk: "1.1.0" } };
 }
+it("versions external checker bytes under distinct logical keys without changing the product root", () => {
+  const product = fixture(),
+    checker = fixture();
+  writeFileSync(join(checker.root, "checker.py"), "# frozen checker\n");
+  const scope = {
+    ...product.scope,
+    checkerScopes: [{ checkId: "external/check", root: checker.root, inputs: ["checker.py"] }],
+  };
+  const captured = captureArtifactVersion(scope, product.environment);
+  if (captured.status !== "known") throw Error("No owned multi-root capture");
+  expect(captured.version.workspace.root).toBe(product.root);
+  expect(captured.version.checkerWorkspaces).toMatchObject([
+    { checkId: "external/check", workspace: { root: checker.root } },
+  ]);
+  expect(captured.version.inputs.map((file) => file.path)).toContain(
+    "@checker/external%2Fcheck/checker.py",
+  );
+  expect(verifyArtifactVersion(captured.version, scope, product.environment)).toBe("same");
+  writeFileSync(join(checker.root, "checker.py"), "# changed checker\n");
+  expect(verifyArtifactVersion(captured.version, scope, product.environment)).toBe("changed");
+});
+it("captures checker definitions before future outputs but requires those outputs for actual versions", () => {
+  const product = fixture(),
+    checker = fixture();
+  rmSync(join(product.root, "output.txt"));
+  const scope = {
+    ...product.scope,
+    checkerScopes: [{ checkId: "external", root: checker.root, inputs: ["input.txt"] }],
+  };
+  const definition = captureDefinitionVersion(scope, product.environment);
+  if (definition.status !== "known") throw Error("No definition capture");
+  expect(definition.version.checkerWorkspaces).toHaveLength(1);
+  expect(definition.version.artifacts).toEqual([]);
+  expect(captureArtifactVersion(scope, product.environment).status).toBe("unknown");
+  writeFileSync(join(product.root, "output.txt"), "actual result");
+  const actual = captureArtifactVersion(scope, product.environment);
+  if (actual.status !== "known") throw Error("No actual output capture");
+  expect(actual.version.scopeDigest).toBe(definition.version.scopeDigest);
+  expect(actual.version.versionId).not.toBe(definition.version.versionId);
+});
+it("rejects ordinary paths masquerading as checker keys only in the new role-aware scope", () => {
+  const h = fixture();
+  mkdirSync(join(h.root, "@checker", "fake"), { recursive: true });
+  writeFileSync(join(h.root, "@checker", "fake", "input.txt"), "ordinary input");
+  const scope = { ...h.scope, inputs: ["@checker/fake/input.txt"] };
+  expect(captureArtifactVersion({ ...scope, checkerScopes: [] }, h.environment).status).toBe(
+    "unknown",
+  );
+  expect(readSync).not.toHaveBeenCalled();
+  expect(captureArtifactVersion(scope, h.environment).status).toBe("known");
+});
 it.each(["empty scope id", "no declared files"])(
   "rejects an unusable artifact definition: %s",
   (kind) => {

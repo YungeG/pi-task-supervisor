@@ -16,6 +16,11 @@ import { dirname, isAbsolute, join, resolve } from "node:path";
 import { validWorkOwner, type WorkOwnerKey } from "./control-journal";
 import { redact } from "./receipt-store";
 
+export interface CheckerScope {
+  readonly checkId: string;
+  readonly root: string;
+  readonly inputs: readonly string[];
+}
 export interface ArtifactScope {
   readonly scopeId: string;
   readonly owner: WorkOwnerKey;
@@ -23,6 +28,7 @@ export interface ArtifactScope {
   readonly inputs: readonly string[];
   readonly artifacts: readonly string[];
   readonly environmentKeys: readonly string[];
+  readonly checkerScopes?: readonly CheckerScope[];
 }
 export interface ArtifactFileDigest {
   path: string;
@@ -40,6 +46,7 @@ export interface ArtifactVersionV1 {
   artifactDigest: string;
   environmentDigest: string;
   versionId: string;
+  checkerWorkspaces?: Array<{ checkId: string; workspace: ArtifactVersionV1["workspace"] }>;
 }
 export type ArtifactVersionResult =
   | { status: "known"; version: ArtifactVersionV1 }
@@ -59,6 +66,14 @@ function versionDigest(value: Omit<ArtifactVersionV1, "versionId">): string {
     value.inputsDigest,
     value.artifactDigest,
     value.environmentDigest,
+    ...(value.checkerWorkspaces !== undefined
+      ? [
+          [
+            "checker-workspaces-v1",
+            value.checkerWorkspaces.map((entry) => [entry.checkId, entry.workspace]),
+          ],
+        ]
+      : []),
   ]);
 }
 const MAX_FILE_BYTES = 16 * 1024 * 1024;
@@ -143,14 +158,49 @@ function assertSources(sources: Map<string, string>): void {
       throw new CaptureFault("SOURCE_CHANGED");
   }
 }
+// Boolean guard retains the declared readonly element type (Array.isArray narrows to any[]).
+function isArrayValue(value: unknown): boolean {
+  return Array.isArray(value);
+}
+function validCheckerScopes(scopes: readonly CheckerScope[] | undefined): boolean {
+  return (
+    scopes === undefined ||
+    (isArrayValue(scopes) &&
+      scopes.length <= 16 &&
+      new Set(scopes.map((scope) => scope.checkId)).size === scopes.length &&
+      scopes.every(
+        (scope) =>
+          typeof scope.checkId === "string" &&
+          scope.checkId.length > 0 &&
+          scope.checkId.length <= 100 &&
+          !/[\p{Cc}\p{Cf}\p{Cs}]/u.test(scope.checkId) &&
+          isAbsolute(scope.root) &&
+          resolve(scope.root) === scope.root &&
+          !/[\p{Cc}\p{Cf}\p{Cs}]/u.test(scope.root) &&
+          scope.inputs.length > 0 &&
+          scope.inputs.length <= 32 &&
+          validPaths(scope.inputs),
+      ))
+  );
+}
+function declaredFileCount(scope: Omit<ArtifactScope, "owner">): number {
+  return (
+    scope.inputs.length +
+    scope.artifacts.length +
+    (scope.checkerScopes?.reduce((count, checker) => count + checker.inputs.length, 0) ?? 0)
+  );
+}
 function validScope(scope: Omit<ArtifactScope, "owner">): boolean {
   return (
     scope.scopeId.trim().length > 0 &&
     Buffer.byteLength(scope.scopeId) <= 200 &&
     !/[\p{Cc}\p{Cf}\p{Cs}]/u.test(scope.scopeId) &&
     isAbsolute(scope.root) &&
-    scope.inputs.length + scope.artifacts.length > 0 &&
-    validPaths([...scope.inputs, ...scope.artifacts])
+    validCheckerScopes(scope.checkerScopes) &&
+    declaredFileCount(scope) > 0 &&
+    validPaths([...scope.inputs, ...scope.artifacts]) &&
+    (scope.checkerScopes === undefined ||
+      ![...scope.inputs, ...scope.artifacts].some((path) => path.startsWith("@checker/")))
   );
 }
 function regularPath(root: string, path: string, sources: Map<string, string>): string {
@@ -196,6 +246,75 @@ function captureFiles(
     }
   });
 }
+export function checkerInputKey(checkId: string, path: string): string {
+  return `@checker/${encodeURIComponent(checkId)}/${path}`;
+}
+/** Resolve only a captured logical key; this helper performs no I/O or admission. */
+export function artifactInputLocation(
+  version: ArtifactVersionV1,
+  path: string,
+): { root: string; path: string } {
+  if (version.checkerWorkspaces === undefined || !path.startsWith("@checker/"))
+    return { root: version.workspace.root, path };
+  const separator = path.indexOf("/", 9);
+  const workspace = version.checkerWorkspaces.find(
+    (entry) => encodeURIComponent(entry.checkId) === path.slice(9, separator),
+  );
+  const relative = path.slice(separator + 1);
+  if (separator < 0 || !workspace || !validPaths([relative]))
+    throw Error("Unknown checker input namespace");
+  return { root: workspace.workspace.root, path: relative };
+}
+function captureCheckerFiles(
+  scope: ArtifactScope,
+  budget: { bytes: number },
+  sources: Map<string, string>,
+) {
+  if (scope.checkerScopes === undefined) return undefined;
+  const inputs: ArtifactFileDigest[] = [];
+  const workspaces: NonNullable<ArtifactVersionV1["checkerWorkspaces"]> = [];
+  const ordered = [...scope.checkerScopes].sort((a, b) =>
+    a.checkId < b.checkId ? -1 : a.checkId > b.checkId ? 1 : 0,
+  );
+  for (const checker of ordered) {
+    const root = checker.root,
+      stat = lstatSync(root, { bigint: true });
+    if (!stat.isDirectory() || realpathSync(root) !== root) throw Error("UNSAFE_SOURCE");
+    remember(sources, root, stat);
+    workspaces.push({
+      checkId: checker.checkId,
+      workspace: { root, device: String(stat.dev), inode: String(stat.ino) },
+    });
+    inputs.push(
+      ...captureFiles(root, checker.inputs, budget, sources).map((file) => ({
+        ...file,
+        path: checkerInputKey(checker.checkId, file.path),
+      })),
+    );
+  }
+  return { inputs, workspaces };
+}
+function capturedScopeDigest(
+  scope: ArtifactScope,
+  workspace: ArtifactVersionV1["workspace"],
+  inputs: readonly string[],
+  artifacts: readonly string[],
+  environmentKeys: readonly string[],
+  workspaces: ArtifactVersionV1["checkerWorkspaces"],
+): string {
+  return hash([
+    workspaces === undefined ? "artifact-scope-v1" : "artifact-scope-checkers-v1",
+    ownerTuple(scope.owner),
+    scope.scopeId,
+    workspace,
+    inputs,
+    artifacts,
+    environmentKeys,
+    ...(workspaces !== undefined
+      ? [workspaces.map((entry) => [entry.checkId, entry.workspace])]
+      : []),
+  ]);
+}
 export interface UnownedArtifactInputs {
   scopeId: string;
   workspace: { root: string; device: string; inode: string };
@@ -210,6 +329,8 @@ export function captureUnownedArtifactInputs(
   environment: Readonly<Record<string, string>>,
 ): { status: "known"; snapshot: UnownedArtifactInputs } | { status: "unknown"; reason: string } {
   try {
+    if (scope.checkerScopes !== undefined)
+      return { status: "unknown", reason: "UNOWNED_CHECKER_SCOPE_UNSUPPORTED" };
     if (scope.inputs.length + scope.artifacts.length > 10000)
       throw new CaptureFault("RESOURCE_LIMIT");
     if (!validScope(scope)) return { status: "unknown", reason: "INVALID_SCOPE" };
@@ -246,8 +367,7 @@ export function captureArtifactVersion(
 ): ArtifactVersionResult {
   try {
     if (!validWorkOwner(scope.owner)) return { status: "unknown", reason: "INVALID_OWNER" };
-    if (scope.inputs.length + scope.artifacts.length > 10_000)
-      throw new CaptureFault("RESOURCE_LIMIT");
+    if (declaredFileCount(scope) > 10_000) throw new CaptureFault("RESOURCE_LIMIT");
     if (!validScope(scope)) return { status: "unknown", reason: "INVALID_SCOPE" };
     const root = resolve(scope.root);
     const stat = lstatSync(root, { bigint: true });
@@ -257,18 +377,21 @@ export function captureArtifactVersion(
     const budget = { bytes: 0 };
     const sources = new Map<string, string>();
     remember(sources, root, stat);
-    const inputs = captureFiles(root, scope.inputs, budget, sources);
+    const productInputs = captureFiles(root, scope.inputs, budget, sources);
     const artifacts = captureFiles(root, scope.artifacts, budget, sources);
+    const checker = captureCheckerFiles(scope, budget, sources);
+    const inputs = [...productInputs, ...(checker?.inputs ?? [])].sort((a, b) =>
+      a.path < b.path ? -1 : a.path > b.path ? 1 : 0,
+    );
     assertSources(sources);
-    const scopeDigest = hash([
-      "artifact-scope-v1",
-      ownerTuple(scope.owner),
-      scope.scopeId,
+    const scopeDigest = capturedScopeDigest(
+      scope,
       workspace,
       inputs.map((x) => x.path),
       artifacts.map((x) => x.path),
       environmentEntries.map((x) => x[0]),
-    ]);
+      checker?.workspaces,
+    );
     const inputsDigest = hash(inputs);
     const artifactDigest = hash(artifacts);
     const environmentDigest = hash(environmentEntries);
@@ -282,6 +405,7 @@ export function captureArtifactVersion(
       inputsDigest,
       artifactDigest,
       environmentDigest,
+      ...(checker ? { checkerWorkspaces: checker.workspaces } : {}),
     };
     return { status: "known", version: { ...body, versionId: versionDigest(body) } };
   } catch (error) {
@@ -290,6 +414,29 @@ export function captureArtifactVersion(
       reason: error instanceof CaptureFault ? error.code : "SOURCE_UNAVAILABLE",
     };
   }
+}
+/** Definition-time inputs only. Declared outputs need not exist and this domain cannot
+ * stand in for an actual post-execution artifact version. */
+export function captureDefinitionVersion(
+  scope: ArtifactScope,
+  environment: Readonly<Record<string, string>>,
+): ArtifactVersionResult {
+  if (!validScope(scope)) return { status: "unknown", reason: "INVALID_SCOPE" };
+  const captured = captureArtifactVersion({ ...scope, artifacts: [] }, environment);
+  if (captured.status !== "known") return captured;
+  const body: Omit<ArtifactVersionV1, "versionId"> = { ...captured.version };
+  body.scopeDigest = capturedScopeDigest(
+    scope,
+    body.workspace,
+    body.inputs.map((file) => file.path),
+    [...scope.artifacts].sort(),
+    [...scope.environmentKeys].sort(),
+    body.checkerWorkspaces,
+  );
+  return {
+    status: "known",
+    version: { ...body, versionId: hash(["definition-version-v1", versionDigest(body)]) },
+  };
 }
 export function verifyArtifactVersion(
   expected: Omit<ArtifactVersionV1, "version"> & { version: number },

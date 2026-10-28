@@ -1,9 +1,9 @@
 #!/usr/bin/env python3
 """Offline actual CLI/PTY lifecycle checks; synthetic keys are not human identity proof."""
-import argparse, errno, fcntl, hashlib, json, os, pathlib, pty, re, select, shutil, signal, struct, tempfile, termios, time, uuid
+import argparse, errno, fcntl, hashlib, json, os, pathlib, pty, re, select, shutil, signal, struct, subprocess, tempfile, termios, time, uuid
 
 parser = argparse.ArgumentParser()
-parser.add_argument('scenario', choices=['sequential', 'permissions', 'information', 'sdk-denial'])
+parser.add_argument('scenario', choices=['sequential', 'permissions', 'information', 'sdk-denial', 'approval-existing', 'approval-preparation'])
 parser.add_argument('--source', type=pathlib.Path, default=pathlib.Path(__file__).resolve().parent.parent)
 parser.add_argument('--cli', type=pathlib.Path)
 parser.add_argument('--out', type=pathlib.Path)
@@ -27,12 +27,17 @@ board = {'version':2, 'generation':47, 'workflowStatus':'paused', 'pauseReason':
 owner = {'version':3, 'sessionId':session_id, 'goal':'Old synthetic native history', 'model':{'provider':'goal-native-fixture','id':'test'}, 'status':'stopped', 'reviews':40, 'continuations':20, 'stagnant':3, 'epoch':0, 'pending':False, 'reason':'Stopped synthetic history', 'holdCause':'user_pause', 'receipts':[], 'bindings':[], 'tokens':123, 'cost':0.5, 'receiptLedger':{'goalId':'old-native-goal','sequence':0,'head':None,'receiptCount':0,'epoch':0,'pending':[]}}
 records = [{'type':'session','version':3,'id':session_id,'timestamp':now,'cwd':str(sandbox)}]
 parent = None
-for i, (kind, value) in enumerate([('continuous-tasks:activation',{'version':1,'enabled':True}),('continuous-tasks:snapshot',board),('continuous-tasks:supervisor',owner)]):
+history = [] if args.scenario.startswith('approval-') else [('continuous-tasks:activation',{'version':1,'enabled':True}),('continuous-tasks:snapshot',board),('continuous-tasks:supervisor',owner)]
+for i, (kind, value) in enumerate(history):
     entry = {'type':'custom','id':f'old-{i}','parentId':parent,'timestamp':now,'customType':kind,'data':value}
     records.append(entry); parent = entry['id']
 seed = ''.join(json.dumps(row,separators=(',',':'))+'\n' for row in records).encode()
 path.write_bytes(seed)
 env = {k:v for k,v in os.environ.items() if not k.startswith(('PI_SESSION_', 'PI_SUBAGENT', 'PI_INTERCOM', 'PI_SUPERVISOR'))}
+if args.scenario.startswith('approval-'):
+    env.update(GIT_CONFIG_NOSYSTEM='1',GIT_CONFIG_GLOBAL=os.devnull)
+    subprocess.run(['git','init','-q',str(sandbox)],check=True,env=env)
+    (sandbox/'.gitignore').write_text('*\n!.gitignore\n!input.txt\n!test_output.py\n!result.txt\n!owned-checker/\n!owned-checker/test_output.py\n')
 env.update(PI_CODING_AGENT_DIR=str(sandbox/'agent'), PI_OFFLINE='1', PI_SKIP_VERSION_CHECK='1', PI_TELEMETRY='0', TERM='xterm-256color', GOAL_NATIVE_SCENARIO=args.scenario, GOAL_NATIVE_OUT=str(sandbox))
 argv = [node, str(cli), '--offline', '--no-extensions', '--no-mcp', '--no-skills', '--no-prompt-templates', '--no-context-files', '--no-approve', '-e', str(source/'test/goal-native-fixture.ts'), '--model', 'goal-native-fixture/test', '--session', str(path), '--session-dir', str(sandbox/'sessions')]
 if args.scenario == 'sdk-denial':
@@ -51,7 +56,8 @@ def receive(pattern, timeout=40):
     deadline = min(overall_deadline, time.monotonic()+timeout)
     while time.monotonic() < deadline:
         match = re.search(pattern, text())
-        if match: return match
+        if match and (data.rfind(b'\x1b[?2026h') <= data.rfind(b'\x1b[?2026l')):
+            return match
         ready, _, _ = select.select([fd], [], [], max(0, deadline-time.monotonic()))
         if not ready: break
         try: chunk = os.read(fd, 65536)
@@ -74,14 +80,23 @@ def card_layouts():
     send('\x1b'); receive('C 双栏')
     send('\x1bOR'); receive('A 会话卡')
     layout_checks += 1
-def answer(kind):
+def answer(kind, already_selected=False):
     global stage
     stage = 'native draft and scope review '+kind
-    receive('需要你回应|只读核对|格式化浏览')
+    receive('需要你回应|只读核对|格式化浏览|集中审核')
+    if '集中审核' in text():
+        if not already_selected and '必需权限已齐' not in text():
+            send('a'); receive(r'必需权限已齐|完整材料已核对|Enter 批准')
+        for _ in range(128):
+            if '完整材料已核对' in text(): break
+            send('\x1b[6~'); receive(r'材料\s+\d+/\d+|完整材料已核对')
+        else: raise AssertionError('bundled native material never completed')
+        send('\r')
+        return
     if '需要你回应' in text():
         if args.decision_layouts: card_layouts()
         send('\x1b[B'); receive('→.*(?:允许上述范围|开始执行|选项 1)')
-        send('\r'); receive('只读核对')
+        send('\x1bOQ'); receive('只读核对')
         for _ in range(128):
             send('\r')
             match=receive(r'(需要你回应)|(第\s*\d+/\d+\s*页)')
@@ -104,17 +119,35 @@ def answer(kind):
 def probe(label):
     global stage
     stage = 'readonly native probe '+label
-    command('/goal-native-probe '+label); receive('GOAL_NATIVE_SAVED_'+re.escape(label))
-    value = json.loads((sandbox/(label+'.json')).read_text())
+    command('/goal-native-probe '+label)
+    artifact=sandbox/(label+'.json'); deadline=time.monotonic()+15
+    while not artifact.exists() and time.monotonic()<deadline:
+        ready,_,_=select.select([fd],[],[],0.05)
+        if ready:
+            chunk=os.read(fd,65536);data.extend(chunk);log.write(chunk);log.flush()
+    assert artifact.is_file(), 'Native read-only probe did not produce its actual artifact: '+label
+    value = json.loads(artifact.read_text())
     assert value['stdinTty'] and value['stdoutTty'] and value['mode']=='tui' and not value['nativeSourceMocked']
     assert pathlib.Path(value['sessionFile']).resolve() == path
     assert pathlib.Path(value['argv1']).resolve() == cli
+    value['probeArtifact']=str(artifact)
     return value
+def wait_probe(label, predicate):
+    deadline = time.monotonic()+25
+    for attempt in range(80):
+        value = probe(label+'-'+str(attempt))
+        if predicate(value): return value
+        if time.monotonic() > deadline: break
+        time.sleep(0.05)
+    raise AssertionError('Actual native state never reached '+label+': '+json.dumps(value.get('supervisor')))
 def goal_records(value):
     return [row for row in value['entries'] if row.get('customType')=='continuous-tasks:supervisor' and row['data'].get('version')==5]
 def selected(value):
     return [row for row in goal_records(value) if row['data']['kind']=='transition-committed'][-1]
 def current_preflight(value):
+    if not any(row['data']['kind']=='transition-committed' for row in goal_records(value)):
+        stored=[row['data'] for row in value['entries'] if row.get('customType')=='continuous-tasks:preflight'][-1]
+        return stored.get('snapshot',stored)
     commit = selected(value); gid = commit['data']['seed']['goalRunId']
     rows = [row for row in value['entries'] if row.get('customType')=='continuous-tasks:preflight' and row['data'].get('goalRunId')==gid]
     return rows[-1]['data']['snapshot'] if rows else commit['data']['seed']['preflight']
@@ -177,7 +210,10 @@ try:
         (sandbox/'verified.json').write_text(json.dumps(report,indent=2)+'\n'); print(json.dumps(report),flush=True)
         raise SystemExit(0)
     stage = 'native archive-and-plan'
-    command('/task-supervisor supervise Owned native next goal'); answer('archive')
+    if args.scenario.startswith('approval-'):
+        command('/task-supervisor preflight Owned native first workflow')
+    else:
+        command('/task-supervisor supervise Owned native next goal'); answer('archive')
     if args.scenario == 'sequential':
         stage = 'first readonly planning'; receive('GOAL_NATIVE_IDLE_1'); first = probe('first')
         gid = first['currentGoalRunId']; assert all(row['data'].get('supervisor') is None for row in goal_records(first) if row['data']['kind']=='goal-state')
@@ -195,6 +231,59 @@ try:
         for message in messages:
             index = next(i for i,row in enumerate(final['entries']) if row['id']==message['id'])
             assert any(row['data'].get('action')=='claim-planning-dispatch' and row['data']['planning']['attemptId'] in message['content'] for row in goal_records({'entries':final['entries'][:index]}))
+    elif args.scenario.startswith('approval-'):
+        prepare = args.scenario == 'approval-preparation'
+        if not prepare:
+            stage = 'unread native bundle must not submit'
+            receive('集中审核'); send('\r'); receive('请先用 PgDn')
+            send('\x1b'); receive('GOAL_NATIVE_IDLE_1')
+            deferred = probe('deferred')
+            assert 'approval' not in current_preflight(deferred) and 'started' not in current_preflight(deferred)
+            assert not any(row.get('customType')=='continuous-tasks:preflight-control' for row in deferred['entries'])
+            command('/task-supervisor approve'); receive('集中审核')
+            # Actual terminal geometry changes invalidate reading, not the local selection.
+            if '必需权限已齐' not in text():
+                send('a'); receive(r'必需权限已齐|完整材料已核对|Enter 批准')
+            fcntl.ioctl(fd,termios.TIOCSWINSZ,struct.pack('HHHH',24,80,0,0)); os.kill(pid,signal.SIGWINCH)
+            data.clear(); receive('材料未完整核对')
+        answer('consolidated permissions and definitions', already_selected=not prepare)
+        if prepare: receive('GOAL_NATIVE_IDLE_1')
+        approved = probe('approved')
+        original = current_preflight(approved)
+        assert original['phase']=='approved' and 'started' not in original
+        assert not (sandbox/'result.txt').exists()
+        assert not approved.get('supervisor')
+        command('/task-supervisor start'); answer('independent first Start')
+        if prepare:
+            receive('GOAL_NATIVE_IDLE_2')
+            prepared=wait_probe('prepared',lambda value:value.get('supervisor',{}).get('status')=='paused' and not value['supervisor'].get('pending'))
+            assert prepared['board']['workflowStatus']=='inactive' and len(prepared['board']['tasks'])==1
+            assert not prepared.get('acceptance',{}).get('contracts') and not (sandbox/'result.txt').exists()
+            proposal_id=original['proposal']['contractProposalId']
+            command('/task-supervisor review-contract '+proposal_id); answer('only prepared definitions')
+            reviewed=probe('reviewed')
+            assert reviewed['supervisor']['status']=='paused'
+            assert reviewed['supervisor']['reviews']==prepared['supervisor']['reviews']
+            assert current_preflight(reviewed)['approval']==original['approval']
+            assert len(reviewed['acceptance']['contracts'])==1
+            command('/task-supervisor recover')
+        receive('GOAL_NATIVE_IDLE_'+('3' if prepare else '2'))
+        final=wait_probe('completed',lambda value:value.get('supervisor',{}).get('status')=='completed')
+        assert final['board']['workflowStatus']=='completed'
+        assert (sandbox/'result.txt').read_text()=='made\n'
+        assert current_preflight(final)['approval']==original['approval']
+        controls=[row['data'] for row in final['entries'] if row.get('customType')=='continuous-tasks:preflight-control']
+        assert sum(row['kind']=='approve' for row in controls)==1 and sum(row['kind']=='start' for row in controls)==1
+        assert sum(row['kind']=='define' for row in controls)==0
+        contracts=final['acceptance']['contracts']
+        assert len(contracts)==1 and contracts[0]['data']['authority']['kind']==('native-reviewed' if prepare else 'preflight-reviewed')
+        runs=final['acceptance']['runs']; assert len(runs)==1
+        observed=runs[0]['observed']['data']
+        assert observed['closed'] and observed['exitCode']==0 and observed['pid']>0 and observed['termination']=='exited'
+        assert observed['temporary']['cleanup']=='removed' and not pathlib.Path(observed['temporary']['root']).exists()
+        assert observed['result']['tests']==1 and observed['result']['passed']==1
+        assert observed['invocation']['profile']['id']=='python-unittest-v1'
+        assert final.get('stateFromPublishedJournal')
     else:
         answer('required permission')
         stage = 'approved without execution'; receive('GOAL_NATIVE_IDLE_1'); approved = probe('approved')
@@ -212,7 +301,7 @@ try:
     verify_native_commits(final)
     raw = path.read_bytes(); assert raw.startswith(seed) and raw.endswith(b'\n')
     assert sha(settings)==before
-    report = {'result':'PASS','scenario':args.scenario,'source':str(source),'actualCli':str(cli),'nativeSourceMocked':False,'syntheticKeystrokes':True,'businessExecutionCertified':False,'decisionLayoutChecks':layout_checks,'settingsUnchanged':True,'originalHistoryBytesUnchanged':True,'probe':str(sandbox/'final.json'),'sessionFile':str(path),'transcript':str(transcript)}
+    report = {'result':'PASS','scenario':args.scenario,'sourceQualifiedSyntheticTaskCompletion':args.scenario.startswith('approval-'),'source':str(source),'actualCli':str(cli),'nativeSourceMocked':False,'syntheticKeystrokes':True,'businessExecutionCertified':False,'decisionLayoutChecks':layout_checks,'settingsUnchanged':True,'originalHistoryBytesUnchanged':True,'probe':final.get('probeArtifact',str(sandbox/'final.json')),'sessionFile':str(path),'transcript':str(transcript)}
     (sandbox/'verified.json').write_text(json.dumps(report,indent=2)+'\n')
     print(json.dumps(report), flush=True)
 finally:
