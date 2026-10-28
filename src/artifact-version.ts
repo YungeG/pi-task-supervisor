@@ -1,6 +1,6 @@
 import { createHash } from "node:crypto";
 import { execFileSync } from "node:child_process";
-import { fileURLToPath } from "node:url";
+import { VERSION as HOST_SDK_VERSION } from "@earendil-works/pi-coding-agent";
 import {
   closeSync,
   constants,
@@ -8,11 +8,10 @@ import {
   lstatSync,
   openSync,
   readSync,
-  readFileSync,
   realpathSync,
   type BigIntStats,
 } from "node:fs";
-import { dirname, isAbsolute, join, resolve } from "node:path";
+import { isAbsolute, join, resolve } from "node:path";
 import { validWorkOwner, type WorkOwnerKey } from "./control-journal";
 import { redact } from "./receipt-store";
 
@@ -511,13 +510,8 @@ export function captureWorkspaceArtifactVersion(
     const absolute = resolve(root);
     if (realpathSync(absolute) !== absolute) throw new CaptureFault("WORKSPACE_SCOPE_UNAVAILABLE");
     const inputs = workspaceFiles(absolute, sessionFile);
-    const sdkRoot = dirname(
-      dirname(fileURLToPath(import.meta.resolve("@earendil-works/pi-coding-agent"))),
-    );
-    const sdk = JSON.parse(readFileSync(join(sdkRoot, "package.json"), "utf8")) as {
-      version?: unknown;
-    };
-    if (typeof sdk.version !== "string") throw new CaptureFault("WORKSPACE_SCOPE_UNAVAILABLE");
+    // Bundled hosts supply this SDK module without a physically resolvable peer.
+    if (typeof HOST_SDK_VERSION !== "string") throw new CaptureFault("WORKSPACE_SCOPE_UNAVAILABLE");
     const result = captureArtifactVersion(
       {
         scopeId: "git-visible-workspace-v1",
@@ -527,7 +521,7 @@ export function captureWorkspaceArtifactVersion(
         artifacts: [],
         environmentKeys: ["NODE_VERSION", "SDK_VERSION"],
       },
-      { NODE_VERSION: process.version, SDK_VERSION: sdk.version },
+      { NODE_VERSION: process.version, SDK_VERSION: HOST_SDK_VERSION },
     );
     if (JSON.stringify(workspaceFiles(absolute, sessionFile)) !== JSON.stringify(inputs))
       throw new CaptureFault("SOURCE_CHANGED");
