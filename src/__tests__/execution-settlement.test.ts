@@ -1,3 +1,4 @@
+import { startSupervisor } from "../supervisor";
 import { createEventBus } from "@earendil-works/pi-coding-agent";
 import { beforeEach, expect, it } from "vitest";
 import { getBoard, resetState, setBoard } from "../state";
@@ -237,7 +238,7 @@ it("keeps an active owner-confirmed Run bound when clear_execution is requested"
   const board = activeBoard();
   board.tasks[0]!.status = "implementing";
   setBoard(board);
-  await h.command("supervise Finish synthetic authorized work");
+  startSupervisor(h.mock.api, h.ctx, "Finish synthetic authorized work");
   const tool = createWorkflowGateTool(h.mock.api);
   const executionRef = { source: "pi-subagents" as const, runId: "owned-run" };
   expect(

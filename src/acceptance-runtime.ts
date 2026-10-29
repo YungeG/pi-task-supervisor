@@ -1,3 +1,4 @@
+import { scopeExecutionIssue } from "./scope-revision-journal";
 import type { RestoreJournalRead } from "./restore-journal";
 import type {
   ExtensionAPI,
@@ -118,7 +119,16 @@ import {
   type AcceptanceBoundFact,
 } from "./acceptance-journal";
 
-export function proposeAcceptanceContract(pi: ExtensionAPI, ctx: ExtensionContext, input: unknown) {
+function canProposeGoalContract(scopeMetadata: boolean): boolean {
+  const status = currentRuntime().supervisor?.status;
+  return status === "active" || (scopeMetadata && ["paused", "fault"].includes(status ?? ""));
+}
+export function proposeAcceptanceContract(
+  pi: ExtensionAPI,
+  ctx: ExtensionContext,
+  input: unknown,
+  scopeMetadata = false,
+) {
   const proposal = validateAcceptanceProposal(input),
     runtime = currentRuntime(),
     sessionId = ctx.sessionManager.getSessionId();
@@ -140,7 +150,7 @@ export function proposeAcceptanceContract(pi: ExtensionAPI, ctx: ExtensionContex
     target = { kind: "preflight", preflightId: pref.preflightId };
     sourceRef = { entryId: node.id, digest: node.digest };
   } else {
-    if (!owner || owner.kind !== "goal" || runtime.supervisor?.status !== "active")
+    if (!owner || owner.kind !== "goal" || !canProposeGoalContract(scopeMetadata))
       throw Error("Contract proposals require the actual current planning or active Goal context");
     target = { kind: "goal", owner };
     sourceRef = ownedGoalSource(journal, owner);
@@ -499,7 +509,9 @@ function assertConditionContinuity(
   inputs: readonly string[],
   previous: ReturnType<typeof selectedAcceptanceContract>,
   approved: AcceptanceProposal | undefined,
+  scopeRevision = false,
 ): void {
+  if (scopeRevision) return; // Preparation for a full native scope review, not permission to bind.
   const original = previous?.data.header ?? approved;
   if (!original) return;
   const originalInputs = previous
@@ -521,6 +533,7 @@ function prepareContractBinding(
   sourceRef: AcceptanceReference,
   goal: string,
   proposal: AcceptanceProposal,
+  scopeRevision?: boolean,
 ) {
   const journal = inspectRestorableSession(ctx, true);
   if (!journal) throw Error("Contract binding requires a physical source");
@@ -535,6 +548,7 @@ function prepareContractBinding(
     inventory?.inputs ?? header.inputs,
     previous,
     approved,
+    scopeRevision,
   );
   const scope: ArtifactScope = {
     scopeId: header.scopeId,
@@ -619,6 +633,95 @@ function commitContractBinding(
     contractDigest: acceptanceContractDigest(body),
   });
   return { entryId: result.entryId, digest: result.digest };
+}
+function pendingScopeCompletion(owner: WorkOwnerKey): boolean {
+  return [...(currentRuntime().controlJournal?.completionIntents?.values() ?? [])].some(
+    (entry) =>
+      !entry.disposition && invocationOwnerKey(entry.data.owner) === invocationOwnerKey(owner),
+  );
+}
+function requireScopeQuiescence(owner: WorkOwnerKey): void {
+  const runtime = currentRuntime(),
+    store = runtime.receiptStore;
+  if (
+    !store ||
+    !store.healthy ||
+    store.pendingCount ||
+    runtime.controlJournal?.invocations?.active.size ||
+    runtime.invocation?.attention ||
+    pendingScopeCompletion(owner)
+  )
+    throw Error("Scope metadata cannot replace an unknown capture or unsettled invocation/writer");
+}
+function heldScopeOwner(ctx: ExtensionContext, mode: "review" | "proposal") {
+  const runtime = currentRuntime(),
+    owner = currentWorkOwner(ctx.sessionManager.getSessionId()),
+    state = runtime.supervisor;
+  if (
+    runtime.journalFault ||
+    !owner ||
+    owner.kind !== "goal" ||
+    state?.sessionId !== ctx.sessionManager.getSessionId() ||
+    !["paused", "fault"].includes(state.status) ||
+    state.pending
+  )
+    throw Error("Scope metadata requires the actual held Goal and a known journal source");
+  if (
+    (mode === "review" && !ctx.isIdle()) ||
+    ctx.hasPendingMessages() ||
+    executionActivityIssue(ctx.sessionManager.getSessionId())
+  )
+    throw Error("Scope review requires closed host executions and actual idle");
+  requireScopeQuiescence(owner);
+  if (!getBoardRef().finalAcceptanceTaskId)
+    throw Error("Before compilation use the original definition review, not scope revision");
+  return owner;
+}
+export function scopeRevisionContractContext(
+  ctx: ExtensionContext,
+  mode: "review" | "proposal" = "review",
+) {
+  const owner = heldScopeOwner(ctx, mode),
+    view = readControlJournal(ctx),
+    journal = inspectRestorableSession(ctx, true);
+  if (!journal) throw Error("Scope metadata requires its actual physical journal");
+  const bound = selectedAcceptanceContract(view.acceptance, owner);
+  if (!bound || !view.acceptance)
+    throw Error("Scope review requires its existing compiled contract");
+  const specs = bound.data.definitions.map(
+    (ref) =>
+      view.acceptance?.definitions.find(
+        (d) => d.entryId === ref.ref.entryId && d.digest === ref.ref.digest,
+      )?.data.spec,
+  );
+  if (specs.some((spec) => !spec)) throw Error("Original scope definitions are unavailable");
+  const proposal: AcceptanceProposal = {
+    ...bound.data.header,
+    checks: specs as AcceptanceProposal["checks"],
+  };
+  const sourceRef = ownedGoalSource(journal, owner),
+    goal = acceptanceGoalSource(journal, owner, sourceRef, journal.branch.length);
+  return { owner, view, journal, bound, proposal, sourceRef, goal };
+}
+export function prepareScopeRevisionContract(ctx: ExtensionContext, proposal: AcceptanceProposal) {
+  const source = scopeRevisionContractContext(ctx);
+  return prepareContractBinding(ctx, source.owner, source.sourceRef, source.goal, proposal, true);
+}
+export function commitScopeRevisionContract(
+  pi: ExtensionAPI,
+  ctx: ExtensionContext,
+  prepared: ReturnType<typeof prepareScopeRevisionContract>,
+  controlRef: AcceptanceReference,
+): AcceptanceReference {
+  return commitContractBinding(pi, ctx, prepared, {
+    kind: "scope-revision-reviewed",
+    originalGoalDigest: acceptanceGoalDigest(
+      prepared.base.owner,
+      prepared.base.sourceRef,
+      prepared.goal,
+    ),
+    controlRef,
+  });
 }
 function appendOrReuseDefinition(
   pi: ExtensionAPI,
@@ -1050,6 +1153,9 @@ export function preflightAssociationIssue(ctx?: ExtensionContext): string | unde
     ? PREFLIGHT_ASSOCIATION_FAULT
     : undefined;
 }
+function managedAcceptanceIssue(ctx: ExtensionContext): string | undefined {
+  return preflightAssociationIssue(ctx) ?? scopeExecutionIssue(ctx);
+}
 export function contractCompilationAdmission(
   ctx: ExtensionContext,
   toolName: string,
@@ -1059,7 +1165,7 @@ export function contractCompilationAdmission(
   const runtime = currentRuntime(),
     state = runtime.supervisor,
     board = getBoardRef();
-  const association = !readOnly && preflightAssociationIssue(ctx);
+  const association = !readOnly && managedAcceptanceIssue(ctx);
   if (association) return association;
   if (!state?.preflightBinding || state.status !== "active" || board.finalAcceptanceTaskId)
     return undefined;
@@ -1325,6 +1431,8 @@ function manualWriterAfter(
   });
 }
 function selectManualCheck(ctx: ExtensionCommandContext, checkId: string) {
+  const scope = managedAcceptanceIssue(ctx);
+  if (scope) throw Error(scope);
   if (
     !ctx.isIdle() ||
     ctx.hasPendingMessages() ||
@@ -1480,6 +1588,8 @@ function publishManualResponse(
   return { status: "confirmed" as const, checkId, value: admitted.value };
 }
 function selectRegisteredCheck(ctx: ExtensionContext, checkId: string) {
+  const scope = managedAcceptanceIssue(ctx);
+  if (scope) throw Error(scope);
   const owner = currentWorkOwner(ctx.sessionManager.getSessionId()),
     view = readControlJournal(ctx).acceptance;
   if (!owner || !view || currentRuntime().supervisor?.status !== "active")
@@ -1713,6 +1823,14 @@ function contractContext(ctx: ExtensionContext | undefined, restoration?: Restor
     view: ctx ? readControlJournal(ctx, restoration).acceptance : runtime.controlJournal.acceptance,
   };
 }
+function contractScopeIssue(
+  ctx: ExtensionContext | undefined,
+  view: AcceptanceJournalView,
+  restoration?: RestoreJournalRead,
+): string | undefined {
+  // Absence here comes from the already source-verified contract view, not a display cache.
+  return view.scopeProposals?.length ? scopeExecutionIssue(ctx, restoration) : undefined;
+}
 /** Semantic gate is additional to structural, original receipt, execution and human gates.
  * No-contract histories stay at their legacy level; no historical mapping is invented. */
 export function acceptanceContractIssue(
@@ -1722,6 +1840,8 @@ export function acceptanceContractIssue(
 ): string | undefined {
   const { owner, view } = contractContext(ctx, restoration);
   if (!owner || !view) return undefined;
+  const scope = contractScopeIssue(ctx, view, restoration);
+  if (scope) return scope;
   const bound = selectedAcceptanceContract(view, owner);
   if (!bound)
     return view.definitions.some((item) => journalDigest(item.data.owner) === journalDigest(owner))

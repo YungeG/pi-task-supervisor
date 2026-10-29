@@ -1,4 +1,5 @@
 import { randomUUID } from "node:crypto";
+import { requireCurrentEvidenceCapability } from "./execution-capability";
 import {
   appendOwnerSnapshot,
   goalStartIdentityIssue,
@@ -777,6 +778,7 @@ export async function startApprovedPreflight(
   requireUnusedGoalStart();
   inspectPreflightStart(ctx, base.goal, planIdHint);
   validateBundleBeforeStart(ctx, base);
+  requireCurrentEvidenceCapability(pi, ctx);
   if (!isTrustedLocalTui(ctx)) return result(ctx, base, "unsupported");
   base = prepareRequest(pi, ctx, base, "start");
   if (

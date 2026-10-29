@@ -1,6 +1,8 @@
+import { enterPlanningMode } from "../management-policy";
 import { approvePreflight } from "../preflight-human";
 import { beforeEach, describe, expect, it, vi } from "vitest";
 import {
+  beginPreflight,
   canonicalPreflightProposal,
   preflightDigest,
   preflightAuthorizationIssue,
@@ -12,13 +14,14 @@ import {
 } from "../preflight";
 import { currentRuntime } from "../runtime";
 import { resetState, setBoard } from "../state";
-import { setSessionScopeEnabled } from "../scope";
+import { enableSessionScope, setSessionScopeEnabled } from "../scope";
 import {
   acceptanceError,
   evidencePacket,
   holdSupervisor,
   recoverSupervisor,
   supervisorState,
+  startSupervisor,
 } from "../supervisor";
 import { createSubmitPreflightTool } from "../tools";
 import { activeBoard } from "./helpers/lifecycle";
@@ -30,7 +33,9 @@ beforeEach(() => {
 });
 async function proposed() {
   const h = preflightLifecycle();
-  await h.command("preflight Local fixture");
+  beginPreflight(h.mock.api, h.ctx, "Local fixture");
+  enableSessionScope(h.mock.api);
+  enterPlanningMode(h.mock.api, h.ctx);
   const tool = createSubmitPreflightTool(h.mock.api);
   const submit = (
     proposal: unknown = localProposal,
@@ -200,16 +205,16 @@ describe("current-branch human control and persistence", () => {
       const h = preflightLifecycle();
       if (kind === "busy") vi.mocked(h.ctx.isIdle).mockReturnValue(false);
       if (kind === "pending") vi.mocked(h.ctx.hasPendingMessages).mockReturnValue(true);
-      if (kind === "existing supervisor") await h.command("supervise Old goal");
+      if (kind === "existing supervisor") startSupervisor(h.mock.api, h.ctx, "Old goal");
       if (kind === "existing board") setBoard(activeBoard());
-      await h.command("preflight New goal");
+      await h.command("supervise New goal");
       expect(currentRuntime().preflight).toBeUndefined();
     },
   );
   it("invalidates old plan IDs when a human replaces unstarted planning", async () => {
     const h = await approved();
     const old = currentRuntime().preflight!;
-    await h.command("preflight New local goal");
+    await h.command("supervise New local goal");
     expect(currentRuntime().preflight?.preflightId).not.toBe(old.preflightId);
     await h.command(`start ${old.planId}`);
     expect(supervisorState()).toBeUndefined();
@@ -247,7 +252,7 @@ describe("current-branch human control and persistence", () => {
       createdAt: "2026-08-23T00:00:00.000Z",
     };
     setBoard({ ...board, workflowStatus: "waiting_for_decision", decision });
-    await h.command("resolve decision-1 Yes");
+    await h.command("decide decision-1 Yes");
     expect(currentRuntime().preflight?.phase).toBe("revoked");
   });
   it("keeps a restored valid partial selection non-executable", async () => {
@@ -469,17 +474,22 @@ describe("current-branch human control and persistence", () => {
     restorePreflight(h.ctx);
     expect(currentRuntime().preflight?.phase).toBe("revoked");
   });
-  it("keeps legacy startup separate after an unexecuted revoked plan", async () => {
+  it("keeps later targets read-only after an unexecuted revoked plan, with no direct-start fallback", async () => {
     const h = await proposed();
     const id = currentRuntime().preflight!.planId;
     await h.command(`revoke ${id}`);
     await h.command("supervise Local fixture");
     expect(supervisorState()).toBeUndefined();
     await h.command("supervise A different legacy goal");
-    expect(supervisorState()?.status).toBe("active");
-    expect(supervisorState()?.preflightBinding).toBeUndefined();
+    expect(supervisorState()).toBeUndefined();
+    expect(currentRuntime().preflight).toMatchObject({
+      goal: "A different legacy goal",
+      phase: "planning",
+    });
+    expect(currentRuntime().preflight?.approval).toBeUndefined();
+    expect(currentRuntime().preflight?.started).toBeUndefined();
     const content = h.fire("before_agent_start").message.content;
-    expect(content).toContain("User-recorded supervisor goal: A different legacy goal");
+    expect(content).toContain("A different legacy goal");
     expect(content).not.toContain("Preflight revoked");
   });
 });

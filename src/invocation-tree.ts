@@ -57,6 +57,16 @@ export interface InvocationRootSealedV1 {
   outcome: "qualified" | "held" | "unknown";
   reason: string;
 }
+/** A direct SDK call observation is never a container eligibility attestation. */
+export interface InvocationRootSealedV2 extends Omit<
+  InvocationRootSealedV1,
+  "version" | "outcome"
+> {
+  version: 2;
+  rootKind: "direct";
+  outcome: "observed" | "held" | "unknown";
+}
+export type InvocationRootSeal = InvocationRootSealedV1 | InvocationRootSealedV2;
 export interface EligibilityAttestedV1 {
   version: 1;
   kind: "eligibility-attested";
@@ -77,7 +87,7 @@ export interface EligibilityView {
   ref: InvocationReference;
 }
 export interface InvocationSealView {
-  data: InvocationRootSealedV1;
+  data: InvocationRootSeal;
   ref: InvocationReference;
 }
 export interface InvocationNodeV1 {
@@ -297,9 +307,42 @@ export function invocationSealIssue(graph: InvocationGraph, rootId: string): str
     return "Invocation has failed, unknown, unfinished or unqualified effects";
   return undefined;
 }
+export function directInvocationIssue(graph: InvocationGraph, rootId: string): string | undefined {
+  const root = graph.nodes.get(rootId),
+    index = graph.roots.get(rootId);
+  if (!root?.end || root.parentId !== null || !index || index.started !== index.ended)
+    return "Direct SDK call has no complete kernel end";
+  if (root.toolName === "codemode" || index.started !== 1)
+    return "Direct SDK call has unexplained container/descendant effects";
+  if (
+    root.end.outcome !== "returned" ||
+    root.end.effects !== "tool-only" ||
+    root.effect === "unknown"
+  )
+    return "Direct SDK tool failed or has unknown effects";
+  return undefined;
+}
+function validateSealOutcome(
+  graph: InvocationGraph,
+  fact: InvocationRootSeal,
+  root: InvocationNodeV1,
+): void {
+  if (fact.version === 2) {
+    if (root.toolName === "codemode")
+      throw Error("Container roots cannot use a direct SDK observation seal");
+    if (fact.outcome === "observed" && directInvocationIssue(graph, fact.rootId))
+      throw Error("Direct SDK observation has no closed original tool result");
+    return;
+  }
+  if (
+    fact.outcome === "qualified" &&
+    (invocationSealIssue(graph, fact.rootId) || !fact.artifactVersion)
+  )
+    throw Error("Invocation root effects/version are not qualified");
+}
 export function sealInvocationRoot(
   graph: InvocationGraph,
-  fact: InvocationRootSealedV1,
+  fact: InvocationRootSeal,
   ref: InvocationReference,
 ): void {
   const root = graph.nodes.get(fact.rootId),
@@ -320,11 +363,7 @@ export function sealInvocationRoot(
     index.digest !== fact.historyDigest
   )
     throw Error("Invocation seal does not match the complete causal journal aggregate");
-  if (
-    fact.outcome === "qualified" &&
-    (invocationSealIssue(graph, fact.rootId) || !fact.artifactVersion)
-  )
-    throw Error("Invocation root effects/version are not qualified");
+  validateSealOutcome(graph, fact, root);
   graph.records.add(fact.recordId);
   graph.seals.set(fact.rootId, { data: fact, ref });
   index.sealed = ref;

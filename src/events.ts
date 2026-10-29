@@ -5,7 +5,9 @@ import type {
   ExtensionContext,
 } from "@earendil-works/pi-coding-agent";
 import type { ContinuousTasksConfig } from "./config";
+import { registeredCheckInvocationIssue } from "./execution-capability";
 import { contractCompilationAdmission, preflightAssociationIssue } from "./acceptance-runtime";
+import { isScopeRevisionProposalTool } from "./scope-revision-schema";
 import {
   observeFinalValidation,
   finalReviewWriteIssue,
@@ -553,8 +555,23 @@ async function restoreSession(
   }
 }
 
+function materializeStoppedChoice(pi: ExtensionAPI, ctx: ExtensionContext): void {
+  const selected = currentRuntime().management,
+    origin = selected?.volatileSource;
+  if (
+    selected?.mode === "off" &&
+    selected.source === "volatile" &&
+    origin &&
+    origin.sessionId === ctx.sessionManager.getSessionId() &&
+    origin.path === ctx.sessionManager.getSessionFile() &&
+    (origin.leafId === null ||
+      ctx.sessionManager.getBranch().some((entry) => entry.id === origin.leafId))
+  )
+    materializeManagement(pi, ctx);
+}
 function registerSessionHandlers(pi: ExtensionAPI, control: Control): void {
   const restoreCache = async (ctx: ExtensionContext) => {
+    materializeStoppedChoice(pi, ctx);
     await restoreSession(pi, control, ctx);
     const store = currentRuntime().receiptStore;
     const config = await loadConfig();
@@ -569,6 +586,7 @@ function registerSessionHandlers(pi: ExtensionAPI, control: Control): void {
     await restoreCache(ctx);
   });
   pi.on("session_shutdown", async (_event, ctx) => {
+    materializeStoppedChoice(pi, ctx);
     control.cancel();
     invalidateGoalCallbacks();
     const epoch = currentRuntime().goalEpoch;
@@ -771,7 +789,8 @@ function managementToolRule(
 ): { handled: boolean; issue?: string } {
   const management = captureManagementSnapshot(ctx);
   const metadataRepair = existingExecutionMetadata(ctx, toolName, input);
-  const controlRepair = scopedDecisionReplacement(toolName, input, ctx);
+  const scopeProposal = isScopeRevisionProposalTool(pi, toolName);
+  const controlRepair = scopedDecisionReplacement(toolName, input, ctx) || scopeProposal;
   const validationCheck = toolName === "bash" && !!registeredFinalValidation(ctx, toolName, input);
   const admission = decideAdmission(management, {
     kind: "tool",
@@ -787,6 +806,7 @@ function managementToolRule(
     controlRepair,
   });
   if (admission.verdict === "deny") return { handled: true, issue: admission.reason };
+  if (scopeProposal) return { handled: true }; // The owned tool validates the held owner and writes metadata only.
   const contractIssue = contractCompilationAdmission(
     ctx,
     toolName,
@@ -905,6 +925,7 @@ function registerWorkHandlers(pi: ExtensionAPI, control: Control): void {
     if (runs.length > 128) runs.shift();
   });
   pi.on("before_agent_start", (_event, ctx) => {
+    materializeStoppedChoice(pi, ctx);
     const management = captureManagementSnapshot(ctx);
     if (decideAdmission(management, { kind: "context" }).verdict === "deny") return undefined;
     const board = getBoardRef();
@@ -929,6 +950,7 @@ function registerWorkHandlers(pi: ExtensionAPI, control: Control): void {
   // Native aborts during an awaited boundary are reported only after it returns.
   // This notification reconciles state; it never schedules another turn.
   pi.on("agent_settled", (event, ctx) => {
+    materializeStoppedChoice(pi, ctx);
     const started = runs.shift();
     if (started ? started !== runScope(ctx) : Boolean(currentRuntime().goal?.current)) return;
     if (!isSessionScopeEnabled()) return;
@@ -972,6 +994,8 @@ function registerReceiptHandlers(pi: ExtensionAPI): void {
         leases.begin(event.toolCallId, ctx, event.toolName) ??
         taskGate(pi, event.toolName, event.input, ctx);
       if (reason) return { block: true, reason };
+      const capability = registeredCheckInvocationIssue(pi, ctx, event);
+      if (capability) return { block: true, reason: capability };
       admitManagedInvocation(pi, ctx, event);
       beginProgressCapture(pi, ctx, event, goalReadOnlyTool(pi, event.toolName));
       prepareToolCapture(pi, event, ctx);

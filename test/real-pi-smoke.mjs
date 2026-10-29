@@ -91,10 +91,12 @@ const widgetThemes = ["system", "dark", "light"].map((name) => {
 });
 
 const packageRoot = resolve(dirname(fileURLToPath(import.meta.url)), "..");
-const extensionPath = join(packageRoot, "src", "index.ts");
+const extensionPath = supervised && !preflight?join(packageRoot,"test","host-module-extension.ts"):join(packageRoot, "src", "index.ts");
 const sandbox = mkdtempSync(join(tmpdir(), "pi-task-supervisor-smoke-"));
 const realSettings = join(homedir(), ".pi", "agent", "settings.json");
 const previousAgentDir = process.env.PI_CODING_AGENT_DIR;
+const previousHostGoal=process.env.OWNED_HOST_MODULE_GOAL;
+const previousHostSession=process.env.OWNED_HOST_MODULE_SESSION;
 const previousArgv = process.argv;
 const ttyDescriptors = [process.stdin, process.stdout].map((stream) =>
   Object.getOwnPropertyDescriptor(stream, "isTTY"),
@@ -259,6 +261,7 @@ async function waitForCompletion(sessionManager) {
 
 const settingsDigestBefore = digest(realSettings);
 process.env.PI_CODING_AGENT_DIR = sandbox;
+if(supervised&&!preflight)process.env.OWNED_HOST_MODULE_GOAL=goal;
 
 try {
   if (preflight) {
@@ -284,6 +287,7 @@ try {
   writeFileSync(join(sandbox, "review-input.txt"), "Fixed owned smoke validation input\n");
   if(preflight)writeFileSync(join(sandbox,"acceptance-check.mjs"),"import assert from 'node:assert/strict';import{readFileSync}from'node:fs';assert.equal(readFileSync(new URL('./review-input.txt',import.meta.url),'utf8'),'Fixed owned smoke validation input\\n');console.log(JSON.stringify({protocol:'check-result-v1',tests:1,passed:1,failed:0,skipped:0,requiredCases:{'smoke-input':'passed'},skippedIds:[]}));\n");
   const sessionManager = SessionManager.create(sandbox, join(sandbox, "sessions"));
+  process.env.OWNED_HOST_MODULE_SESSION=sessionManager.getSessionId();
   if(preflight) sessionManager.appendMessage({role:"user",content:"Owned offline request for this isolated preflight smoke only",timestamp:Date.now()});
   writeFileSync(
     join(sandbox, "continuous-tasks.json"),
@@ -775,14 +779,13 @@ try {
   };
   await session.bindExtensions(uiBindings);
   assertNoUiScriptErrors();
-  if (widgetLines.length) throw new Error("Fresh session had a stale task widget");
-  if (session.extensionRunner.getActiveTools().includes("workflow_gate")) {
+  if ((!supervised||preflight)&&widgetLines.length) throw new Error("Fresh session had a stale task widget");
+  if ((!supervised||preflight) && session.extensionRunner.getActiveTools().includes("workflow_gate")) {
     throw new Error("A fresh session exposed task tools before user activation");
   }
   const enableCommand = session.extensionRunner.getCommand("task-supervisor");
-  const legacyCommand = session.extensionRunner.getCommand("continuous-tasks");
-  if (!enableCommand || !legacyCommand)
-    throw new Error("Pi Task Supervisor primary command or legacy alias was not registered");
+  if (!enableCommand || session.extensionRunner.getCommand("continuous-tasks"))
+    throw new Error("Only the canonical task-supervisor command must be registered");
   let agentStarts = 0;
   const toolSequence = [];
   session.subscribe((event) => {
@@ -813,7 +816,7 @@ try {
 
   if (preflight) {
     await enableCommand.handler(
-      `${freshSupervise ? "supervise" : "preflight"} ${goal}`,
+      `supervise ${goal}`,
       session.extensionRunner.createCommandContext(),
     );
     await waitUntil(
@@ -826,7 +829,7 @@ try {
     const plan = latestPreflight(sessionManager);
     const starts = agentStarts;
     preflightApprovalEnabled = true;
-    await legacyCommand.handler(
+    await enableCommand.handler(
       `approve ${plan.planId} A1`,
       session.extensionRunner.createCommandContext(),
     );
@@ -846,17 +849,10 @@ try {
       `start ${plan.planId}`,
       session.extensionRunner.createCommandContext(),
     );
-  } else
-    await enableCommand.handler(
-      supervised ? `supervise-legacy ${goal}` : "enable",
-      session.extensionRunner.createCommandContext(),
-    );
-  // enable now explicitly selects task-only mode; it cannot be an idempotent
-  // alias probe while supervised. Exercise the legacy command name read-only there.
-  await legacyCommand.handler(
-    supervised ? "status" : "enable",
-    session.extensionRunner.createCommandContext(),
-  );
+  } else if(supervised)void session.prompt("Exercise the owned trusted-host Supervisor mechanism").catch(error=>errors.push(error));
+  else await enableCommand.handler("tasks-only",session.extensionRunner.createCommandContext());
+  // Canonical tasks-only is an explicit mode change, not a read-only probe.
+  await enableCommand.handler(supervised?"status":"tasks-only",session.extensionRunner.createCommandContext());
   if (!supervised) await session.prompt("Start the approved task supervisor board.");
   if (interruptCompaction) {
     await waitUntil(() => interruptedReviewStarted, "supervisor review start");
@@ -869,7 +865,7 @@ try {
       await compacted;
     } else {
       // Explicit pause cancels our advisor immediately, even if the provider ignores its signal.
-      await legacyCommand.handler(
+      await enableCommand.handler(
         "pause compaction maintenance",
         session.extensionRunner.createCommandContext(),
       );
@@ -908,7 +904,7 @@ try {
       throw new Error("Stale advisor restarted Main after compaction");
     await enableCommand.handler("resume", session.extensionRunner.createCommandContext());
     if (nativeAbort)
-      await legacyCommand.handler("recover", session.extensionRunner.createCommandContext());
+      await enableCommand.handler("recover", session.extensionRunner.createCommandContext());
   }
   if (asyncExecution) {
     await waitUntil(
@@ -992,11 +988,11 @@ try {
   if (completedCompactions !== ((compaction || interruptCompaction) && !ordinaryPause ? 1 : 0))
     throw new Error("Unexpected automatic compaction count");
   if (faux.getPendingResponseCount() !== 0) throw new Error("Faux responses were not exhausted");
-  if (userMessages.length !== (preflight ? 1 : supervised ? 0 : 1))
+  if (userMessages.length !== 1)
     throw new Error("Auto-continuation forged a user message");
   if (
     continuationMessages.length !==
-    (progressTasks ? 5 : compaction || batchContinuation || nativeAbort ? 3 : supervised ? 2 : 1)
+    (progressTasks ? 5 : compaction || batchContinuation || nativeAbort ? 3 : supervised ? 2 : 1)-(supervised&&!preflight?1:0)
   ) {
     throw new Error(`Unexpected hidden continuation count: ${continuationMessages.length}`);
   }
@@ -1004,7 +1000,7 @@ try {
     activationEntries.length !== 1 ||
     JSON.stringify(activationEntries[0].data) !== JSON.stringify({ version: 1, enabled: true })
   ) {
-    throw new Error("The enable command did not persist one valid session activation entry");
+    throw new Error("Mode selection did not persist one valid session activation entry");
   }
   if (!snapshot.tasks.every((task) => task.status === "done" && task.completionEvidence)) {
     throw new Error("Completed tasks are missing evidence");
@@ -1291,7 +1287,8 @@ try {
       userMessages: userMessages.length,
       hiddenContinuations: continuationMessages.length,
       activationEntries: activationEntries.length,
-      primaryAndLegacyCommands: true,
+      canonicalCommandOnly: true,
+      trustedHostModuleInitialization: supervised&&!preflight,
       boundedTaskWidgetLifecycle: true,
       readOnlyFullTaskList: true,
       uiStubNotRealTerminal: true,
@@ -1318,6 +1315,8 @@ try {
   session?.dispose();
   if (previousAgentDir === undefined) delete process.env.PI_CODING_AGENT_DIR;
   else process.env.PI_CODING_AGENT_DIR = previousAgentDir;
+  if(previousHostGoal===undefined)delete process.env.OWNED_HOST_MODULE_GOAL;else process.env.OWNED_HOST_MODULE_GOAL=previousHostGoal;
+  if(previousHostSession===undefined)delete process.env.OWNED_HOST_MODULE_SESSION;else process.env.OWNED_HOST_MODULE_SESSION=previousHostSession;
   process.argv = previousArgv;
   if (preflight)
     [process.stdin, process.stdout].forEach((stream, i) => {

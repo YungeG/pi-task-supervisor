@@ -20,7 +20,7 @@ it.each(["before", "memory", "after"] as const)(
           ? failure
           : undefined;
       });
-      await f.command("enable");
+      await f.command("tasks-only");
       expect(currentRuntime().journalFault).toBeDefined();
       f.fail(() => undefined);
       f.reload();
@@ -28,7 +28,7 @@ it.each(["before", "memory", "after"] as const)(
       await f.fire("session_tree");
       expect(currentRuntime().journalFault).toBeUndefined();
       expect(await f.fire("agent_before_settle", BOUNDARY)).toBeUndefined();
-      await f.command("enable");
+      await f.command("tasks-only");
       expect(currentRuntime().management).toMatchObject({
         mode: "tasks",
         state: "active",
@@ -58,7 +58,7 @@ it.each(["before", "memory", "after"] as const)(
     });
     try {
       await f.command("disable");
-      await f.command("enable");
+      await f.command("tasks-only");
       expect(
         (
           await tool.execute(
@@ -97,7 +97,7 @@ it.each(["before", "memory", "after"] as const)(
       expect(currentRuntime().journalFault).toBeUndefined();
       expect(currentRuntime().management?.state).toBe("stopping-with-attention");
       expect(await f.fire("before_agent_start")).toBeUndefined();
-      await f.command("enable");
+      await f.command("tasks-only");
       expect(currentRuntime().management).toMatchObject({
         mode: "tasks",
         state: "active",

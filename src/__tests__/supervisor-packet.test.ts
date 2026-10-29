@@ -2,7 +2,7 @@ import { fauxAssistantMessage } from "@earendil-works/pi-ai";
 import { beforeEach, describe, expect, it, vi } from "vitest";
 import { setSessionScopeEnabled } from "../scope";
 import { getBoardRef, resetState, setBoard } from "../state";
-import { supervisorState } from "../supervisor";
+import { startSupervisor, supervisorState } from "../supervisor";
 import { activeBoard, BOUNDARY, lifecycle } from "./helpers/lifecycle";
 import { appendMockEntries } from "./helpers/mocks";
 import { executionRegistryFixture } from "./helpers/execution-registry";
@@ -105,7 +105,7 @@ describe("bounded supervisor evidence packet", () => {
         phases: [{ phase: 1, status: "active", title: "Bounded" }],
       }),
     );
-    await h.command("supervise Preserve required metadata under the original byte cap");
+    startSupervisor(h.mock.api, h.ctx, "Preserve required metadata under the original byte cap");
     await h.fire("tool_result", {
       type: "tool_result",
       toolName: "bash",
@@ -165,7 +165,7 @@ describe("bounded supervisor evidence packet", () => {
       Object.assign(h.ctx, {
         modelRegistry: { find: () => h.ctx.model, streamSimple },
       });
-      await h.command("supervise Validate the approved work without losing its evidence");
+      startSupervisor(h.mock.api, h.ctx, "Validate the approved work without losing its evidence");
       for (let index = 0; index < 40; index++) {
         await h.fire("tool_result", {
           toolName: "read",
@@ -231,7 +231,7 @@ describe("bounded supervisor evidence packet", () => {
       return { result: async () => fauxAssistantMessage(JSON.stringify(guide)) };
     });
     Object.assign(h.ctx, { modelRegistry: { find: () => h.ctx.model, streamSimple } });
-    await h.command("supervise Preserve all bound validation evidence");
+    startSupervisor(h.mock.api, h.ctx, "Preserve all bound validation evidence");
     for (let index = 0; index < 40; index++) {
       await h.fire("tool_result", {
         toolName: "read",
@@ -275,7 +275,7 @@ describe("bounded supervisor evidence packet", () => {
         })),
       }),
     );
-    await h.command("supervise Preserve the complete multilingual plan");
+    startSupervisor(h.mock.api, h.ctx, "Preserve the complete multilingual plan");
     expect(await h.fire("agent_before_settle", BOUNDARY)).toBeUndefined();
     expect(supervisorState()).toMatchObject({
       status: "fault",

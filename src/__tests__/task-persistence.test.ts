@@ -4,7 +4,7 @@ import { createEmptyBoard } from "../engine";
 import { CUSTOM_EVENT_TYPE, CUSTOM_SNAPSHOT_TYPE } from "../types";
 import { setSessionScopeEnabled } from "../scope";
 import { getBoard, reconstructState, resetState, setBoard } from "../state";
-import { SUPERVISOR_ENTRY } from "../supervisor";
+import { startSupervisor, SUPERVISOR_ENTRY } from "../supervisor";
 import {
   createAdvanceTasksTool,
   createClearTasksTool,
@@ -143,7 +143,7 @@ describe("task update persistence admission", () => {
       },
     }));
     const h = lifecycle(advisor);
-    await h.command("supervise Complete the approved synthetic board");
+    startSupervisor(h.mock.api, h.ctx, "Complete the approved synthetic board");
     const before = getBoard();
     const input = { count: 1 };
     expect(
@@ -312,7 +312,7 @@ describe("task update persistence admission", () => {
         }),
       );
       const h = lifecycle();
-      await h.command("supervise Verify the approved synthetic work");
+      startSupervisor(h.mock.api, h.ctx, "Verify the approved synthetic work");
       await h.fire("tool_result", {
         type: "tool_result",
         toolName: "bash",

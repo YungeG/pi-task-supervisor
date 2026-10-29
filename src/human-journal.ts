@@ -18,6 +18,7 @@ export interface JournalReceiptProof {
   ledgerEpoch: number;
   captureId: string;
   captureDigest: string;
+  scopeRevisionRef?: { entryId: string; digest: string };
   inputDigest?: string;
   receipt?: Pick<
     HostReceipt,
@@ -37,6 +38,7 @@ export interface JournalSupervisorProof {
   bindingsDigest: string;
   taskBindings?: Array<{ taskId: string; digest: string; refsDigest: string }>;
   authorityDigest?: string;
+  scopeRevisionRef?: { entryId: string; digest: string };
 }
 export interface JournalNode {
   id: string;
@@ -201,6 +203,7 @@ const RETAINED = new Set([
   "continuous-tasks:control-facts",
   "continuous-tasks:acceptance-facts",
   "continuous-tasks:acceptance-proposal",
+  "continuous-tasks:scope-revision-proposal",
 ]);
 export interface JournalLimits {
   maxBytes: number;
@@ -239,6 +242,9 @@ function receiptProof(data: unknown): JournalReceiptProof | undefined {
     ledgerEpoch: data.epoch,
     captureId: data.capture.id,
     captureDigest: receiptDigest(data.capture),
+    ...(data.capture.scopeRevisionRef
+      ? { scopeRevisionRef: structuredClone(data.capture.scopeRevisionRef) }
+      : {}),
   };
   if (data.kind === "receipt") {
     const { id, tool, epoch, ok, exitCode, eligible, reviews, digest } = data.receipt;
@@ -250,12 +256,23 @@ function receiptProof(data: unknown): JournalReceiptProof | undefined {
 function supervisorIdentity(
   data: Record<string, unknown>,
   payload: Record<string, unknown>,
-): Pick<JournalSupervisorProof, "goalKey" | "lifecycleCommitId"> {
+): Pick<JournalSupervisorProof, "goalKey" | "lifecycleCommitId" | "scopeRevisionRef"> {
   const ledger = record(payload.receiptLedger) ? payload.receiptLedger : undefined;
   const scope = data.version === 5 && record(data.scope) ? data.scope : undefined;
   const goalKey = scope?.goalRunId ?? ledger?.goalId;
   return {
     ...(typeof goalKey === "string" ? { goalKey } : {}),
+    ...(record(payload.scopeRevisionRef) &&
+    identifier(payload.scopeRevisionRef.entryId) &&
+    typeof payload.scopeRevisionRef.digest === "string" &&
+    /^[a-f0-9]{64}$/.test(payload.scopeRevisionRef.digest)
+      ? {
+          scopeRevisionRef: {
+            entryId: payload.scopeRevisionRef.entryId,
+            digest: payload.scopeRevisionRef.digest,
+          },
+        }
+      : {}),
     ...(typeof scope?.lifecycleCommitId === "string"
       ? { lifecycleCommitId: scope.lifecycleCommitId }
       : {}),

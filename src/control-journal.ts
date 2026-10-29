@@ -1,4 +1,5 @@
 import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
+import { assertScopeReceiptSources } from "./scope-revision-journal";
 import { lstatSync } from "node:fs";
 import {
   ACCEPTANCE_PROPOSAL_ENTRY,
@@ -44,6 +45,9 @@ import {
   type InvocationEndedV1,
   type InvocationNodeV1,
   type InvocationRootSealedV1,
+  type InvocationRootSealedV2,
+  type InvocationRootSeal,
+  directInvocationIssue,
   type EligibilityAttestedV1,
 } from "./invocation-tree";
 import { isGoalCarrier, isGoalRecord } from "./goal-records";
@@ -66,9 +70,11 @@ export const CONTROL_FEATURES = [
   "execution-settlement-v1",
   "final-review-v1",
   "invocation-tree-v1",
+  "invocation-direct-v1",
   "management-mode-v1",
   "progress-facts-v1",
   "approval-workflow-v1",
+  "scope-revision-v1",
 ] as const;
 export type ControlFeature = (typeof CONTROL_FEATURES)[number];
 const supportedControlFeatures = new Set<ControlFeature>([
@@ -78,9 +84,11 @@ const supportedControlFeatures = new Set<ControlFeature>([
   "execution-settlement-v1",
   "final-review-v1",
   "invocation-tree-v1",
+  "invocation-direct-v1",
   "management-mode-v1",
   "progress-facts-v1",
   "approval-workflow-v1",
+  "scope-revision-v1",
 ]);
 const id = (maxLength: number) => Type.String({ minLength: 1, maxLength });
 const hash = Type.String({ pattern: "^[a-f0-9]{64}$" });
@@ -736,31 +744,51 @@ export const InvocationEndedSchema = Type.Unsafe<InvocationEndedV1>(
     strict,
   ),
 );
-export const InvocationRootSealedSchema = Type.Unsafe<InvocationRootSealedV1>(
-  Type.Object(
-    {
-      version: Type.Literal(1),
-      kind: Type.Literal("invocation-root-sealed"),
-      recordId: id(100),
-      owner: WorkOwnerSchema,
-      rootId: id(100),
-      endRef: reference,
-      messageRef: reference,
-      started: Type.Integer({ minimum: 1, maximum: Number.MAX_SAFE_INTEGER }),
-      ended: natural,
-      historyDigest: hash,
-      epoch: natural,
-      artifactVersion: Type.Union([ReviewVersionSchema, Type.Null()]),
-      outcome: Type.Union([
-        Type.Literal("qualified"),
-        Type.Literal("held"),
-        Type.Literal("unknown"),
-      ]),
-      reason: id(1000),
-    },
-    strict,
+const invocationSealFields = {
+  kind: Type.Literal("invocation-root-sealed"),
+  recordId: id(100),
+  owner: WorkOwnerSchema,
+  rootId: id(100),
+  endRef: reference,
+  messageRef: reference,
+  started: Type.Integer({ minimum: 1, maximum: Number.MAX_SAFE_INTEGER }),
+  ended: natural,
+  historyDigest: hash,
+  epoch: natural,
+  artifactVersion: Type.Union([ReviewVersionSchema, Type.Null()]),
+  reason: id(1000),
+};
+export const InvocationRootSealedSchema = Type.Union([
+  Type.Unsafe<InvocationRootSealedV1>(
+    Type.Object(
+      {
+        ...invocationSealFields,
+        version: Type.Literal(1),
+        outcome: Type.Union([
+          Type.Literal("qualified"),
+          Type.Literal("held"),
+          Type.Literal("unknown"),
+        ]),
+      },
+      strict,
+    ),
   ),
-);
+  Type.Unsafe<InvocationRootSealedV2>(
+    Type.Object(
+      {
+        ...invocationSealFields,
+        version: Type.Literal(2),
+        rootKind: Type.Literal("direct"),
+        outcome: Type.Union([
+          Type.Literal("observed"),
+          Type.Literal("held"),
+          Type.Literal("unknown"),
+        ]),
+      },
+      strict,
+    ),
+  ),
+]);
 export const EligibilityAttestedSchema = Type.Unsafe<EligibilityAttestedV1>(
   Type.Object(
     {
@@ -790,7 +818,7 @@ export const InvocationFactSchema = Type.Union([
 export type InvocationFact =
   | InvocationStartedV1
   | InvocationEndedV1
-  | InvocationRootSealedV1
+  | InvocationRootSeal
   | EligibilityAttestedV1;
 export interface InvocationFactView {
   entryId: string;
@@ -877,17 +905,9 @@ export const ControlFenceSchema = Type.Object(
       Type.Object({ entryId: id(200), digest: hash }, strict),
     ]),
     features: Type.Array(
-      Type.Union([
-        Type.Literal(CONTROL_FEATURES[0]),
-        Type.Literal(CONTROL_FEATURES[1]),
-        Type.Literal(CONTROL_FEATURES[2]),
-        Type.Literal(CONTROL_FEATURES[3]),
-        Type.Literal(CONTROL_FEATURES[4]),
-        Type.Literal(CONTROL_FEATURES[5]),
-        Type.Literal(CONTROL_FEATURES[6]),
-        Type.Literal(CONTROL_FEATURES[7]),
-        Type.Literal(CONTROL_FEATURES[8]),
-      ]),
+      Type.Unsafe<ControlFeature>(
+        Type.Union(CONTROL_FEATURES.map((feature) => Type.Literal(feature))),
+      ),
       { maxItems: CONTROL_FEATURES.length },
     ),
     owner: Type.Union([WorkOwnerSchema, Type.Null()]),
@@ -2764,7 +2784,7 @@ function invocationRegistryQuiet(
   );
 }
 function invocationSealEpoch(
-  data: InvocationRootSealedV1,
+  data: InvocationRootSeal,
   journal: SessionJournal,
   position: number,
 ): void {
@@ -2784,8 +2804,23 @@ function invocationSealEpoch(
   )
     fail();
 }
+function observedDirectSource(
+  data: InvocationRootSealedV2,
+  root: InvocationNodeV1,
+  graph: InvocationGraph,
+  modes: readonly SessionModeView[],
+  ok: boolean,
+): void {
+  if (
+    data.outcome === "observed" &&
+    (!ok ||
+      directInvocationIssue(graph, data.rootId) ||
+      !invocationModeMatches(data.owner, root.modeRef, modes))
+  )
+    fail();
+}
 function invocationSealSource(
-  data: InvocationRootSealedV1,
+  data: InvocationRootSeal,
   graph: InvocationGraph,
   modes: readonly SessionModeView[],
   journal: SessionJournal,
@@ -2804,6 +2839,10 @@ function invocationSealSource(
     proof.tool !== root.toolName
   )
     fail();
+  if (data.version === 2) {
+    observedDirectSource(data, root, graph, modes, proof.ok);
+    return;
+  }
   if (data.outcome !== "qualified") return;
   if (
     !proof.ok ||
@@ -2954,7 +2993,12 @@ function validateInvocationAddition(
   journal: SessionJournal,
   lease: ControlLease,
 ): void {
-  if (!view.latestFence?.data.features.includes("invocation-tree-v1"))
+  if (
+    !view.latestFence?.data.features.includes("invocation-tree-v1") ||
+    (value.kind === "invocation-root-sealed" &&
+      value.version === 2 &&
+      !view.latestFence.data.features.includes("invocation-direct-v1"))
+  )
     throw new ControlJournalError("CONTROL_FACT_UNSUPPORTED");
   if (!lease.owner || invocationOwnerKey(value.owner) !== invocationOwnerKey(lease.owner))
     throw new ControlJournalError("CONTROL_OWNER_CHANGED");
@@ -3244,7 +3288,12 @@ function consumeInvocationFact(
   position: number,
 ): boolean {
   if (!validInvocationFact(node.data, journal.sessionId)) return false;
-  if (!fence?.data.features.includes("invocation-tree-v1"))
+  if (
+    !fence?.data.features.includes("invocation-tree-v1") ||
+    (node.data.kind === "invocation-root-sealed" &&
+      node.data.version === 2 &&
+      !fence.data.features.includes("invocation-direct-v1"))
+  )
     throw new ControlJournalError("CONTROL_FACT_UNSUPPORTED");
   addInvocationFact(
     fold.invocationFacts,
@@ -3461,6 +3510,7 @@ function verifiedControlView(
   const prior = cached && reusableControlFold(ctx, journal, cached) ? cached : undefined;
   if (prior) controlFoldHits = Math.min(Number.MAX_SAFE_INTEGER, controlFoldHits + 1);
   const { view, fold, latestFence } = foldControlJournal(journal, prior);
+  assertScopeReceiptSources(journal, view.acceptance);
   assertFenceMirror(ctx.sessionManager.getBranch(), journal);
   const path = ctx.sessionManager.getSessionFile();
   if (path && journal.nodes.size <= 8192 && lstatSync(path).size <= 32 * 1024 * 1024)
@@ -3515,6 +3565,7 @@ function assertFenceMirror(
       node.customType !== CONTROL_FACT_ENTRY &&
       node.customType !== ACCEPTANCE_FACT_ENTRY &&
       node.customType !== ACCEPTANCE_PROPOSAL_ENTRY &&
+      node.customType !== "continuous-tasks:scope-revision-proposal" &&
       !isAcceptanceWitness(node, journal) &&
       (node.customType !== CONTROL_FENCE_ENTRY || node.wireVersion !== 6)
     )
@@ -3610,7 +3661,7 @@ export function retainedWorkOwner(sessionId: string): WorkOwnerKey | null {
       kind: "goal",
       goal: {
         sessionId,
-        goalKey: runtime.receiptStore.checkpoint().goalId,
+        goalKey: runtime.receiptStore.ownerGoalId,
         goalRunId: null,
         lifecycleCommitId: null,
       },

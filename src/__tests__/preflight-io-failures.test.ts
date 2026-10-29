@@ -1,3 +1,5 @@
+import { enterPlanningMode } from "../management-policy";
+import { enableSessionScope } from "../scope";
 import { beforeEach, expect, it, vi } from "vitest";
 import { readFileSync, writeFileSync } from "node:fs";
 import { resetState } from "../state";
@@ -9,6 +11,7 @@ import {
   startApprovedPreflight,
 } from "../preflight-human";
 import {
+  beginPreflight,
   preflightContext,
   preflightStatusLines,
   preflightAuthorizationIssue,
@@ -23,7 +26,9 @@ beforeEach(() => {
 });
 async function ready(approve = true) {
   const h = preflightLifecycle();
-  await h.command("preflight Local fixture");
+  beginPreflight(h.mock.api, h.ctx, "Local fixture");
+  enableSessionScope(h.mock.api);
+  enterPlanningMode(h.mock.api, h.ctx);
   vi.mocked(h.ctx.ui.select).mockResolvedValue(approve ? "允许上述范围" : "稍后决定");
   await createSubmitPreflightTool(h.mock.api).execute(
     "submit",

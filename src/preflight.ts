@@ -1,3 +1,4 @@
+import { currentScopeState, scopeEffectivePlan } from "./scope-revision-journal";
 import { RestoreReadInvalidated, type RestoreJournalRead } from "./restore-journal";
 import { createHash, randomUUID } from "node:crypto";
 import { isDeepStrictEqual } from "node:util";
@@ -36,11 +37,7 @@ import {
   ensureApprovalWorkflowFence,
   approvalAction,
 } from "./approval-bundle";
-import {
-  ApprovalContractCaptureSchema,
-  ApprovalPreparationSchema,
-  ApprovalReferenceSchema,
-} from "./approval-schema";
+import { ApprovalContractCaptureSchema, ApprovalReferenceSchema } from "./approval-schema";
 import { acceptanceLayersFromCache } from "./acceptance-contract";
 import { getBoardRef } from "./state";
 import { isSafeBoundedText } from "./validation";
@@ -66,37 +63,10 @@ export const PREFLIGHT_ENTRY = "continuous-tasks:preflight";
 export const PREFLIGHT_CONTROL_ENTRY = "continuous-tasks:preflight-control";
 const MAX_PROPOSAL_BYTES = 16_000;
 const text = (max: number) => Type.String({ minLength: 1, maxLength: max });
-const strings = (minimum = 0) => Type.Array(text(1000), { minItems: minimum, maxItems: 20 });
 const strict = { additionalProperties: false };
 
-const PermissionSchema = Type.Object(
-  {
-    id: text(64),
-    action: text(500),
-    target: text(500),
-    environment: text(500),
-    required: Type.Boolean(),
-    limits: text(1000),
-    risks: text(1000),
-    fallback: text(1000),
-    reconfirm: text(1000),
-  },
-  strict,
-);
-export const PreflightProposalSchema = Type.Object(
-  {
-    summary: text(2000),
-    steps: strings(1),
-    acceptance: strings(1),
-    permissions: Type.Array(PermissionSchema, { maxItems: 20 }),
-    prohibitions: strings(),
-    reconfirm: strings(),
-    contractProposalId: Type.Optional(text(200)),
-    preparation: Type.Optional(ApprovalPreparationSchema),
-  },
-  strict,
-);
-export type PreflightProposal = Static<typeof PreflightProposalSchema>;
+import { PreflightProposalSchema, type PreflightProposal } from "./preflight-proposal-schema";
+export { PreflightProposalSchema, type PreflightProposal } from "./preflight-proposal-schema";
 export const SubmitPreflightParams = Type.Object(
   { preflightId: text(100), proposal: PreflightProposalSchema },
   strict,
@@ -276,7 +246,7 @@ function controlIssue(ctx: ExtensionContext): string | undefined {
 function requireOwn(ctx: ExtensionContext): PreflightState {
   const state = currentRuntime().preflight;
   if (!state || state.sessionId !== ctx.sessionManager.getSessionId())
-    throw new Error("No current-session preflight; use the human preflight command first");
+    throw new Error("No current-session preflight; use the human supervise command first");
   return state;
 }
 function failPersistence(message: string): never {
@@ -563,24 +533,24 @@ export function preflightPermissionPayload(base: PreflightState, ids: string[]):
 export function preflightPermissionScope(base: PreflightState, ids: string[]): object {
   return goalLogicalScope(preflightPermissionPayload(base, ids), "preflight");
 }
+export function preflightStartPayload(base: PreflightState, approvalEntryDigest: string): object {
+  return {
+    action: "start",
+    sessionId: base.sessionId,
+    goal: base.goal,
+    preflightId: base.preflightId,
+    revision: base.revision,
+    planId: base.planId,
+    planDigest: base.planDigest,
+    proposal: base.proposal,
+    request: base.version === 2 ? base.startRequest : undefined,
+    permissionIds: base.approval?.permissionIds,
+    approvalControlEntryId: base.approval?.controlEntryId,
+    approvalControlDigest: approvalEntryDigest,
+  };
+}
 export function preflightStartScope(base: PreflightState, approvalEntryDigest: string): object {
-  return goalLogicalScope(
-    {
-      action: "start",
-      sessionId: base.sessionId,
-      goal: base.goal,
-      preflightId: base.preflightId,
-      revision: base.revision,
-      planId: base.planId,
-      planDigest: base.planDigest,
-      proposal: base.proposal,
-      request: base.version === 2 ? base.startRequest : undefined,
-      permissionIds: base.approval?.permissionIds,
-      approvalControlEntryId: base.approval?.controlEntryId,
-      approvalControlDigest: approvalEntryDigest,
-    },
-    "preflight",
-  );
+  return goalLogicalScope(preflightStartPayload(base, approvalEntryDigest), "preflight");
 }
 function nativeRequest(base: PreflightState, start: boolean) {
   if (base.version !== 2) return undefined;
@@ -767,7 +737,7 @@ function definitionAuthorityProposal(
   return proposal;
 }
 /** Actual prior source only. Returns verified metadata, never creates a grant or dispatch. */
-export function confirmedApprovalDefinitionSource(
+export function confirmedPreflightControlSource(
   journal: SessionJournal,
   reference: { entryId: string; digest: string },
 ) {
@@ -794,6 +764,16 @@ export function confirmedApprovalDefinitionSource(
     control.humanInteraction.scopeDigest
   )
     throw Error("Approval definition material differs from its native scope");
+  return { base, control, proof, request, goalScope };
+}
+export function confirmedApprovalDefinitionSource(
+  journal: SessionJournal,
+  reference: { entryId: string; digest: string },
+) {
+  const { base, control, proof, request, goalScope } = confirmedPreflightControlSource(
+    journal,
+    reference,
+  );
   const capture = request.acceptance;
   if (!capture) throw Error("Old permission approval cannot confirm acceptance definitions");
   if (control.kind === "approve" ? request.purpose !== "bundle" : request.purpose !== "definitions")
@@ -801,6 +781,67 @@ export function confirmedApprovalDefinitionSource(
   assertDefinitionBusinessGrant(journal, base, request, control, proof);
   const proposal = definitionAuthorityProposal(journal, base, capture);
   return { base, control, proof, capture, proposal, goalScope };
+}
+function originalStartApproval(
+  journal: SessionJournal,
+  base: PreflightState,
+  control: NativeStartControl,
+  startBaseId: string,
+) {
+  const approvalNode = journal.nodes.get(control.approvalControlEntryId);
+  if (
+    !approvalNode ||
+    approvalNode.digest !== control.approvalControlDigest ||
+    base.approval?.controlEntryId !== approvalNode.id ||
+    !same(base.approval.permissionIds, control.permissionIds)
+  )
+    throw Error("Original first-start permission source changed");
+  const approval = confirmedPreflightControlSource(journal, {
+    entryId: approvalNode.id,
+    digest: approvalNode.digest,
+  });
+  if (
+    approval.control.kind !== "approve" ||
+    approval.base.planDigest !== base.planDigest ||
+    journal.branch.indexOf(approval.proof.witness) >=
+      journal.branch.findIndex((node) => node.id === startBaseId)
+  )
+    throw Error("Original first-start is not preceded by its permission witness");
+  return approvalNode;
+}
+/** Exact native first-start source, including its original permission witness. */
+export function confirmedPreflightStartSource(
+  journal: SessionJournal,
+  reference: { entryId: string; digest: string },
+) {
+  const node = journal.nodes.get(reference.entryId);
+  if (
+    !node ||
+    node.digest !== reference.digest ||
+    !Check(NativePreflightControlSchema, node.data) ||
+    node.data.kind !== "start"
+  )
+    throw Error("Scope revision needs its original native first-start");
+  const control = node.data,
+    proof = findReadbackProof(journal, "preflight", control.humanInteraction.requestId);
+  if (proof.status !== "confirmed" || proof.control.id !== node.id)
+    throw Error("Original first-start witness is unavailable");
+  const stored = proof.base.data,
+    base = isGoalCarrier(stored) ? stored.snapshot : stored;
+  if (!Check(NativePreflightStateSchema, base) || !base.approval)
+    throw Error("Original first-start plan is unavailable");
+  nativeIdentity(base, control);
+  const approvalNode = originalStartApproval(journal, base, control, proof.base.id);
+  const payload = preflightStartPayload(base, approvalNode.digest),
+    goalScope = isGoalCarrier(stored)
+      ? { goalRunId: stored.goalRunId, lifecycleCommitId: stored.lifecycleCommitId }
+      : undefined;
+  if (
+    journalDigest(goalScope ? { goalScope, payload } : payload) !==
+    control.humanInteraction.scopeDigest
+  )
+    throw Error("Original first-start material changed");
+  return { base, control, proof, goalScope };
 }
 export function projectPreflightStart(
   base: PreflightState,
@@ -1861,7 +1902,12 @@ function permissionContext(ctx: ExtensionContext, state: PreflightState): string
   return undefined;
 }
 
-function executionAgreement(state: PreflightState): string {
+function executionAgreement(state: PreflightState, ctx: ExtensionContext): string {
+  const scope = currentScopeState(ctx);
+  if (scope.issue)
+    return `Same-Goal scope is held: ${scope.issue}. Main may submit a complete propose_scope_revision; user uses review-scope or exact repair-scope. Preserve original permissions and Start; do not rerun preflight/start, recreate the Goal or execute.`;
+  if (scope.revision && scope.owner)
+    return `Effective committed same-Goal scope (not a sandbox): ${JSON.stringify({ originalGoal: state.goal, originalPlanId: state.planId, originalStart: state.started, selectedPermissionIds: state.approval?.permissionIds, revisionRef: { entryId: scope.revision.entryId, digest: scope.revision.digest }, proposal: scopeEffectivePlan(scope.view, scope.owner) })}. Preserve original owner/Start/budgets; enforce these exact current constraints, not earlier scope/evidence. Commit does not resume or accept work.`;
   if (
     state.version === 2 &&
     state.proposal?.contractProposalId &&
@@ -1880,9 +1926,9 @@ export function preflightContext(ctx: ExtensionContext): string | undefined {
     return `Recorded preflight result is held: ${fault ?? "projection repair pending"}. Do not execute or request the same approval again. Inspect and use /task-supervisor repair-preflight only for its confirmed pending cache; other holds remain.`;
   const permissions = permissionContext(ctx, state);
   if (permissions) return permissions;
-  if (state.started) return executionAgreement(state);
+  if (state.started) return executionAgreement(state, ctx);
   if (state.phase === "interrupted" || state.phase === "revoked")
-    return `Preflight ${state.phase}; no execution permission. Inspect history and use a new human preflight command before planning again.`;
+    return `Preflight ${state.phase}; no execution permission. Inspect history and use an explicit human supervise command before planning again.`;
   return `Preflight ${state.preflightId}; user-recorded goal: ${state.goal}\nPrepare a read-only proposal with scope, permissions, prohibitions and validation. Submit it through submit_preflight using this exact preflightId. Do not implement or start supervision. A proposal is not user approval. Current preflight phase: ${state.phase}.`;
 }
 export function preflightStatusLines(ctx: ExtensionContext): string[] {

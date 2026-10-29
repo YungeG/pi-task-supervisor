@@ -1,7 +1,7 @@
 import { beforeEach, describe, expect, it, vi } from "vitest";
 import { setSessionScopeEnabled } from "../scope";
 import { getBoard, resetState, setBoard } from "../state";
-import { holdSupervisor, supervisorState, type Advisor } from "../supervisor";
+import { startSupervisor, holdSupervisor, supervisorState, type Advisor } from "../supervisor";
 import { createGetReadyTasksTool, createWorkflowGateTool } from "../tools";
 import { activeBoard, BOUNDARY, lifecycle } from "./helpers/lifecycle";
 
@@ -44,7 +44,7 @@ async function decisionGate(h: ReturnType<typeof lifecycle>) {
 async function supervisedWait() {
   const advisor = vi.fn<Advisor>(async () => ({ advice: guide }));
   const h = lifecycle(advisor);
-  await h.command("supervise Complete the approved local work");
+  startSupervisor(h.mock.api, h.ctx, "Complete the approved local work");
   await decisionGate(h);
   h.mock.sendMessage.mockClear();
   return { ...h, advisor };
@@ -81,7 +81,7 @@ describe("supervised human decision settlement", () => {
     const state = structuredClone(supervisorState());
     await h.fire("agent_before_settle", BOUNDARY);
     await h.fire("agent_settled", { aborted: false });
-    await h.command(`resolve ${decision.id} B`);
+    await h.command(`decide ${decision.id} B`);
     expect(getBoard()).toMatchObject({ workflowStatus: "waiting_for_decision", decision });
     expect(supervisorState()).toEqual(state);
     expect(h.mock.sendMessage).not.toHaveBeenCalled();
@@ -130,7 +130,7 @@ describe("supervised human decision settlement", () => {
 
   it("still faults on unexplained settlement without a human gate", async () => {
     const h = lifecycle();
-    await h.command("supervise Complete the approved local work");
+    startSupervisor(h.mock.api, h.ctx, "Complete the approved local work");
     await h.fire("agent_settled", { aborted: false });
     expect(supervisorState()).toMatchObject({ status: "fault", holdCause: "interrupted" });
   });

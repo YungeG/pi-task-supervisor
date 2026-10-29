@@ -143,6 +143,7 @@ export interface NativeQuestion {
     | "authorization"
     | "business-choice"
     | "contract-definition"
+    | "scope-revision"
     | "first-start"
     | "information"
     | "approval-bundle";
@@ -343,6 +344,23 @@ function canonicalContractDefinition(question: NativeQuestion): boolean {
     question.options[1] === "不绑定"
   );
 }
+function canonicalScopeRevision(question: NativeQuestion): boolean {
+  return (
+    question.kind === "authorization" &&
+    isGoalReadbackFrame(question.frame) &&
+    question.options === undefined &&
+    question.approval === undefined
+  );
+}
+function documentReview(question: NativeQuestion): boolean {
+  return ["contract-definition", "scope-revision"].includes(question.purpose ?? "");
+}
+function canonicalDocumentPurpose(purpose: Purpose, question: NativeQuestion): boolean {
+  return (
+    (purpose === "contract-definition" && canonicalContractDefinition(question)) ||
+    (purpose === "scope-revision" && canonicalScopeRevision(question))
+  );
+}
 function purposeFor(question: NativeQuestion): Purpose | undefined {
   // Only absent metadata selects a default; null/unknown purposes must stay invalid.
   const defaults = {
@@ -356,7 +374,7 @@ function purposeFor(question: NativeQuestion): Purpose | undefined {
   if ((purpose === "authorization" || purpose === "information") && purpose === question.kind)
     return purpose;
   if (purpose === "business-choice" && question.kind === "choice") return purpose;
-  if (purpose === "contract-definition" && canonicalContractDefinition(question)) return purpose;
+  if (canonicalDocumentPurpose(purpose, question)) return purpose;
   if (purpose === "first-start" && canonicalLaterStart(question)) return purpose;
   return undefined;
 }
@@ -369,8 +387,7 @@ function validDefinitionBody(body: string): boolean {
 }
 function validDisplayMetadata(question: NativeQuestion): boolean {
   if (question.purpose === "approval-bundle" && !validApprovalMetadata(question)) return false;
-  if (question.purpose === "contract-definition" && !validDefinitionBody(question.body))
-    return false;
+  if (documentReview(question) && !validDefinitionBody(question.body)) return false;
   if (question.approval && question.purpose !== "approval-bundle") return false;
   if (question.informationFormat !== undefined) {
     if (question.kind !== "information") return false;
@@ -531,6 +548,7 @@ function draftConfirmation(
     information: "补充信息（全文已核对）",
     "approval-bundle": "集中审核（完整材料已核对）",
     "contract-definition": "契约定义审核（完整材料已核对）",
+    "scope-revision": "范围修订审核（完整材料已核对）",
   };
   let label = "确认提交所选方案";
   if (question.kind === "authorization") label = value === "Approve" ? "允许上述范围" : "不允许";
@@ -657,6 +675,12 @@ async function invokeApprovalReview(
     true,
   );
   if (!current() || !isApprovalSelection(selected, question)) return undefined;
+  if (question.purpose === "scope-revision")
+    return selected.permissionIds.length
+      ? undefined
+      : selected.outcome === "approve"
+        ? "Approve"
+        : "Reject";
   if (question.purpose === "contract-definition")
     return selected.permissionIds.length
       ? undefined
@@ -696,7 +720,7 @@ async function invokeUI(
     if (!purpose || !validDisplayMetadata(question) || !current()) return undefined;
     await closeReadOnlyView(ctx);
     if (!current()) return undefined;
-    if (purpose === "approval-bundle" || purpose === "contract-definition")
+    if (["approval-bundle", "contract-definition", "scope-revision"].includes(purpose))
       return await invokeApprovalReview(ctx, question, current, signal);
     if (question.material) return await invokeDecisionCard(ctx, question, purpose, current, signal);
     return await invokeLegacyQuestion(ctx, question, purpose, current, signal);

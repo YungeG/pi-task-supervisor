@@ -1,5 +1,6 @@
 import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
 import { currentRuntime } from "./runtime";
+import { scopeExecutionIssue, scopeLeaseToken } from "./scope-revision-journal";
 import { activeGoalContext } from "./management-policy";
 import {
   isGoalCarrier,
@@ -105,6 +106,8 @@ export function goalExecutionIssue(ctx?: ExtensionContext): string | undefined {
   const issue = goalControlIssue(ctx);
   if (issue) return issue;
   if (!activeGoalContext()) return undefined;
+  const scope = scopeExecutionIssue(ctx);
+  if (scope) return scope;
   const current = currentRuntime().goal?.current;
   if (current && !["active", "reviewing"].includes(current.phase))
     return `GoalRun is ${current.phase}; no automatic board continuation or execution`;
@@ -211,11 +214,13 @@ export function invalidateGoalCallbacks(): void {
   runtime.cancel();
 }
 export function goalLease(): string {
-  const current = currentRuntime().goal?.current;
+  const current = currentRuntime().goal?.current,
+    scope = scopeLeaseToken();
   return JSON.stringify([
     current?.scope.goalRunId,
     current?.scope.lifecycleCommitId,
     current?.planning.attemptId,
     currentRuntime().goalEpoch,
+    ...(scope === undefined ? [] : [scope]),
   ]);
 }

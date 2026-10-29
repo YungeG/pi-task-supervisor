@@ -15,11 +15,13 @@ export const TASK_TOOL_NAMES: readonly string[] = [
 export const PREFLIGHT_TOOL_NAME = "submit_preflight";
 const checkTools = ["run_check"];
 const proposalTools = ["propose_contract"];
+const scopeTools = ["propose_scope_revision"];
 const taskTools = new Set([
   ...TASK_TOOL_NAMES,
   PREFLIGHT_TOOL_NAME,
   ...checkTools,
   ...proposalTools,
+  ...scopeTools,
 ]);
 
 function modePermitsTools(): boolean {
@@ -45,7 +47,7 @@ export function updateActiveTools(pi: ExtensionAPI, value: boolean): void {
     ? preflight.phase === "interrupted"
       ? []
       : [PREFLIGHT_TOOL_NAME, ...proposalTools]
-    : [...TASK_TOOL_NAMES, ...checkTools, ...proposalTools];
+    : [...TASK_TOOL_NAMES, ...checkTools, ...proposalTools, ...(supervised ? scopeTools : [])];
   pi.setActiveTools(value ? [...active, ...selected] : active);
 }
 

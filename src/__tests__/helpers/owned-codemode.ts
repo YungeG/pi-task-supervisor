@@ -16,7 +16,11 @@ import {
   type ExtensionContext,
 } from "@earendil-works/pi-coding-agent";
 import { fauxProvider, fauxAssistantMessage, fauxToolCall } from "@earendil-works/pi-ai";
-import supervisor from "../../index";
+import supervisor, { registerSupervisorComponents } from "../../index";
+import { scopedAPI, currentRuntime } from "../../runtime";
+import { startSupervisor } from "../../supervisor";
+import { enableSessionScope } from "../../scope";
+import { adoptSupervisedMode } from "../../management-policy";
 import { createMockContext } from "./mocks";
 import { installCustomUI } from "./custom-ui";
 import { trustedCliRoots } from "../../human-ui";
@@ -277,7 +281,11 @@ export async function ownedCodemode(kind: OwnedCase, hooks: OwnedFixtureHooks = 
               "owned-work",
             ),
             fauxAssistantMessage(
-              fauxToolCall("run_check", { checkId: "required-node" }, { id: "owned-direct-check" }),
+              fauxToolCall(
+                hooks.checkTool ?? "run_check",
+                hooks.checkTool === "owned_check" ? {} : { checkId: "required-node" },
+                { id: "owned-direct-check" },
+              ),
               { stopReason: "toolUse" },
             ),
             fauxAssistantMessage(
@@ -342,20 +350,29 @@ export async function ownedCodemode(kind: OwnedCase, hooks: OwnedFixtureHooks = 
       noPromptTemplates: true,
       noContextFiles: true,
       extensionFactories: [
-        ...(hooks.goalStart
-          ? [
-              (pi: ExtensionAPI) => {
-                let started = false;
-                pi.on("tool_call", (_event, ctx) => {
-                  if (!started) {
-                    started = true;
-                    hooks.goalStart?.(pi, ctx, dir);
+        workflow
+          ? supervisor
+          : (pi: ExtensionAPI) => {
+              scopedAPI(pi, (api) => {
+                let hostDefinitions = false;
+                api.on("tool_call", (_event, ctx) => {
+                  if (!hostDefinitions) {
+                    hostDefinitions = true;
+                    hooks.goalStart?.(api, ctx, dir);
                   }
                 });
-              },
-            ]
-          : []),
-        supervisor,
+                registerSupervisorComponents(api);
+                // Existing trusted-host module seam for kernel/effects tests. This is
+                // not a human command, native approval or current first-Start proof.
+                api.on("session_start", (_event, ctx) => {
+                  if (!currentRuntime().supervisor && !currentRuntime().journalFault) {
+                    startSupervisor(api, ctx, "Owned covered SDK mechanism");
+                    enableSessionScope(api);
+                    adoptSupervisedMode(api, ctx);
+                  }
+                });
+              });
+            },
         {
           name: "codemode",
           builtin: true,
@@ -507,12 +524,17 @@ export async function ownedCodemode(kind: OwnedCase, hooks: OwnedFixtureHooks = 
         )?.data as { status: string; reason?: string } | undefined;
     const command = session.extensionRunner.getCommand("task-supervisor");
     if (!command) throw Error("Owned command missing");
-    await command.handler(
-      workflow
-        ? "supervise Owned covered SDK mechanism"
-        : "supervise-legacy Owned covered SDK mechanism",
-      session.extensionRunner.createCommandContext(),
-    );
+    if (workflow)
+      await command.handler(
+        "supervise Owned covered SDK mechanism",
+        session.extensionRunner.createCommandContext(),
+      );
+    else
+      void session
+        .prompt("Exercise the owned trusted-host kernel/effects mechanism")
+        .catch((error: unknown) => {
+          errors.push(error);
+        });
     if (workflow) {
       await session.waitForIdle();
       const approval = [...customRows(manager)]

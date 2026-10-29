@@ -1,7 +1,7 @@
 import { beforeEach, describe, expect, it, vi } from "vitest";
 import { setSessionScopeEnabled } from "../scope";
 import { getBoard, resetState, setBoard } from "../state";
-import { supervisorState, type Advisor, type Advice } from "../supervisor";
+import { startSupervisor, supervisorState, type Advisor, type Advice } from "../supervisor";
 import { activeBoard, BOUNDARY, deferred, lifecycle } from "./helpers/lifecycle";
 
 const guide: Advice = {
@@ -21,7 +21,7 @@ describe("native supervisor continuation and compaction", () => {
   it("returns host next-batch control through a native boundary, never as a user message", async () => {
     const advisor = vi.fn<Advisor>(async () => ({ advice: guide }));
     const h = lifecycle(advisor);
-    await h.command("supervise Finish and verify the approved work");
+    startSupervisor(h.mock.api, h.ctx, "Finish and verify the approved work");
     h.mock.sendMessage.mockClear();
     const result = await h.fire("agent_before_settle", BOUNDARY);
     expect(result).toMatchObject({
@@ -44,7 +44,7 @@ describe("native supervisor continuation and compaction", () => {
   it("preserves the durable goal through compaction before the settlement boundary", async () => {
     const advisor = vi.fn<Advisor>(async () => ({ advice: guide }));
     const h = lifecycle(advisor);
-    await h.command("supervise Finish and verify the approved work");
+    startSupervisor(h.mock.api, h.ctx, "Finish and verify the approved work");
     await h.fire("session_before_compact");
     const result = await h.fire("agent_before_settle", BOUNDARY);
     expect(result?.continue).toBe(true);
@@ -56,7 +56,7 @@ describe("native supervisor continuation and compaction", () => {
   it("interrupts an in-flight review visibly and ignores its late result after compaction", async () => {
     const reply = deferred<Awaited<ReturnType<Advisor>>>();
     const h = lifecycle(() => reply.promise);
-    await h.command("supervise Finish approved work");
+    startSupervisor(h.mock.api, h.ctx, "Finish approved work");
     const pending = h.fire("agent_before_settle", BOUNDARY);
     await h.fire("session_before_compact");
     expect(await pending).toBeUndefined();
@@ -75,7 +75,7 @@ describe("native supervisor continuation and compaction", () => {
 
   it("reconciles a native abort during the boundary instead of leaving an active-idle supervisor", async () => {
     const h = lifecycle(async () => ({ advice: guide }));
-    await h.command("supervise Finish approved work");
+    startSupervisor(h.mock.api, h.ctx, "Finish approved work");
     await h.fire("agent_before_settle", BOUNDARY);
     await h.fire("agent_settled", { type: "agent_settled", aborted: true });
     expect(supervisorState()).toMatchObject({ status: "paused", pending: false });
@@ -84,7 +84,7 @@ describe("native supervisor continuation and compaction", () => {
 
   it("faults visibly if Pi settles an unfinished supervisor instead of executing its continuation", async () => {
     const h = lifecycle(async () => ({ advice: guide }));
-    await h.command("supervise Finish approved work");
+    startSupervisor(h.mock.api, h.ctx, "Finish approved work");
     await h.fire("agent_before_settle", BOUNDARY);
     h.mock.sendMessage.mockClear();
     await h.fire("agent_settled", { type: "agent_settled", aborted: false });
@@ -109,7 +109,7 @@ describe("native supervisor continuation and compaction", () => {
   it("rejects advice whose session branch changed while the model was reviewing", async () => {
     const reply = deferred<Awaited<ReturnType<Advisor>>>();
     const h = lifecycle(() => reply.promise);
-    await h.command("supervise Finish approved work");
+    startSupervisor(h.mock.api, h.ctx, "Finish approved work");
     const pending = h.fire("agent_before_settle", BOUNDARY);
     vi.mocked(h.ctx.sessionManager.getLeafId).mockReturnValue("different-branch");
     reply.resolve({ advice: guide });

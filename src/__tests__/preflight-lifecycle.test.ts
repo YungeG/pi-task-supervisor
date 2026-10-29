@@ -1,6 +1,8 @@
+import { enterPlanningMode } from "../management-policy";
+import { beginPreflight } from "../preflight";
 import { beforeEach, describe, expect, it, vi } from "vitest";
 import { resetState, setBoard, getBoard } from "../state";
-import { setSessionScopeEnabled, TASK_TOOL_NAMES } from "../scope";
+import { enableSessionScope, setSessionScopeEnabled, TASK_TOOL_NAMES } from "../scope";
 import { currentRuntime } from "../runtime";
 import { supervisorState } from "../supervisor";
 import {
@@ -18,7 +20,9 @@ beforeEach(() => {
 });
 async function proposed() {
   const h = preflightLifecycle();
-  await h.command("preflight Local implementation");
+  beginPreflight(h.mock.api, h.ctx, "Local implementation");
+  enableSessionScope(h.mock.api);
+  enterPlanningMode(h.mock.api, h.ctx);
   await createSubmitPreflightTool(h.mock.api).execute(
     "submit",
     { preflightId: currentRuntime().preflight!.preflightId, proposal: localProposal },
@@ -79,7 +83,7 @@ describe("preflight lifecycle authorization boundary", () => {
         input: {},
       }),
     ).toMatchObject({ block: true });
-    await h.command("enable");
+    await h.command("tasks-only");
     expect(currentRuntime().management?.mode).toBe("tasks");
     expect(getBoard().tasks).toHaveLength(0);
     expect(currentRuntime().preflight).toEqual(retained);
@@ -284,7 +288,7 @@ describe("preflight lifecycle authorization boundary", () => {
         h.mock.sendMessage.mockImplementation(() => {
           throw new Error("dispatch failed");
         });
-      await h.command("preflight Local fixture");
+      await h.command("supervise Local fixture");
       expect(currentRuntime().journalFault).toBeDefined();
       expect(supervisorState()).toBeUndefined();
       expect(h.fire("tool_call", { toolName: "submit_preflight", input: {} })).toMatchObject({
@@ -331,7 +335,7 @@ describe("preflight lifecycle authorization boundary", () => {
     expect(currentRuntime().preflight).toBeUndefined();
     vi.mocked(h.ctx.sessionManager.getSessionId).mockReturnValue("test-session");
     await h.fire("session_tree");
-    await h.command("preflight Replacement goal");
+    await h.command("supervise Replacement goal");
     h.mock.sendMessage.mockClear();
     await h.fire("session_tree");
     expect(currentRuntime().preflight?.phase).toBe("interrupted");

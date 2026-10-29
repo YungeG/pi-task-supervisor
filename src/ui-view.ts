@@ -373,22 +373,22 @@ function collectSupervisorBlockers(
   supervisor: Readonly<SupervisorState> | undefined,
   limits: Readonly<{ reviews: number; continuations: number; stagnant: number }>,
   capturedAt: number,
+  budget: FlowFacts["budget"],
 ): UiLine[] {
   const blockers: UiLine[] = [];
   if (!supervisor) return blockers;
+  if (budget?.status === "unknown")
+    blockers.push(line(budget.reason ?? "Budget unknown", "supervisor", "warning"));
   if (supervisor.reason) {
     blockers.push(line(supervisor.reason, "supervisor", "warning"));
   }
   if (supervisor.holdCause) {
     blockers.push(line(`Hold: ${supervisor.holdCause}`, "supervisor", "warning"));
   }
-  if (supervisor.reviews >= limits.reviews) {
+  const spent = budget?.spentReviews ?? supervisor.reviews;
+  if (spent >= limits.reviews) {
     blockers.push(
-      line(
-        `Reviews limit reached: ${supervisor.reviews}/${limits.reviews}`,
-        "supervisor",
-        "warning",
-      ),
+      line(`Reviews limit reached: ${spent}/${limits.reviews}`, "supervisor", "warning"),
     );
   }
   if (supervisor.continuations >= limits.continuations) {
@@ -436,6 +436,7 @@ function collectBlockers(input: UiSummaryInput): UiLine[] {
       isSameSessionSupervisor(input) ? input.supervisor : undefined,
       input.limits,
       input.scope.capturedAt,
+      input.facts.budget,
     ),
     ...collectHostBlockers(input.facts),
   ];
@@ -633,7 +634,9 @@ function isBudgetExhausted(input: UiSummaryInput): boolean {
   return (
     supervisor !== undefined &&
     supervisor.sessionId === scope.sessionId &&
-    (supervisor.reviews >= limits.reviews ||
+    (input.facts.budget?.status === "unknown" ||
+      input.facts.budget?.status === "exhausted" ||
+      supervisor.reviews >= limits.reviews ||
       supervisor.continuations >= limits.continuations ||
       supervisor.stagnant >= limits.stagnant)
   );

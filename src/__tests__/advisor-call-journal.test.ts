@@ -6,7 +6,12 @@ import { submitAndPresentPreflight } from "../preflight-human";
 import { currentRuntime } from "../runtime";
 import { resetState } from "../state";
 import { supervisorState } from "../supervisor";
-import { advisorUsageFor, beginAdvisorCall, observeAdvisorCall } from "../advisor-calls";
+import {
+  advisorUsageFor,
+  beginAdvisorCall,
+  observeAdvisorCall,
+  advisorBudgetAssessment,
+} from "../advisor-calls";
 
 async function context() {
   resetState();
@@ -62,6 +67,14 @@ it("charges extra calls in one review attempt without pretending they are new re
     ).toEqual([1, 2, 3]);
     expect(reserved.reviews).toBe(1);
     expect(advisorUsageFor(third.owner)).toMatchObject({ providerCalls: 3, pendingCalls: 1 });
+    expect(advisorBudgetAssessment({ ...reserved, reviews: 39 })).toMatchObject({
+      status: "exhausted",
+      spentReviews: 40,
+    });
+    expect(advisorBudgetAssessment({ ...reserved, reviews: 38 })).toMatchObject({
+      status: "available",
+      spentReviews: 39,
+    });
   } finally {
     f.restoreHost();
     rmSync(f.dir, { recursive: true, force: true });

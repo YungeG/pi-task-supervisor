@@ -1,3 +1,6 @@
+import { adoptSupervisedMode } from "../management-policy";
+import { enableSessionScope } from "../scope";
+import { startSupervisor } from "../supervisor";
 // C3 native human-control/private-registry/physical-readback seam. In-memory
 // trusted-source/TTY simulation only; never real person, CLI/PTY or product acceptance.
 import { readFileSync, writeFileSync, unlinkSync } from "node:fs";
@@ -306,7 +309,9 @@ async function manualFixture(information = false) {
   writeFileSync(h.path, JSON.stringify({ ...header, cwd: root }) + "\n");
   h.ctx.cwd = root;
   writeFileSync(join(root, "artifact.txt"), "owned-artifact\n");
-  await h.command("supervise-legacy Owned manual check");
+  startSupervisor(h.mock.api, h.ctx, "Owned manual check");
+  enableSessionScope(h.mock.api);
+  adoptSupervisedMode(h.mock.api, h.ctx);
   const token = recognizeAcceptanceSuite("Owned manual check", {
     version: 1,
     scopeId: "owned-manual",

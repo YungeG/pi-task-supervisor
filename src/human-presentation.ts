@@ -1,3 +1,4 @@
+import type { scopeRevisionReviewSubject } from "./scope-revision-journal";
 import type { ThemeColor } from "@earendil-works/pi-coding-agent";
 import type { PreflightState, PreflightProposal } from "./preflight";
 import { stripTerminalSequences } from "@earendil-works/pi-tui";
@@ -457,6 +458,29 @@ export function readableDefinitionReview(subject: ReturnType<typeof contractRevi
         "技术详情 · 身份与版本（仅供核对，不是额外选择）",
         ...identity.map(([key, value]) => exactDetail(key, value)),
       ].join("\n"),
+    ].join("\n\n"),
+  };
+}
+export function readableScopeRevision(subject: ReturnType<typeof scopeRevisionReviewSubject>) {
+  const definition = readableDefinitionReview(subject.contract);
+  return {
+    title: "同一 Goal 范围修订 · 不启动或恢复",
+    body: [
+      "本次仅修改既有权限对象内的约束和验收定义。原 Goal、首次 Start、任务身份、暂停及已用预算保留。提交后仍需显式 recover 与新证据；原成功不会自动适用。",
+      `修订原因：${subject.reason}`,
+      exactDetail("原方案全文", subject.previousPlan),
+      exactDetail("拟生效方案全文（含每项权限的限制、风险、替代和重确认条件）", subject.plan),
+      exactDetail("原验收条件及冻结定义全文", subject.previousContract),
+      definition.body,
+      exactDetail("技术详情 · 原批准与首次 Start", {
+        approvalRef: subject.approvalRef,
+        startRef: subject.startRef,
+      }),
+      exactDetail("技术详情 · 修订链", {
+        proposalRef: subject.proposalRef,
+        previousRevisionRef: subject.previousRevisionRef,
+        previousContractRef: subject.previousContractRef,
+      }),
     ].join("\n\n"),
   };
 }

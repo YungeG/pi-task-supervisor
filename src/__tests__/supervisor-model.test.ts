@@ -2,7 +2,7 @@ import { fauxAssistantMessage, fauxToolCall } from "@earendil-works/pi-ai";
 import { beforeEach, describe, expect, it, vi } from "vitest";
 import { setSessionScopeEnabled } from "../scope";
 import { resetState, setBoard } from "../state";
-import { supervisorState } from "../supervisor";
+import { startSupervisor, supervisorState } from "../supervisor";
 import { activeBoard, BOUNDARY, lifecycle } from "./helpers/lifecycle";
 import { appendMockEntries } from "./helpers/mocks";
 
@@ -28,7 +28,7 @@ describe("session-runtime advisor adapter", () => {
     const find = vi.fn(() => h.ctx.model);
     const streamSimple = vi.fn(() => ({ result: async () => reply }));
     Object.assign(h.ctx, { modelRegistry: { find, streamSimple } });
-    await h.command("supervise Validate the approved work");
+    startSupervisor(h.mock.api, h.ctx, "Validate the approved work");
     Object.assign(h.ctx, { model: { provider: "changed", id: "changed" } });
     const result = await h.fire("agent_before_settle", BOUNDARY);
     expect(result?.continue).toBe(true);
@@ -70,7 +70,7 @@ describe("session-runtime advisor adapter", () => {
           streamSimple: () => ({ result: async () => reply }),
         },
       });
-      await h.command("supervise Validate the approved work");
+      startSupervisor(h.mock.api, h.ctx, "Validate the approved work");
       expect(await h.fire("agent_before_settle", BOUNDARY)).toBeUndefined();
       expect(supervisorState()?.status).toBe("fault");
       expect(h.mock.sendMessage).toHaveBeenLastCalledWith(
@@ -93,7 +93,7 @@ describe("session-runtime advisor adapter", () => {
         },
       },
     });
-    await h.command("supervise Validate approved work");
+    startSupervisor(h.mock.api, h.ctx, "Validate approved work");
     await h.fire("tool_result", {
       toolName: "read",
       toolCallId: "credentials",
@@ -141,7 +141,7 @@ describe("session-runtime advisor adapter", () => {
         })),
       }),
     );
-    await h.command("supervise Validate the approved large plan");
+    startSupervisor(h.mock.api, h.ctx, "Validate the approved large plan");
     expect(await h.fire("agent_before_settle", BOUNDARY)).toBeUndefined();
     expect(supervisorState()).toMatchObject({
       status: "fault",
@@ -154,7 +154,7 @@ describe("session-runtime advisor adapter", () => {
     const h = lifecycle();
     const streamSimple = vi.fn();
     Object.assign(h.ctx, { modelRegistry: { find: () => undefined, streamSimple } });
-    await h.command("supervise Validate approved work");
+    startSupervisor(h.mock.api, h.ctx, "Validate approved work");
     await h.fire("agent_before_settle", BOUNDARY);
     expect(supervisorState()).toMatchObject({
       status: "fault",
@@ -173,7 +173,7 @@ describe("session-runtime advisor adapter", () => {
         },
       },
     });
-    await h.command("supervise Validate approved work");
+    startSupervisor(h.mock.api, h.ctx, "Validate approved work");
     await h.fire("agent_before_settle", BOUNDARY);
     expect(supervisorState()).toMatchObject({
       status: "fault",

@@ -3,11 +3,13 @@
 import argparse, errno, fcntl, hashlib, json, os, pathlib, pty, re, select, shutil, signal, struct, subprocess, tempfile, termios, time, uuid
 
 parser = argparse.ArgumentParser()
-parser.add_argument('scenario', choices=['sequential', 'permissions', 'information', 'sdk-denial', 'approval-existing', 'approval-preparation'])
+parser.add_argument('scenario', choices=['sequential', 'permissions', 'information', 'sdk-denial', 'approval-existing', 'approval-preparation', 'approval-scope'])
 parser.add_argument('--source', type=pathlib.Path, default=pathlib.Path(__file__).resolve().parent.parent)
 parser.add_argument('--cli', type=pathlib.Path)
 parser.add_argument('--out', type=pathlib.Path)
 parser.add_argument('--decision-layouts', action='store_true', help='exercise optional Markdown reading and wide split without submitting')
+parser.add_argument('--default-builtin',action='store_true',help='keep the real default builtin codemode loaded and active')
+parser.add_argument('--container-only',action='store_true',help='verify unsupported default-models container-only profile blocks before first Start')
 args = parser.parse_args()
 source = args.source.resolve()
 cli = (args.cli or source/'node_modules/@earendil-works/pi-coding-agent/dist/cli.js').resolve()
@@ -40,6 +42,12 @@ if args.scenario.startswith('approval-'):
     (sandbox/'.gitignore').write_text('*\n!.gitignore\n!input.txt\n!test_output.py\n!result.txt\n!owned-checker/\n!owned-checker/test_output.py\n')
 env.update(PI_CODING_AGENT_DIR=str(sandbox/'agent'), PI_OFFLINE='1', PI_SKIP_VERSION_CHECK='1', PI_TELEMETRY='0', TERM='xterm-256color', GOAL_NATIVE_SCENARIO=args.scenario, GOAL_NATIVE_OUT=str(sandbox))
 argv = [node, str(cli), '--offline', '--no-extensions', '--no-mcp', '--no-skills', '--no-prompt-templates', '--no-context-files', '--no-approve', '-e', str(source/'test/goal-native-fixture.ts'), '--model', 'goal-native-fixture/test', '--session', str(path), '--session-dir', str(sandbox/'sessions')]
+if args.default_builtin:
+    argv.remove('--no-extensions');argv.extend(['--tools','+codemode'])
+if args.container_only:
+    assert args.default_builtin and args.scenario.startswith('approval-')
+    (sandbox/'agent').mkdir(exist_ok=True)
+    (sandbox/'agent/settings.json').write_text(json.dumps({'codemode':{'mode':'only'}}))
 if args.scenario == 'sdk-denial':
     argv = [node, str(source/'test/goal-sdk-negative.mjs')]
 pid, fd = pty.fork()
@@ -84,7 +92,20 @@ def card_layouts():
 def answer(kind, already_selected=False):
     global stage, contract_ui_checks
     stage = 'native draft and scope review '+kind
-    receive('需要你回应|只读核对|格式化浏览|集中审核|契约定义审核')
+    receive('需要你回应|只读核对|格式化浏览|集中审核|契约定义审核|范围修订审核')
+    if '范围修订审核' in text():
+        assert 'Enter 批准本版修订' in text() and 'r 拒绝本版' in text() and 'Esc 稍后' in text()
+        for geometry in [None,(30,100)]:
+            if geometry:
+                fcntl.ioctl(fd,termios.TIOCSWINSZ,struct.pack('HHHH',*geometry,0,0)); os.kill(pid,signal.SIGWINCH)
+                data.clear();receive('材料未完整核对');send('\r');receive('本次没有提交')
+            for _ in range(128):
+                if '完整材料已核对' in text(): break
+                send('\x1b[6~'); receive(r'材料\s+\d+/\d+|完整材料已核对')
+            else: raise AssertionError('scope revision material never completed')
+        (sandbox/'scope-revision-complete.txt').write_text(text())
+        send('\r')
+        return
     if '契约定义审核' in text():
         assert 'Enter 绑定当前定义' in text() and 'r 不绑定' in text() and 'Esc 稍后' in text()
         assert '选项 1' not in text() and '选项 2' not in text()
@@ -206,6 +227,8 @@ if args.scenario == 'sdk-denial':
     raise SystemExit(0)
 try:
     receive('GOAL_NATIVE_READY'); initial = probe('initial'); assert initial['modelCalls']==0
+    if args.default_builtin:
+        assert len(initial['codemode'])==1 and initial['codemode'][0]['sourceInfo']['path']=='builtin:codemode' and initial['codemode'][0]['modelsAdvertised']
     if args.scenario == 'information':
         stage = 'native same-screen information input'
         command('/goal-native-information'); receive('需要你回应')
@@ -228,13 +251,13 @@ try:
         raise SystemExit(0)
     stage = 'native archive-and-plan'
     if args.scenario.startswith('approval-'):
-        command('/task-supervisor preflight Owned native first workflow')
+        command('/task-supervisor supervise Owned native first workflow')
     else:
         command('/task-supervisor supervise Owned native next goal'); answer('archive')
     if args.scenario == 'sequential':
         stage = 'first readonly planning'; receive('GOAL_NATIVE_IDLE_1'); first = probe('first')
         gid = first['currentGoalRunId']; assert all(row['data'].get('supervisor') is None for row in goal_records(first) if row['data']['kind']=='goal-state')
-        command('/task-supervisor preflight'); stage = 'same-goal explicit planning'; receive('GOAL_NATIVE_IDLE_2'); replanned = probe('replanned')
+        command('/task-supervisor supervise --replan'); stage = 'same-goal explicit planning'; receive('GOAL_NATIVE_IDLE_2'); replanned = probe('replanned')
         assert replanned['currentGoalRunId']==gid
         assert any(row['data']['kind']=='goal-state' and row['data']['planning']['attemptNo']==1 for row in goal_records(replanned))
         command('/task-supervisor stop'); stopped = probe('stopped'); assert goal_records(stopped)[-1]['data']['disposition']=='closed-unstarted'
@@ -250,6 +273,7 @@ try:
             assert any(row['data'].get('action')=='claim-planning-dispatch' and row['data']['planning']['attemptId'] in message['content'] for row in goal_records({'entries':final['entries'][:index]}))
     elif args.scenario.startswith('approval-'):
         prepare = args.scenario == 'approval-preparation'
+        scope = args.scenario == 'approval-scope'
         if not prepare:
             stage = 'unread native bundle must not submit'
             receive('集中审核'); send('\r'); receive('请先用 PgDn')
@@ -270,6 +294,16 @@ try:
         assert original['phase']=='approved' and 'started' not in original
         assert not (sandbox/'result.txt').exists()
         assert not approved.get('supervisor')
+        if args.container_only:
+            command('/task-supervisor start');receive('Formal evidence route unsupported')
+            denied=probe('unsupported-before-start')
+            assert 'started' not in current_preflight(denied) and not denied.get('supervisor')
+            assert denied['modelCalls']==approved['modelCalls'] and not (sandbox/'result.txt').exists()
+            assert not any(row.get('customType')=='continuous-tasks:preflight-control' and row['data'].get('kind')=='start' for row in denied['entries'])
+            assert sha(settings)==before
+            report={'result':'PASS','scenario':'unsupported-before-start','actualCli':str(cli),'defaultBuiltin':True,'modelsEnabledCodemodePresent':True,'noFirstStart':True,'noBusinessDispatch':True,'settingsUnchanged':True,'nativeSourceMocked':False,'syntheticKeystrokes':True,'probe':str(sandbox/'unsupported-before-start.json'),'sessionFile':str(path),'transcript':str(transcript)}
+            (sandbox/'verified.json').write_text(json.dumps(report,indent=2)+'\n');print(json.dumps(report),flush=True)
+            raise SystemExit(0)
         command('/task-supervisor start'); answer('independent first Start')
         if prepare:
             receive('GOAL_NATIVE_IDLE_2')
@@ -299,7 +333,27 @@ try:
             assert current_preflight(reviewed)['approval']==original['approval']
             assert len(reviewed['acceptance']['contracts'])==1
             command('/task-supervisor recover')
-        receive('GOAL_NATIVE_IDLE_'+('3' if prepare else '2'))
+        if scope:
+            receive('GOAL_NATIVE_IDLE_2')
+            held=wait_probe('scope-original-held',lambda value:value.get('supervisor',{}).get('status')=='paused' and not value['supervisor'].get('pending'))
+            stage='real model metadata proposal while actual Main is running and Goal held'
+            command('Form the exact owned synthetic same-Goal scope proposal only; no business work')
+            receive('GOAL_NATIVE_SCOPE_PROPOSED'); receive('GOAL_NATIVE_IDLE_3')
+            proposed=probe('scope-proposed')
+            assert len(proposed['acceptance']['scopeProposals'])==1 and not proposed['acceptance']['scopeCommits']
+            assert proposed['supervisor']==held['supervisor'] and not (sandbox/'result.txt').exists()
+            proposal_id=proposed['acceptance']['scopeProposals'][0]['data']['proposalId']
+            fcntl.ioctl(fd,termios.TIOCSWINSZ,struct.pack('HHHH',24,80,0,0)); os.kill(pid,signal.SIGWINCH)
+            command('/task-supervisor review-scope '+proposal_id);receive('范围修订审核')
+            send('\r');receive('本次没有提交');send('\x1b');receive('范围记录：deferred')
+            deferred_scope=probe('scope-deferred');assert not deferred_scope['acceptance']['scopeReviews']
+            command('/task-supervisor review-scope '+proposal_id);answer('exact scope amendment, not original business approval or Start')
+            reviewed=probe('scope-reviewed')
+            assert len(reviewed['acceptance']['scopeCommits'])==1 and reviewed['supervisor']==held['supervisor']
+            assert current_preflight(reviewed)==current_preflight(held) and not (sandbox/'result.txt').exists()
+            assert reviewed['board']==held['board']
+            command('/task-supervisor recover')
+        receive('GOAL_NATIVE_IDLE_'+('4' if scope else '3' if prepare else '2'))
         final=wait_probe('completed',lambda value:value.get('supervisor',{}).get('status')=='completed')
         assert final['board']['workflowStatus']=='completed'
         assert (sandbox/'result.txt').read_text()=='made\n'
@@ -308,7 +362,15 @@ try:
         assert sum(row['kind']=='approve' for row in controls)==1 and sum(row['kind']=='start' for row in controls)==1
         assert sum(row['kind']=='define' for row in controls)==0
         contracts=final['acceptance']['contracts']
-        assert len(contracts)==1 and contracts[0]['data']['authority']['kind']==('native-reviewed' if prepare else 'preflight-reviewed')
+        assert len(contracts)==(2 if scope else 1) and contracts[-1]['data']['authority']['kind']==('scope-revision-reviewed' if scope else 'native-reviewed' if prepare else 'preflight-reviewed')
+        if scope:
+            commit=final['acceptance']['scopeCommits'][0]
+            expected_ref={'entryId':commit['entryId'],'digest':commit['digest']}
+            assert final['supervisor']['scopeRevisionRef']==expected_ref
+            assert len(final['acceptance']['scopeReviews'])==1 and final['acceptance']['scopeReviews'][0].get('witness')
+            ledger=[row['data'] for row in final['entries'] if row.get('customType')=='continuous-tasks:receipt-ledger' and row['data'].get('kind')=='receipt']
+            assert any(row['receipt']['id']=='tool:native-check' and row['receipt'].get('scopeRevisionRef')==expected_ref and row['capture'].get('scopeRevisionRef')==expected_ref for row in ledger)
+            assert final['supervisor']['reviews']>=held['supervisor']['reviews'] and final['supervisor']['continuations']>=held['supervisor']['continuations']
         runs=final['acceptance']['runs']; assert len(runs)==1
         observed=runs[0]['observed']['data']
         assert observed['closed'] and observed['exitCode']==0 and observed['pid']>0 and observed['termination']=='exited'
@@ -333,7 +395,7 @@ try:
     verify_native_commits(final)
     raw = path.read_bytes(); assert raw.startswith(seed) and raw.endswith(b'\n')
     assert sha(settings)==before
-    report = {'result':'PASS','scenario':args.scenario,'sourceQualifiedSyntheticTaskCompletion':args.scenario.startswith('approval-'),'source':str(source),'actualCli':str(cli),'nativeSourceMocked':False,'syntheticKeystrokes':True,'businessExecutionCertified':False,'decisionLayoutChecks':layout_checks,'manualContractDocumentChecks':contract_ui_checks,'settingsUnchanged':True,'originalHistoryBytesUnchanged':True,'probe':final.get('probeArtifact',str(sandbox/'final.json')),'sessionFile':str(path),'transcript':str(transcript)}
+    report = {'result':'PASS','scenario':args.scenario,'sourceQualifiedSyntheticTaskCompletion':args.scenario.startswith('approval-'),'source':str(source),'actualCli':str(cli),'nativeSourceMocked':False,'syntheticKeystrokes':True,'businessExecutionCertified':False,'decisionLayoutChecks':layout_checks,'manualContractDocumentChecks':contract_ui_checks,'scopeDocument80x24AndResizeChecked':args.scenario=='approval-scope','defaultBuiltin':args.default_builtin,'settingsUnchanged':True,'originalHistoryBytesUnchanged':True,'probe':final.get('probeArtifact',str(sandbox/'final.json')),'sessionFile':str(path),'transcript':str(transcript)}
     (sandbox/'verified.json').write_text(json.dumps(report,indent=2)+'\n')
     print(json.dumps(report), flush=True)
 finally:

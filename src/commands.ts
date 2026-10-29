@@ -1,3 +1,4 @@
+import { reviewScopeRevision, repairScopeRevision, revokeScopeRevision } from "./scope-revision";
 import {
   approvePreflight,
   startApprovedPreflight,
@@ -32,7 +33,12 @@ import {
   assertPlanningAdmission,
 } from "./management-policy";
 import { retryFinalReview, pauseFaultedFinalReview, resumePausedFinalReview } from "./final-review";
-import { advisorUsageForCurrent, advisorUsageFor, type AdvisorUsage } from "./advisor-calls";
+import {
+  advisorUsageForCurrent,
+  advisorUsageFor,
+  advisorBudgetAssessment,
+  type AdvisorUsage,
+} from "./advisor-calls";
 import { loadConfig } from "./config";
 import {
   beginPreflight,
@@ -41,6 +47,7 @@ import {
   preflightStatusLines,
   revokePreflight,
   currentPreflightRequestIssue,
+  type PreflightState,
 } from "./preflight";
 import { showTaskList } from "./board-ui";
 import { showGoalHistory } from "./goal-history-ui";
@@ -48,7 +55,6 @@ import {
   holdSupervisor,
   recoverSupervisor,
   saveSupervisor,
-  startSupervisor,
   supervisorNotice,
   supervisorState,
 } from "./supervisor";
@@ -56,7 +62,7 @@ import { enableSessionScope, isSessionScopeEnabled, updateActiveTools } from "./
 import { getBoardRef, persistEntries, setBoard, updateUI, refreshUI } from "./state";
 import { preflightNotice, boardNotice } from "./human-presentation";
 import { cloneBoard, hasActionableTasks } from "./validation";
-import { routeGoalCommand, goalStatusText } from "./goal-commands";
+import { routeGoalCommand, goalStatusText, parseSuperviseArgs } from "./goal-commands";
 import { goalExecutionIssue } from "./goal-scope";
 
 function notifyError(ctx: ExtensionCommandContext, message: string): void {
@@ -76,8 +82,7 @@ function continuationHeld(): boolean {
     state.status !== "active" ||
     state.pending ||
     Boolean(state.externalWait) ||
-    state.reviews >= SUPERVISOR_LIMITS.reviews ||
-    state.continuations >= SUPERVISOR_LIMITS.continuations ||
+    advisorBudgetAssessment(state).status !== "available" ||
     state.stagnant >= SUPERVISOR_LIMITS.stagnant
   );
 }
@@ -272,46 +277,68 @@ async function beginPlanning(
   }
 }
 
+function hasPlanningMaterial(pref: PreflightState): boolean {
+  return !!(
+    pref.proposal ||
+    pref.approval ||
+    (pref.version === 2 && (pref.permissionRequest || pref.startRequest))
+  );
+}
+function currentPlanningGoal(ctx: ExtensionCommandContext, text: string): string | undefined {
+  const request = parseSuperviseArgs(text),
+    runtime = currentRuntime(),
+    pref = runtime.preflight;
+  const selected = captureManagementSnapshot(ctx).mode === "supervised";
+  const same =
+    selected &&
+    pref?.sessionId === ctx.sessionManager.getSessionId() &&
+    (!request.goal || pref.goal === request.goal);
+  if (!request.replan)
+    return same &&
+      pref.phase !== "revoked" &&
+      !["stopped", "completed"].includes(runtime.supervisor?.status ?? "")
+      ? undefined
+      : request.goal;
+  if (!same)
+    throw Error("--replan needs the same current unstarted Goal; it cannot create another target");
+  if (pref.started || runtime.supervisor)
+    throw Error(
+      "Started Goal: use propose_scope_revision and review-scope, not replan or another Start",
+    );
+  if (hasPlanningMaterial(pref))
+    throw Error(
+      "Existing proposal/approval/control remains with its original owner; inspect it or submit changed material in that attempt, without moving old permission to a new attempt",
+    );
+  return pref.goal;
+}
 async function startGoal(
   pi: ExtensionAPI,
   ctx: ExtensionCommandContext,
-  goal: string,
   planId?: string,
 ): Promise<void> {
   await ctx.waitForIdle();
-  goal = goal.trim().split(/\s+/).join(" ");
   const planning = currentRuntime().preflight;
-  if (planId !== undefined || (planning && planning.goal === goal)) {
-    if (!planning) throw new Error("No preflight plan exists");
-    inspectPreflightStart(ctx, planning.goal, planId);
-    const outcome = await startApprovedPreflight(pi, ctx, planId);
-    const notice = preflightNotice(outcome);
-    refreshUI(ctx);
-    ctx.ui.notify(withTaskDetails(ctx, notice.message), notice.level);
-    if (outcome.status === "started") {
-      try {
-        adoptSupervisedMode(pi, ctx);
-        const config = await loadConfig();
-        if (config.receiptCache) currentRuntime().receiptStore?.configure(config.receiptCache);
-        adoptPreflightAcceptance(pi, ctx);
-        continueNow(pi, ctx);
-      } catch (error) {
-        currentRuntime().cancel();
-        currentRuntime().journalFault ??=
-          "Preflight startup dispatch outcome unknown; inspect pending Main, never replay";
-        throw error;
-      }
+  if (!planning)
+    throw Error("No current preflight plan; use supervise for read-only planning first");
+  inspectPreflightStart(ctx, planning.goal, planId);
+  const outcome = await startApprovedPreflight(pi, ctx, planId);
+  const notice = preflightNotice(outcome);
+  refreshUI(ctx);
+  ctx.ui.notify(withTaskDetails(ctx, notice.message), notice.level);
+  if (outcome.status === "started") {
+    try {
+      adoptSupervisedMode(pi, ctx);
+      const config = await loadConfig();
+      if (config.receiptCache) currentRuntime().receiptStore?.configure(config.receiptCache);
+      adoptPreflightAcceptance(pi, ctx);
+      continueNow(pi, ctx);
+    } catch (error) {
+      currentRuntime().cancel();
+      currentRuntime().journalFault ??=
+        "Preflight startup dispatch outcome unknown; inspect pending Main, never replay";
+      throw error;
     }
-    return;
   }
-  startSupervisor(pi, ctx, goal);
-  enableSessionScope(pi);
-  adoptSupervisedMode(pi, ctx);
-  const config = await loadConfig();
-  if (config.receiptCache) currentRuntime().receiptStore?.configure(config.receiptCache);
-  enableSessionScope(pi);
-  updateActiveTools(pi, true);
-  continueNow(pi, ctx);
 }
 
 async function settleMain(ctx: ExtensionCommandContext, manual: boolean): Promise<void> {
@@ -373,16 +400,6 @@ async function revokeGoal(
     );
 }
 
-async function routeStart(
-  pi: ExtensionAPI,
-  ctx: ExtensionCommandContext,
-  action: string,
-  text: string,
-): Promise<void> {
-  if (action === "start")
-    await startGoal(pi, ctx, currentRuntime().preflight?.goal ?? "", text || undefined);
-  else await startGoal(pi, ctx, text);
-}
 function repairCommand(pi: ExtensionAPI, ctx: ExtensionCommandContext, action: string): boolean {
   if (action === "repair-decision") repairBoardProjection(pi, ctx);
   else if (action === "repair-preflight") {
@@ -391,17 +408,6 @@ function repairCommand(pi: ExtensionAPI, ctx: ExtensionCommandContext, action: s
   } else return false;
   status(ctx);
   return true;
-}
-async function legacySupervise(
-  pi: ExtensionAPI,
-  ctx: ExtensionCommandContext,
-  text: string,
-): Promise<void> {
-  if (currentRuntime().goal?.current)
-    throw new Error(
-      "Legacy shortcut cannot replace a scoped Goal; use explicit supervise planning",
-    );
-  await startGoal(pi, ctx, text);
 }
 async function verifyArtifactCommand(
   pi: ExtensionAPI,
@@ -455,15 +461,13 @@ async function supervisorCommand(
   text: string,
 ): Promise<boolean> {
   if (action === "supervise") {
-    await beginPlanning(pi, ctx, text);
-    return true;
-  }
-  if (action === "supervise-legacy") {
-    await legacySupervise(pi, ctx, text);
+    const goal = currentPlanningGoal(ctx, text);
+    if (goal === undefined) status(ctx);
+    else await beginPlanning(pi, ctx, goal);
     return true;
   }
   if (action === "start") {
-    await routeStart(pi, ctx, action, text);
+    await startGoal(pi, ctx, text || undefined);
     return true;
   }
   if (await evidenceMetadataCommand(pi, ctx, action, text)) return true;
@@ -472,18 +476,7 @@ async function supervisorCommand(
     return true;
   }
   if (action === "pause" && !isSessionScopeEnabled()) return false;
-  if (["pause", "stop", "recover"].includes(action)) await settleMain(ctx, action === "pause");
-  if (action === "stop") {
-    const state = supervisorState();
-    if (!state) throw new Error("No supervisor is registered");
-    pause(pi, ctx, "Supervisor stopped by user");
-    state.status = "stopped";
-    state.pending = false;
-    state.reason = "Stopped by user";
-    saveSupervisor(pi);
-    supervisorNotice(pi, ctx, state.reason);
-    return true;
-  }
+  if (["pause", "recover"].includes(action)) await settleMain(ctx, action === "pause");
   if (action === "recover") {
     if (ctx.hasPendingMessages()) throw new Error("Wait for pending messages before recovery");
     recoverSupervisor(pi, ctx);
@@ -498,16 +491,12 @@ async function supervisorCommand(
   return false;
 }
 
-async function preflightCommand(
+async function approveCommand(
   pi: ExtensionAPI,
   ctx: ExtensionCommandContext,
   action: string,
   text: string,
 ): Promise<boolean> {
-  if (action === "preflight") {
-    await beginPlanning(pi, ctx, text);
-    return true;
-  }
   if (action !== "approve") return false;
   const [id, ...selection] = text ? text.split(/\s+/) : [];
   await ctx.waitForIdle();
@@ -523,11 +512,11 @@ async function preflightCommand(
   return true;
 }
 
-function enableNotice(ctx: ExtensionCommandContext, already: boolean): void {
+function tasksOnlyNotice(ctx: ExtensionCommandContext, already: boolean): void {
   ctx.ui.notify(
     already
-      ? "Pi Task Supervisor is already enabled for this session"
-      : "Pi Task Supervisor enabled for this session",
+      ? "Task-board-only management is already selected for this session"
+      : "Task-board-only management selected; no automatic Supervisor or new business permission",
     "info",
   );
 }
@@ -550,18 +539,44 @@ async function readOnlyCommand(
   }
   return false;
 }
+async function scopeRevisionCommand(
+  pi: ExtensionAPI,
+  ctx: ExtensionCommandContext,
+  action: string,
+  text: string,
+): Promise<boolean> {
+  if (!["review-scope", "repair-scope", "revoke-scope"].includes(action)) return false;
+  if (!text)
+    throw Error(
+      `Usage: /task-supervisor ${action} <${action === "revoke-scope" ? "revisionId" : "proposalId"}>`,
+    );
+  const result =
+    action === "review-scope"
+      ? await reviewScopeRevision(pi, ctx, text)
+      : action === "repair-scope"
+        ? await repairScopeRevision(pi, ctx, text)
+        : await revokeScopeRevision(pi, ctx, text);
+  refreshUI(ctx);
+  if (ctx.hasUI)
+    ctx.ui.notify(
+      `范围记录：${result.status}；仍保留原权限/Start/暂停/用量，不代表恢复或验收。`,
+      "info",
+    );
+  return true;
+}
 async function ownerControlCommand(
   pi: ExtensionAPI,
   ctx: ExtensionCommandContext,
   action: string,
   text: string,
 ): Promise<boolean> {
-  if (action === "enable") {
+  if (await scopeRevisionCommand(pi, ctx, action, text)) return true;
+  if (action === "tasks-only") {
     const before = captureManagementSnapshot(ctx);
     await enableTasksMode(pi, ctx);
     updateActiveTools(pi, isSessionScopeEnabled());
     refreshUI(ctx);
-    enableNotice(ctx, before.mode === "tasks" && before.state === "active");
+    tasksOnlyNotice(ctx, before.mode === "tasks" && before.state === "active");
     return true;
   }
   if (action === "disable" || action === "stop") {
@@ -579,7 +594,8 @@ async function ownerControlCommand(
 }
 export function registerCommands(pi: ExtensionAPI): void {
   const command = {
-    description: "Enable or control Pi Task Supervisor for this session",
+    description:
+      "Choose supervised planning or task-board-only management; inspect/control this session",
     async handler(args: string, ctx: ExtensionCommandContext) {
       const [action = "status", id, ...answerParts] = args.trim().split(/\s+/);
       try {
@@ -591,14 +607,17 @@ export function registerCommands(pi: ExtensionAPI): void {
           return;
         if (repairCommand(pi, ctx, action)) return;
         if (currentRuntime().journalFault) throw new Error(currentRuntime().journalFault);
-        if (await preflightCommand(pi, ctx, action, [id, ...answerParts].filter(Boolean).join(" ")))
+        if (await approveCommand(pi, ctx, action, [id, ...answerParts].filter(Boolean).join(" ")))
           return;
         if (
           await supervisorCommand(pi, ctx, action, [id, ...answerParts].filter(Boolean).join(" "))
         )
           return;
         if (!isSessionScopeEnabled()) {
-          notifyError(ctx, "Pi Task Supervisor is disabled; run /task-supervisor enable");
+          notifyError(
+            ctx,
+            "Management is off; choose /task-supervisor tasks-only for a task board or supervise <goal> for read-only planning",
+          );
           return;
         }
         if (action === "pause") {
@@ -609,13 +628,13 @@ export function registerCommands(pi: ExtensionAPI): void {
           resume(pi, ctx);
           return;
         }
-        if (["resolve", "decide"].includes(action)) {
+        if (action === "decide") {
           await resolveDecision(pi, ctx, id);
           return;
         }
         notifyError(
           ctx,
-          "Usage: /task-supervisor enable|disable|preflight <goal>|approve [planId [all|none|IDs]]|start [planId]|decide|resolve [id] (native response, not chat approval)|repair-preflight|repair-decision|revoke <planId>|supervise <goal> (planning)|supervise-legacy <goal> (explicit compatibility)|status|tasks|history [goalKey|page:offset] (read-only)|pause [reason]|resume|recover|repair-completion <intentId> (confirmed metadata only, no replay)|verify-check <checkId> (native artifact response, no permission/start)|review-contract <proposalId> (native definition review)|retry-review [attemptId] (review/registered validation only)|stop",
+          "Usage: /task-supervisor supervise <goal> | supervise --replan [same unstarted goal] (-- protects literal goal text) | tasks-only | disable | approve [planId [all|none|IDs]] | start [planId] | decide [id] (native) | repair-preflight | repair-decision | revoke <planId> | status | tasks | history [goalKey|page:offset] (read-only) | pause [reason] | resume | recover | repair-completion <intentId> | verify-check <checkId> | review-contract <proposalId> | review-scope <proposalId> | repair-scope <proposalId> | revoke-scope <revisionId> | retry-review [attemptId] | stop",
         );
       } catch (error) {
         notifyError(
@@ -626,5 +645,4 @@ export function registerCommands(pi: ExtensionAPI): void {
     },
   };
   pi.registerCommand("task-supervisor", command);
-  pi.registerCommand("continuous-tasks", command);
 }

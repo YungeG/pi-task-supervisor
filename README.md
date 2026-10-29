@@ -19,11 +19,11 @@ Do not leave the existing Git source enabled alongside the npm source: they have
 ## Human commands
 
 ```text
-/task-supervisor enable                   # task-only management
+/task-supervisor tasks-only               # task board only; no automatic Supervisor
 /task-supervisor disable                  # safe release after actual quiescence
 /task-supervisor supervise <goal>          # read-only planning, not immediate execution
-/task-supervisor supervise-legacy <goal>   # explicitly selected compatibility path
-/task-supervisor preflight <goal>
+/task-supervisor supervise --replan [goal] # same unstarted target only; no inherited old-attempt grant
+/task-supervisor supervise -- <goal>       # literal goal text that starts with --
 /task-supervisor approve [planId [all|none|IDs]]
 /task-supervisor start [planId]
 /task-supervisor revoke <planId>
@@ -33,21 +33,25 @@ Do not leave the existing Git source enabled alongside the npm source: they have
 /task-supervisor pause [reason]
 /task-supervisor resume
 /task-supervisor decide
-/task-supervisor resolve [decision-id]     # compatibility entry; opens native response
 /task-supervisor repair-decision          # confirmed board cache only
 /task-supervisor repair-preflight         # confirmed preflight cache only
 /task-supervisor recover
+/task-supervisor review-contract <proposalId> # native definition review before compilation
+/task-supervisor verify-check <checkId>    # current manual artifact condition, not business approval
+/task-supervisor review-scope <proposalId> # exact same-Goal amendment; remains held
+/task-supervisor repair-scope <proposalId> # original witnessed metadata only
+/task-supervisor revoke-scope <revisionId> # revocation never falls back to older execution rights
 /task-supervisor retry-review [attemptId]  # completed work: review/qualified validation only
 /task-supervisor repair-completion <intentId> # candidate: confirmed missing metadata only, never replay
 /task-supervisor stop
 ```
 
-`/continuous-tasks` remains a legacy alias for every subcommand. Both names control the same board and supervisor; repeated task-only `enable` is idempotent across aliases. `enable` while supervised is an explicit mode change, not a read-only alias probe. Existing `continuous-tasks:*` journal entries, messages, and renderers retain their identifiers. Historical records remain readable, but untyped legacy decisions require a complete replacement proposal and a new native response; unknown or inconsistent authorization history is held, not silently migrated.
+Only `/task-supervisor` is registered. The old `preflight`, `enable`, `supervise-legacy`, `resolve` subcommands and `/continuous-tasks` prefix are removed, not forwarded. Repeated `tasks-only` is idempotent; using it while supervised is an explicit mode change, not a read-only view. Existing `continuous-tasks:*` journal entries, messages, and renderers retain their identifiers. Historical records remain readable, but untyped legacy decisions require a complete replacement proposal and a new native response; unknown or inconsistent authorization history is held, not silently migrated.
 
-- `enable` selects **tasks** mode: task tools without a Supervisor/Advisor. After detaching a Goal, it creates an independent empty board rather than reviving old grants, evidence or supervision; an existing bare task board can remain explicit tracking history/work.
-- `supervise` consistently enters **supervised read-only planning**, including a fresh session. Native permissions and separate first-start remain required. With stopped/completed history it uses native archive-and-plan for an independent GoalRun in the **same Session**. Archive is not business approval or Start. The separately named `supervise-legacy` preserves the direct compatibility path; it cannot replace a scoped Goal or bypass retained preflight gates. Real pending decisions, faults and unknown external execution still block; old done tasks are never new proof.
+- `tasks-only` selects **tasks** mode: task tools without a Supervisor/Advisor. After detaching a Goal, it creates an independent empty board rather than reviving old grants, evidence or supervision; an existing bare task board can remain explicit tracking history/work.
+- `supervise` consistently enters **supervised read-only planning**, including a fresh session. Native permissions and separate first-start remain required. With stopped/completed history it uses native archive-and-plan for an independent GoalRun in the **same Session**. Archive is not business approval or Start. There is no direct compatibility-start command. Real pending decisions, faults and unknown external execution still block; old done tasks are never new proof.
 - `pause` cancels an advisor immediately and pauses managed Main/the board. `stop` and `disable` cancel local automation first, then confirm actual Main/queue, writer, host-capture and native-control quiescence before publishing **off**. No executor is killed, task forced done or reference discarded. Unknown outcomes remain `stopping-with-attention`; repair only exact existing metadata/original native questions, then repeat `disable`. Known settled business failure or a confirmed native rejection may remain history. Neither `recover` nor a model flag forces release.
-- `resume` jointly resumes a confirmed ordinary human pause of the board and supervisor without resetting counters, usage, epoch, or evidence. Legacy/unknown pauses and stronger holds resume only the board and explicitly require inspection plus `recover`; no automatic Main turn is started. Decisions, pending host work, wrong sessions, and inconsistent state do not gain joint recovery. `decide`/`resolve` collect a native response for the exact current decision; command answer text is not authorization. `recover` clears an applicable hold after inspection but preserves spent review/continuation budgets, usage and Goal identity. It never grants other approvals or restarts external writers. Generic recovery still cannot reopen faulted completed boards. The candidate's `retry-review` path below retries only review or registers a constrained final validation; it does not redo completed tasks.
+- `resume` jointly resumes a confirmed ordinary human pause of the board and supervisor without resetting counters, usage, epoch, or evidence. Legacy/unknown pauses and stronger holds resume only the board and explicitly require inspection plus `recover`; no automatic Main turn is started. Decisions, pending host work, wrong sessions, and inconsistent state do not gain joint recovery. `decide` collects a native response for the exact current decision; command answer text is not authorization. `recover` clears an applicable hold after inspection but preserves spent review/continuation budgets, usage and Goal identity. It never grants other approvals or restarts external writers. Generic recovery still cannot reopen faulted completed boards. The candidate's `retry-review` path below retries only review or registers a constrained final validation; it does not redo completed tasks.
 - `status` is read-only even while disabled or journal-faulted. It reports the goal, host activity, claimed batch, soft check point, all available gate information, advisor-only usage/limits, unknown external run status, and the next valid human action.
 - `/task-supervisor tasks` opens a full readonly TUI board with fixed 总览 / 确认与回应 / 最终验收 entries, even with zero tasks. Filter tasks by status/phase and inspect complete details and retained evidence; Esc returns from a detail/filter to the list, then to the editor. It works while disabled or journal-faulted and never activates supervision or schedules work. RPC/print retain their existing text/select fallback.
 
@@ -55,13 +59,21 @@ The local candidate has one host-selected **off / tasks / supervised** mode and 
 
 In off mode, ordinary host-authorized work is unmanaged: it neither borrows old permissions nor enters the old Goal ledger. Old callbacks cannot become a new owner's evidence; late Advisor usage still belongs to its original call/owner. Recorded acceptance is immutable history, separate from current applicability (`needs_verification`/`stale`). `status` and the read-only overview show mode, work context, retained Goal/acceptance and attention. Loaded code revision is **unknown** unless actually established; on-disk edits or Git HEAD alone are not proof of the running revision.
 
+## Same-Goal scope amendments
+
+For an already started, compiled and held Goal, Main submits complete `propose_scope_revision` metadata. Native `review-scope` shows the original Goal/permission/Start sources, old and proposed constraints and check definitions. Only the complete witnessed commit makes the candidate contract current. The original Goal, task IDs, first Start, permissions and accounting stay intact; reviewing or repairing does not resume work. Resume a separate board gate if needed, then explicitly `recover` to adopt the committed scope. Current-source, capability, budget and fresh-evidence gates still apply.
+
+Version1 keeps the existing workspace, permission/capability objects, scope/input/output/environment objects and requirement/check identities; it amends precise conditions, not guessed “latest values”. Native material is bounded without omissions. `repair-scope` completes only the original witnessed metadata; changed material needs a new exact review. `revoke-scope` also blocks dependent successors and never falls back to older execution rights. Old success/receipts remain history, not new-scope validation. These agreements are not a hostile-code sandbox.
+
+Default models-enabled codemode cannot certify tools-only evidence. Capability checks before Start/recover select an actual supported direct check path or report unsupported. Direct SDK root seals say **observed**, not container-qualified. Spent/unknown review and continuation budgets cannot be replenished by recover or a scope amendment.
+
 ## Sequential goals in one Session (local source candidate)
 
-A Session retains the conversation; one GoalRun is current and earlier goals are read-only archives. After explicitly ending a goal, use `supervise <new goal>` (or `preflight <new goal>`) and the native archive-and-plan choice. Do **not** clear historical tasks or open another Session merely to free a goal slot. Archive keeps unfinished task statuses, usage, evidence, permissions and holds unchanged; it does not complete, abandon, revoke, reset or terminate old work.
+A Session retains the conversation; one GoalRun is current and earlier goals are read-only archives. After explicitly ending a goal, use `supervise <new goal>` and the native archive-and-plan choice. Do **not** clear historical tasks or open another Session merely to free a goal slot. Archive keeps unfinished task statuses, usage, evidence, permissions and holds unchanged; it does not complete, abandon, revoke, reset or terminate old work.
 
 The new GoalRun has its own empty board, planning attempt, permission/start requests, ledger and accounting. No old receipt, task ID, digest, grant, external reference or quota usage is inherited. Reusing the same goal text or task IDs does not reuse identity. A separate native permission response and first-start are still required before business execution.
 
-Before Supervisor exists, bare/equal `preflight` explicitly replans the same GoalRun using a fresh attempt/preflight ID; repeated `supervise` only reports status. `stop` can end a positively never-started goal without inventing a Supervisor or revoking closed grants. Real unanswered permission/start work and unknown business execution stay with their original owners. Lost pure-planning output can be closed only after actual host/queue quiescence and lease cancellation. Reopening/repair never redispatches planning or execution.
+Before Supervisor exists, `supervise --replan [same goal]` explicitly replans the same target using a fresh attempt/preflight ID; repeated `supervise` only reports status. `stop` can end a positively never-started goal without inventing a Supervisor or revoking closed grants. Real unanswered permission/start work and unknown business execution stay with their original owners. Lost pure-planning output can be closed only after actual host/queue quiescence and lease cancellation. Reopening/repair never redispatches planning or execution.
 
 `history` lists at most ten archived summaries per page; `history page:10` requests the next text page, and `history <goalKey>` opens one archived board. The current board also has a history entry. Viewing it never swaps the current runtime, executes work or grants authority; raw receipt bodies are not copied into the history DTO. Stopped-unstarted goals leave no resident work badge, while independent problems remain visible.
 

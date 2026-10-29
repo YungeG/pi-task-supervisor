@@ -56,7 +56,8 @@ import {
   type ReviewViewInput,
 } from "./review-view";
 import { advisorExtraCalls } from "./advisor-calls";
-import { SUPERVISOR_LIMITS } from "./flow";
+import { assessSupervisorBudget } from "./supervisor-budget";
+import { scopeExecutionIssue } from "./scope-revision-journal";
 import { goalControlIssue, goalLease } from "./goal-scope";
 import { digest, redact, redactedJSON, type HostReceipt } from "./receipt-store";
 import { preflightAuthorizationIssue } from "./preflight";
@@ -180,6 +181,7 @@ function validationControlAllowed(
   if (phase && !["active", "fault", "reviewing"].includes(phase)) return false;
   if (
     goalControlIssue(ctx) ||
+    scopeExecutionIssue(ctx) ||
     (state.preflightBinding && preflightAuthorizationIssue(ctx, state.preflightBinding))
   )
     return false;
@@ -571,7 +573,7 @@ function finalReviewControlHeld(status: string, decision: boolean): boolean {
   );
 }
 function finalReviewModeIssue(ctx: ExtensionContext): string | undefined {
-  const issue = goalControlIssue(ctx);
+  const issue = goalControlIssue(ctx) ?? scopeExecutionIssue(ctx);
   if (issue) return issue;
   const mode = currentRuntime().management;
   return mode?.mode === "off" || mode?.state === "stopping-with-attention"
@@ -815,12 +817,13 @@ function finalCallIds(entry: ReviewAttemptEntry): string[] {
 }
 function finalCallBudgetSpent(run: ActiveFinalAttempt): boolean {
   const calls = finalCallIds(run.entry).length;
-  const spent = run.state.reviews + advisorExtraCalls(run.entry.start.data.owner.goal);
-  return (
-    calls >= 4 ||
-    (calls > 0 && spent >= SUPERVISOR_LIMITS.reviews) ||
-    run.state.continuations >= SUPERVISOR_LIMITS.continuations
+  // The primary slot was reserved before the first provider request; subsequent
+  // calls must include it and every extra call in the shared budget.
+  const budget = assessSupervisorBudget(
+    { ...run.state, reviews: run.state.reviews - (calls === 0 ? 1 : 0) },
+    advisorExtraCalls(run.entry.start.data.owner.goal),
   );
+  return calls >= 4 || budget.status !== "available";
 }
 function prepareFinalCall(run: ActiveFinalAttempt): void {
   if (Date.now() >= run.entry.start.data.deadlineAt || run.signal.aborted)
@@ -1279,6 +1282,7 @@ function reviewPauseResumeIssue(ctx: ExtensionContext): string | undefined {
     return "Resolve actual control/capture holds and wait for Main before resuming review control";
   const issue =
     goalControlIssue(ctx) ??
+    scopeExecutionIssue(ctx) ??
     (state.preflightBinding ? preflightAuthorizationIssue(ctx, state.preflightBinding) : undefined);
   if (issue) return issue;
   const owner = currentWorkOwner(ctx.sessionManager.getSessionId());

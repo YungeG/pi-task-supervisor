@@ -5,6 +5,8 @@ import { captureManagementSnapshot } from "./management-policy";
 import { goalLease } from "./goal-scope";
 import { journalDigest } from "./human-journal";
 import { captureWorkspaceArtifactVersion } from "./artifact-version";
+import { scopeEvidenceApplicable, currentScopeReference } from "./scope-revision-journal";
+import type { AcceptanceReference } from "./acceptance-contract";
 import type { HostReceipt } from "./receipt-store";
 import {
   invocationOwnerKey,
@@ -22,12 +24,14 @@ export interface InvocationFrame {
   modeRef: InvocationReference | null;
   goalToken: string;
   humanEpoch: number;
+  scopeRevisionRef?: AcceptanceReference;
 }
 export function captureInvocationFrame(
   ctx: ExtensionContext,
   owner: WorkOwnerKey,
 ): InvocationFrame {
-  const record = currentRuntime().management?.record;
+  const record = currentRuntime().management?.record,
+    scopeRevisionRef = currentScopeReference(ctx);
   return {
     runtime: currentRuntime(),
     manager: ctx.sessionManager,
@@ -37,6 +41,7 @@ export function captureInvocationFrame(
     modeRef: record ? { entryId: record.entryId, digest: record.digest } : null,
     goalToken: goalLease(),
     humanEpoch: currentRuntime().humanEpoch,
+    ...(scopeRevisionRef ? { scopeRevisionRef } : {}),
   };
 }
 export function invocationCarrierCurrent(ctx: ExtensionContext, frame: InvocationFrame): boolean {
@@ -54,7 +59,9 @@ export function invocationFrameCurrent(ctx: ExtensionContext, frame: InvocationF
   if (
     !invocationCarrierCurrent(ctx, frame) ||
     frame.humanEpoch !== currentRuntime().humanEpoch ||
-    frame.goalToken !== goalLease()
+    frame.goalToken !== goalLease() ||
+    journalDigest(frame.scopeRevisionRef ?? null) !==
+      journalDigest(currentScopeReference(ctx) ?? null)
   )
     return false;
   const mode = captureManagementSnapshot(ctx),
@@ -136,6 +143,15 @@ export function qualificationProjection(
     },
   );
 }
+function scopeReceiptSourceMatches(receipt: HostReceipt): boolean {
+  if (receipt.scopeRevisionRef === undefined) return true; // Historical hashes/strength are unchanged.
+  try {
+    const actual = currentRuntime().receiptStore?.readReceipts([receipt.id])[0];
+    return !!actual && journalDigest(actual) === journalDigest(receipt);
+  } catch {
+    return false;
+  }
+}
 /** Original body/hash/eligible/epoch are always returned unchanged, never promoted in place. */
 export function qualifiedEvidence(
   receipt: HostReceipt,
@@ -144,6 +160,11 @@ export function qualifiedEvidence(
   epoch: number,
   ctx?: ExtensionContext,
 ): QualifiedEvidence {
+  if (
+    !scopeReceiptSourceMatches(receipt) ||
+    !scopeEvidenceApplicable(receipt.scopeRevisionRef, ctx)
+  )
+    return { receipt, eligible: false, effectiveEpoch: receipt.epoch };
   if (directEvidence(receipt, taskId, taskDigest, epoch))
     return { receipt, eligible: true, effectiveEpoch: receipt.epoch };
   const rejected: QualifiedEvidence = { receipt, eligible: false, effectiveEpoch: receipt.epoch };

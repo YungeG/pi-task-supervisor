@@ -1,4 +1,6 @@
 import { expect, it, vi } from "vitest";
+import { startSupervisor } from "../supervisor";
+import { adoptSupervisedMode } from "../management-policy";
 import { executionRegistryFixture } from "./helpers/execution-registry";
 import { currentRuntime } from "../runtime";
 import { currentWorkOwner } from "../control-journal";
@@ -17,8 +19,10 @@ it.each(["managed", "unmanaged"])(
       if (origin === "unmanaged") await f.command("disable");
       expect(await f.fire("tool_call", { type: "tool_call", ...read })).toBeUndefined();
       await f.command("disable");
-      await f.command("enable");
-      await f.command("supervise-legacy Independent new legacy Goal");
+      await f.command("tasks-only");
+      // Explicit trusted-host module owner for callback isolation, not a fresh human Start.
+      startSupervisor(f.api, f.ctx, "Independent trusted-host Goal");
+      adoptSupervisedMode(f.api, f.ctx);
       const owner = structuredClone(currentWorkOwner(f.ctx.sessionManager.getSessionId()));
       expect(owner?.kind, JSON.stringify(vi.mocked(f.ctx.ui.notify).mock.calls)).toBe("goal");
       expect(currentRuntime().supervisor?.status).toBe("active");
@@ -63,7 +67,7 @@ it("does not misclassify its own confirmed board-replacement result as another o
   const f = await executionRegistryFixture(false, { gitWorkspace: true });
   try {
     await f.command("disable");
-    await f.command("enable");
+    await f.command("tasks-only");
     const before = structuredClone(currentWorkOwner(f.ctx.sessionManager.getSessionId()));
     const clear = { toolName: "clear_tasks", toolCallId: "own-empty-clear", input: {} };
     expect(await f.fire("tool_call", { type: "tool_call", ...clear })).toBeUndefined();

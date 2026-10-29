@@ -71,7 +71,7 @@ export async function executionRegistryFixture(
   if (boardOnly) {
     // Persist explicit activation; a memory flag is not restored authority.
     setSessionScopeEnabled(false);
-    await f.command("enable");
+    await f.command("tasks-only");
   }
   await createWriteTasksTool(f.api).execute(
     "write",

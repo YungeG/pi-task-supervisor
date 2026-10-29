@@ -1,4 +1,21 @@
 import { Type } from "typebox";
+import {
+  scopeRevisionSchemas,
+  type ScopeRevisionControl,
+  type ScopeRevisionCommitted,
+  type ScopeRevisionRevoked,
+} from "./scope-revision-facts";
+import {
+  scopeRevisionProposalViews,
+  type ScopeRevisionProposalView,
+} from "./scope-revision-proposal";
+import {
+  assertScopeControl,
+  assertScopeExecutionSource,
+  assertScopeBound,
+  assertScopeCommit,
+  assertScopeRevocation,
+} from "./scope-revision-journal";
 import { isDeepStrictEqual } from "node:util";
 import { Check } from "typebox/value";
 import { validDecisionInformation } from "./decision-spec";
@@ -84,6 +101,11 @@ export interface AcceptanceBoundFact {
   authority:
     | { kind: "recognized-host"; originalGoalDigest: string }
     | { kind: "native-reviewed"; originalGoalDigest: string; controlRef: AcceptanceReference }
+    | {
+        kind: "scope-revision-reviewed";
+        originalGoalDigest: string;
+        controlRef: AcceptanceReference;
+      }
     | {
         kind: "preflight-reviewed";
         originalGoalDigest: string;
@@ -183,7 +205,14 @@ export interface ContractReviewEntry {
   control: AcceptanceFactView<ContractReviewControl>;
   witness?: AcceptanceReference;
 }
+export interface ScopeRevisionReviewEntry {
+  control: AcceptanceFactView<ScopeRevisionControl>;
+  witness?: AcceptanceReference;
+}
 export type AcceptanceFact =
+  | ScopeRevisionControl
+  | ScopeRevisionCommitted
+  | ScopeRevisionRevoked
   | AcceptanceDefinitionFact
   | AcceptanceBoundFact
   | AcceptanceCheckStarted
@@ -203,6 +232,10 @@ export interface AcceptanceJournalView {
   reviewBindings: AcceptanceFactView<AcceptanceReviewBound>[];
   manualChecks: ManualCheckEntry[];
   contractReviews: ContractReviewEntry[];
+  scopeReviews?: ScopeRevisionReviewEntry[];
+  scopeCommits?: AcceptanceFactView<ScopeRevisionCommitted>[];
+  scopeRevocations?: AcceptanceFactView<ScopeRevisionRevoked>[];
+  scopeProposals?: ScopeRevisionProposalView[];
 }
 const strict = { additionalProperties: false } as const;
 const id = (max = 200) => Type.String({ minLength: 1, maxLength: max });
@@ -351,7 +384,10 @@ function makeSchema(owner: typeof WorkOwnerSchema) {
         Type.Object({ kind: Type.Literal("recognized-host"), originalGoalDigest: hash }, strict),
         Type.Object(
           {
-            kind: Type.Literal("native-reviewed"),
+            kind: Type.Union([
+              Type.Literal("native-reviewed"),
+              Type.Literal("scope-revision-reviewed"),
+            ]),
             originalGoalDigest: hash,
             controlRef: reference,
           },
@@ -410,6 +446,7 @@ function makeSchema(owner: typeof WorkOwnerSchema) {
       reviewed,
       manual,
       contractControlSchema(owner),
+      ...scopeRevisionSchemas(owner),
     ]),
   );
 }
@@ -507,7 +544,8 @@ export function acceptanceContractDigest(
     data.definitions.map((item) => [item.checkId, refTuple(item.ref), item.definitionDigest]),
     data.authority.kind === "recognized-host"
       ? [data.authority.kind, data.authority.originalGoalDigest]
-      : data.authority.kind === "native-reviewed"
+      : data.authority.kind === "native-reviewed" ||
+          data.authority.kind === "scope-revision-reviewed"
         ? [
             data.authority.kind,
             data.authority.originalGoalDigest,
@@ -583,6 +621,15 @@ function assertDefinition(data: AcceptanceDefinitionFact): void {
   )
     fail();
 }
+function isScopeFact(
+  data: AcceptanceFact,
+): data is ScopeRevisionControl | ScopeRevisionCommitted | ScopeRevisionRevoked {
+  return [
+    "acceptance-scope-control",
+    "scope-revision-committed",
+    "scope-revision-revoked",
+  ].includes(data.kind);
+}
 function assertCurrentOwner(journal: SessionJournal, data: AcceptanceFact, position: number): void {
   if (data.owner.kind !== "goal") fail();
   const last = [...journal.branch.slice(0, position)]
@@ -590,7 +637,8 @@ function assertCurrentOwner(journal: SessionJournal, data: AcceptanceFact, posit
     .find((node) => node.supervisorProof)?.supervisorProof;
   const metadata =
     data.kind === "acceptance-definition-declared" ||
-    (data.kind === "acceptance-contract-bound" && data.authority.kind !== "recognized-host");
+    (data.kind === "acceptance-contract-bound" && data.authority.kind !== "recognized-host") ||
+    isScopeFact(data);
   const pausedMetadata =
     metadata &&
     ["paused", "fault"].includes(last?.status ?? "") &&
@@ -673,9 +721,7 @@ function assertBound(
       ...data.header,
       checks: definitions.map((item) => item.spec),
     });
-  const prior = view.contracts
-    .filter((item) => invocationOwnerKey(item.data.owner) === invocationOwnerKey(data.owner))
-    .at(-1);
+  const prior = selectedAcceptanceContract(view, data.owner);
   if (
     data.contractDigest !== acceptanceContractDigest(data) ||
     data.authority.originalGoalDigest !==
@@ -692,26 +738,27 @@ function assertBound(
       data.contractId !== prior.data.contractId ||
       journalDigest(data.previousRef) !==
         journalDigest({ entryId: prior.entryId, digest: prior.digest }) ||
-      journalDigest([
-        proposal.requirements,
-        data.checkerScopes === undefined
-          ? proposal.inputs
-          : checkerScopeInventory(data.workspace.root, proposal.inputs, proposal.checks).inputs,
-        proposal.artifacts,
-        proposal.scopeId,
-      ]) !==
+      (data.authority.kind !== "scope-revision-reviewed" &&
         journalDigest([
-          prior.data.header.requirements,
-          prior.data.checkerScopes === undefined
-            ? prior.data.header.inputs
-            : checkerScopeInventory(
-                prior.data.workspace.root,
-                prior.data.header.inputs,
-                boundDefinitions(prior.data, view.definitions).map((item) => item.spec),
-              ).inputs,
-          prior.data.header.artifacts,
-          prior.data.header.scopeId,
-        ])
+          proposal.requirements,
+          data.checkerScopes === undefined
+            ? proposal.inputs
+            : checkerScopeInventory(data.workspace.root, proposal.inputs, proposal.checks).inputs,
+          proposal.artifacts,
+          proposal.scopeId,
+        ]) !==
+          journalDigest([
+            prior.data.header.requirements,
+            prior.data.checkerScopes === undefined
+              ? prior.data.header.inputs
+              : checkerScopeInventory(
+                  prior.data.workspace.root,
+                  prior.data.header.inputs,
+                  boundDefinitions(prior.data, view.definitions).map((item) => item.spec),
+                ).inputs,
+            prior.data.header.artifacts,
+            prior.data.header.scopeId,
+          ]))
     )
       fail();
   } else if (data.revision !== 1 || data.previousRef !== null) fail();
@@ -774,6 +821,7 @@ function assertCheckStart(
   journal: SessionJournal,
   position: number,
 ): void {
+  assertScopeExecutionSource(view, journal, data.owner, position);
   const { contract, definition } = runSources(view, data);
   if (
     view.runs.some(
@@ -854,7 +902,8 @@ export function isAcceptanceWitness(node: JournalNode, journal: SessionJournal):
     typeof control.data === "object" &&
     "kind" in control.data &&
     (control.data.kind === "acceptance-manual-control" ||
-      control.data.kind === "acceptance-contract-control")
+      control.data.kind === "acceptance-contract-control" ||
+      control.data.kind === "acceptance-scope-control")
   );
 }
 export function manualCheckSubject(
@@ -928,6 +977,7 @@ function assertManualControl(
   position: number,
   graph: InvocationGraph | undefined,
 ): void {
+  assertScopeExecutionSource(view, journal, data.owner, position);
   const { bound, definition, response } = manualControlSources(view, data);
   if (
     view.manualChecks.some(
@@ -980,7 +1030,8 @@ function consumeManualWitness(view: AcceptanceJournalView, node: JournalNode): v
   const value = node.data,
     manual =
       view.manualChecks.find((item) => item.control.entryId === value.controlEntryId) ??
-      view.contractReviews.find((item) => item.control.entryId === value.controlEntryId);
+      view.contractReviews.find((item) => item.control.entryId === value.controlEntryId) ??
+      view.scopeReviews?.find((item) => item.control.entryId === value.controlEntryId);
   if (
     !manual ||
     manual.witness ||
@@ -1097,6 +1148,10 @@ function assertReviewedAuthority(
   journal: SessionJournal,
   position: number,
 ): void {
+  if (data.authority.kind === "scope-revision-reviewed") {
+    assertScopeBound(data, definitions, view, journal, position);
+    return;
+  }
   if (data.authority.kind === "preflight-reviewed") {
     assertPreflightReviewedAuthority(data, definitions, journal, position);
     return;
@@ -1549,7 +1604,10 @@ function requiresActiveOwner(data: AcceptanceFact): boolean {
   return (
     data.kind === "acceptance-definition-declared" ||
     data.kind === "acceptance-contract-bound" ||
-    data.kind === "acceptance-check-started"
+    data.kind === "acceptance-check-started" ||
+    data.kind === "acceptance-scope-control" ||
+    data.kind === "scope-revision-committed" ||
+    data.kind === "scope-revision-revoked"
   );
 }
 /** Caller supplies only actual preceding-fenced physical nodes in causal order. */
@@ -1558,6 +1616,22 @@ function assertApprovalFeature(
   data: AcceptanceFact,
   position: number,
 ): void {
+  const scope =
+    isScopeFact(data) ||
+    (data.kind === "acceptance-contract-bound" &&
+      data.authority.kind === "scope-revision-reviewed");
+  if (
+    scope &&
+    !journal.branch
+      .slice(0, position)
+      .some(
+        (node) =>
+          node.customType === "continuous-tasks:supervisor" &&
+          validControlFence(node.data) &&
+          node.data.features.includes("scope-revision-v1"),
+      )
+  )
+    fail();
   const extended =
     (data.kind === "acceptance-definition-declared" &&
       (data.checkerWorkspace || data.invocation?.profile)) ||
@@ -1576,6 +1650,25 @@ function assertApprovalFeature(
   )
     fail();
 }
+function consumeScopeFact(
+  view: AcceptanceJournalView,
+  node: JournalNode,
+  data: AcceptanceFact,
+  journal: SessionJournal,
+  position: number,
+): boolean {
+  if (data.kind === "acceptance-scope-control") {
+    assertScopeControl(view, data, journal, position);
+    view.scopeReviews?.push({ control: { entryId: node.id, digest: node.digest, data } });
+  } else if (data.kind === "scope-revision-committed") {
+    assertScopeCommit(view, data, journal, position);
+    view.scopeCommits?.push({ entryId: node.id, digest: node.digest, data });
+  } else if (data.kind === "scope-revision-revoked") {
+    assertScopeRevocation(view, data, journal, position);
+    view.scopeRevocations?.push({ entryId: node.id, digest: node.digest, data });
+  } else return false;
+  return true;
+}
 export function readAcceptanceFacts(
   journal: SessionJournal,
   records: readonly JournalNode[],
@@ -1588,6 +1681,10 @@ export function readAcceptanceFacts(
       reviewBindings: [],
       manualChecks: [],
       contractReviews: [],
+      scopeReviews: [],
+      scopeCommits: [],
+      scopeRevocations: [],
+      scopeProposals: scopeRevisionProposalViews(journal),
     },
     ids = new Set<string>();
   for (const node of records) {
@@ -1602,6 +1699,11 @@ export function readAcceptanceFacts(
     assertApprovalFeature(journal, data, position);
     if (requiresActiveOwner(data)) assertCurrentOwner(journal, data, position);
     acceptanceGoalSource(journal, data.owner, data.sourceRef, position);
+    if (isScopeFact(data)) {
+      consumeScopeFact(view, node, data, journal, position);
+      ids.add(data.recordId);
+      continue;
+    }
     if (data.kind === "acceptance-definition-declared") {
       if (
         view.definitions.filter(
@@ -1633,7 +1735,16 @@ export function selectedAcceptanceContract(
   owner: WorkOwnerKey,
 ): AcceptanceFactView<AcceptanceBoundFact> | undefined {
   return view?.contracts
-    .filter((entry) => invocationOwnerKey(entry.data.owner) === invocationOwnerKey(owner))
+    .filter(
+      (entry) =>
+        invocationOwnerKey(entry.data.owner) === invocationOwnerKey(owner) &&
+        (entry.data.authority.kind !== "scope-revision-reviewed" ||
+          view.scopeCommits?.some(
+            (commit) =>
+              commit.data.contractRef.entryId === entry.entryId &&
+              commit.data.contractRef.digest === entry.digest,
+          )),
+    )
     .at(-1);
 }
 export function acceptanceContractValue(

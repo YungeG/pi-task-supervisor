@@ -18,6 +18,11 @@ import {
 import { journalDigest } from "./human-journal";
 import { currentRuntime } from "./runtime";
 import type { SupervisorState } from "./supervisor";
+import {
+  assessSupervisorBudget,
+  SUPERVISOR_LIMITS,
+  type SupervisorBudgetAssessment,
+} from "./supervisor-budget";
 
 export type AdvisorCallStartedV1 = AdvisorStartedFact;
 export type AdvisorCallObservedV1 = AdvisorObservedFact;
@@ -106,6 +111,20 @@ function attemptCalls(records: readonly AdvisorFactView[]): Map<string, number> 
 export function advisorExtraCalls(owner: GoalOwnerKey): number {
   return [...attemptCalls(ownFacts(owner)).values()].reduce((total, count) => total + count - 1, 0);
 }
+/** Current cached source facts; no filesystem scans or provider calls. */
+export function advisorBudgetAssessment(
+  state: Readonly<SupervisorState>,
+): SupervisorBudgetAssessment {
+  try {
+    const owner = currentWorkOwner(state.sessionId);
+    return assessSupervisorBudget(
+      state,
+      owner?.kind === "goal" ? advisorExtraCalls(owner.goal) : 0,
+    );
+  } catch {
+    return assessSupervisorBudget(state, undefined);
+  }
+}
 function reservedAdvisorSlot(
   reviews: number,
   records: readonly AdvisorFactView[],
@@ -115,7 +134,7 @@ function reservedAdvisorSlot(
   const counts = attemptCalls(records);
   const extraCalls = [...counts.values()].reduce((total, count) => total + count - 1, 0);
   const slot = reviews + extraCalls + (counts.has(attemptId) ? 1 : 0);
-  if (!Number.isSafeInteger(slot) || slot < 1 || slot > 40)
+  if (!Number.isSafeInteger(slot) || slot < 1 || slot > SUPERVISOR_LIMITS.reviews)
     throw new Error("Supervisor shared review/provider call budget exhausted");
   return slot;
 }

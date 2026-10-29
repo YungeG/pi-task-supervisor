@@ -15,7 +15,7 @@ it("persists task-only progress through actual native SDK message sources, with 
   const f = await executionRegistryFixture(true, { gitWorkspace: true });
   try {
     prepareExecutionOwner(f.api, f.ctx, getBoardRef());
-    await f.command("enable");
+    await f.command("tasks-only");
     const manager = SessionManager.open(f.path, join(f.dir, "owned-sdk-sessions"));
     const id = "owned-native-progress-effect",
       path = join(f.dir, "review-input.txt"),

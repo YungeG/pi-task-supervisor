@@ -283,6 +283,7 @@ export async function replanCurrentGoal(
       goal: loaded.current.seed.goal,
       revision: 0,
       phase: "planning",
+      approvalFlow: "consolidated-v1",
     };
     const observed = quiescence(ctx, loaded.current);
     invalidateGoalCallbacks();

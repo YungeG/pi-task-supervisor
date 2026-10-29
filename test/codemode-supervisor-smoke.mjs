@@ -18,6 +18,8 @@ import {
 const root = resolve(dirname(fileURLToPath(import.meta.url)), "..");
 const dir = mkdtempSync(join(tmpdir(), "owned-codemode-supervisor-")),
   previous = process.env.PI_CODING_AGENT_DIR;
+const previousHostGoal=process.env.OWNED_HOST_MODULE_GOAL;
+const previousHostSession=process.env.OWNED_HOST_MODULE_SESSION;
 const events = [],
   errors = [],
   cacheSamples = [];
@@ -93,6 +95,7 @@ function code(code, id) {
 }
 try {
   process.env.PI_CODING_AGENT_DIR = dir;
+  process.env.OWNED_HOST_MODULE_GOAL="Owned native Codemode-only sentinel";
   globalThis.fetch = async () => {
     throw Error("Owned Codemode fixture forbids network");
   };
@@ -160,6 +163,7 @@ try {
   const model = runtime.getModel("owned-codemode-supervisor-faux", "test");
   assert(model);
   const manager = SessionManager.create(dir, join(dir, "sessions"));
+  process.env.OWNED_HOST_MODULE_SESSION=manager.getSessionId();
   const settingsManager = SettingsManager.inMemory({
     compaction: { enabled: false },
     codemode: { mode: "only" },
@@ -193,7 +197,7 @@ try {
         root,
         process.env.P6_CACHE_METRICS === "1"
           ? "test/codemode-owned-metrics-extension.ts"
-          : "src/index.ts",
+          : "test/host-module-extension.ts",
       ),
     ],
     extensionFactories: [
@@ -263,10 +267,7 @@ try {
   });
   const command = session.extensionRunner.getCommand("task-supervisor");
   assert(command);
-  await command.handler(
-    "supervise-legacy Owned native Codemode-only sentinel",
-    session.extensionRunner.createCommandContext(),
-  );
+  void session.prompt("Exercise the owned trusted-host Codemode effects mechanism").catch(error=>errors.push(error));
   const deadline = Date.now() + maxWait;
   while (!["paused", "fault", "completed"].includes(latest(manager)?.status)) {
     if (Date.now() > deadline)
@@ -426,13 +427,15 @@ try {
       goalAccepted: diagnostic.goalAccepted,
       productionHumanProof: false,
       sourceBoundary:
-        "Explicit legacy fixture start; native SDK parent events and real finite check, not real user identity",
+        "Explicit trusted-host module initialization (not a user command/approval); native SDK parent events and real finite check, not real user identity",
     }),
   );
 } finally {
   session?.dispose();
   if (previous === undefined) delete process.env.PI_CODING_AGENT_DIR;
   else process.env.PI_CODING_AGENT_DIR = previous;
+  if(previousHostGoal===undefined)delete process.env.OWNED_HOST_MODULE_GOAL;else process.env.OWNED_HOST_MODULE_GOAL=previousHostGoal;
+  if(previousHostSession===undefined)delete process.env.OWNED_HOST_MODULE_SESSION;else process.env.OWNED_HOST_MODULE_SESSION=previousHostSession;
   if (passed) rmSync(dir, { recursive: true, force: true });
   else console.error(`Owned Codemode sentinel failure retained: ${dir}`);
 }

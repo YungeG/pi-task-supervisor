@@ -18,6 +18,8 @@ import {
 const root = resolve(dirname(fileURLToPath(import.meta.url)), "..");
 const dir = mkdtempSync(join(tmpdir(), "owned-progress-sdk-"));
 const previous = process.env.PI_CODING_AGENT_DIR;
+const previousHostGoal=process.env.OWNED_HOST_MODULE_GOAL;
+const previousHostSession=process.env.OWNED_HOST_MODULE_SESSION;
 let session,
   passed = false,
   edits = 0;
@@ -46,6 +48,7 @@ const facts = (manager) =>
     );
 try {
   process.env.PI_CODING_AGENT_DIR = dir;
+  process.env.OWNED_HOST_MODULE_GOAL=goal;
   execFileSync("git", ["init", "--quiet", dir], { stdio: "ignore", timeout: 2000 });
   writeFileSync(join(dir, ".gitignore"), "*\n!.gitignore\n!fixed-input.txt\n");
   writeFileSync(join(dir, "fixed-input.txt"), "Initial owned implementation\n");
@@ -55,6 +58,7 @@ try {
     models: [{ id: "test", contextWindow: 128000 }],
   });
   const manager = SessionManager.create(dir, join(dir, "sessions"));
+  process.env.OWNED_HOST_MODULE_SESSION=manager.getSessionId();
   const advice = (action, count) => (context) => {
     const packet = JSON.parse(
       context.messages.findLast((message) => message.role === "user").content,
@@ -118,7 +122,7 @@ try {
       cwd: dir,
       agentDir: dir,
       settingsManager,
-      additionalExtensionPaths: [join(root, "src/index.ts")],
+      additionalExtensionPaths: [join(root, "test/host-module-extension.ts")],
     });
     await value.reload();
     return value;
@@ -165,7 +169,7 @@ try {
   await create(manager);
   const command = session.extensionRunner.getCommand("task-supervisor");
   assert(command);
-  await command.handler(`supervise-legacy ${goal}`, session.extensionRunner.createCommandContext());
+  void session.prompt("Exercise the owned trusted-host progress mechanism").catch(error=>errors.push(error));
   const deadline = Date.now() + 15000;
   while (latest(manager)?.status !== "paused") {
     if (Date.now() > deadline)
@@ -243,13 +247,15 @@ try {
       coldRestoreNoReplay: true,
       productionHumanProof: false,
       sourceBoundary:
-        "Owned real SDK/custom finite file tool/faux provider; explicit legacy fixture start, progress is not business acceptance",
+        "Owned real SDK/custom finite file tool/faux provider; explicit trusted-host module initialization (not a user command/approval), progress is not business acceptance",
     }),
   );
 } finally {
   session?.dispose();
   if (previous === undefined) delete process.env.PI_CODING_AGENT_DIR;
   else process.env.PI_CODING_AGENT_DIR = previous;
+  if(previousHostGoal===undefined)delete process.env.OWNED_HOST_MODULE_GOAL;else process.env.OWNED_HOST_MODULE_GOAL=previousHostGoal;
+  if(previousHostSession===undefined)delete process.env.OWNED_HOST_MODULE_SESSION;else process.env.OWNED_HOST_MODULE_SESSION=previousHostSession;
   if (passed) rmSync(dir, { recursive: true, force: true });
   else console.error(`Owned progress SDK failure retained: ${dir}`);
 }

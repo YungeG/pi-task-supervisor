@@ -7,7 +7,7 @@ import { currentRuntime } from "../runtime";
 import { createWriteTasksTool, createCompileTasksTool, createGetReadyTasksTool } from "../tools";
 import { resetState, setBoard } from "../state";
 import { setSessionScopeEnabled } from "../scope";
-import { supervisorState } from "../supervisor";
+import { startSupervisor, supervisorState } from "../supervisor";
 import { activeBoard, BOUNDARY, deferred, lifecycle } from "./helpers/lifecycle";
 
 beforeEach(() => {
@@ -194,7 +194,7 @@ it("holds an inconsistent same-owner mutation barrier instead of leaving a revie
       streamSimple,
     },
   });
-  await h.command("supervise Fixed authorized same-owner work");
+  startSupervisor(h.mock.api, h.ctx, "Fixed authorized same-owner work");
   await h.fire("agent_before_settle", BOUNDARY);
   expect(streamSimple).not.toHaveBeenCalled();
   // The synthetic epoch inconsistency also triggers the stronger receipt identity/version hold.
@@ -215,7 +215,7 @@ it("does not send a provider request after the pinned model lookup changes the S
       streamSimple,
     },
   });
-  await h.command("supervise Fixed authorized old session work");
+  startSupervisor(h.mock.api, h.ctx, "Fixed authorized old session work");
   await h.fire("agent_before_settle", BOUNDARY);
   expect(streamSimple).not.toHaveBeenCalled();
 });
@@ -232,7 +232,7 @@ it("accounts a returned response before rejecting invalid JSON", async () => {
       streamSimple: () => ({ result: async () => response }),
     },
   });
-  await h.command("supervise Finish authorized synthetic work");
+  startSupervisor(h.mock.api, h.ctx, "Finish authorized synthetic work");
   await h.fire("agent_before_settle", BOUNDARY);
   expect(supervisorState()).toMatchObject({
     status: "fault",
@@ -264,7 +264,7 @@ it("accounts returned model consumption even when the host rejects a guide in pl
       streamSimple: () => ({ result: async () => response }),
     },
   });
-  await h.command("supervise Finish the authorized synthetic work");
+  startSupervisor(h.mock.api, h.ctx, "Finish the authorized synthetic work");
   expect(await h.fire("agent_before_settle", BOUNDARY)).toBeUndefined();
   expect(supervisorState()).toMatchObject({
     status: "fault",

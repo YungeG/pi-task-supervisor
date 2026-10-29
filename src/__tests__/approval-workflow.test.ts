@@ -1,4 +1,7 @@
+import { enterPlanningMode } from "../management-policy";
+import { enableSessionScope } from "../scope";
 import { afterEach, beforeEach, expect, it, vi } from "vitest";
+import { createCodemodeExtension, type ToolInfo } from "@earendil-works/pi-coding-agent";
 import {
   existsSync,
   readFileSync,
@@ -18,7 +21,7 @@ import { createSubmitPreflightTool, createWriteTasksTool, createCompileTasksTool
 import { currentRuntime } from "../runtime";
 import { readControlJournal } from "../control-journal";
 import { getBoard, resetState } from "../state";
-import { restorePreflight } from "../preflight";
+import { beginPreflight, restorePreflight } from "../preflight";
 import { approvePreflight } from "../preflight-human";
 import type { AcceptanceProposal } from "../acceptance-proposal";
 import { flowFacts, nextFlowStep } from "../flow";
@@ -41,6 +44,46 @@ import {
 
 beforeEach(resetState);
 
+it("rejects unsupported models-enabled container-only evidence before collecting first Start", async () => {
+  const h = await approvedNodeBundle();
+  let definition: Pick<ToolInfo, "description" | "parameters"> | undefined;
+  void createCodemodeExtension()({
+    registerTool: (tool) => {
+      definition = tool;
+    },
+  } as Parameters<ReturnType<typeof createCodemodeExtension>>[0]);
+  if (!definition) throw Error("SDK builtin metadata missing");
+  const tool: ToolInfo = {
+    ...definition,
+    name: "codemode",
+    exposure: "model-only",
+    sourceInfo: {
+      path: "builtin:codemode",
+      source: "builtin",
+      scope: "temporary",
+      origin: "top-level",
+    },
+  };
+  vi.mocked(h.mock.api.getAllTools).mockReturnValue([...h.mock.api.getAllTools(), tool]);
+  h.mock.getActiveTools.mockReturnValue(["codemode"]);
+  Object.assign(h.mock.api, { getSettings: () => ({ codemode: { mode: "only" } }) });
+  const before = vi.mocked(h.ctx.ui.custom).mock.calls.length;
+  await h.command("start");
+  expect(currentRuntime().preflight?.started).toBeUndefined();
+  expect(vi.mocked(h.ctx.ui.custom)).toHaveBeenCalledTimes(before);
+  expect(vi.mocked(h.ctx.ui.notify).mock.calls.flat().join(" ")).toMatch(
+    /evidence.*unsupported|qualified.*direct/i,
+  );
+  expect(flowFacts(h.ctx).approval).toMatchObject({ kind: "materials", actor: "Main" });
+  expect(nextFlowStep(getBoard(), currentRuntime().supervisor, flowFacts(h.ctx))).not.toContain(
+    "/task-supervisor start",
+  );
+  const approval = structuredClone(currentRuntime().preflight?.approval);
+  Object.assign(h.mock.api, { getSettings: () => ({ codemode: { mode: "on" } }) });
+  await h.command("start");
+  expect(currentRuntime().preflight?.started).toBeDefined();
+  expect(currentRuntime().preflight?.approval).toEqual(approval);
+});
 it("does not recollect unchanged permissions and confirms only changed definitions before independent Start", async () => {
   const h = await plannedBundle();
   const submitted = await createSubmitPreflightTool(h.mock.api).execute(
@@ -710,7 +753,9 @@ it.each([false, true])(
   "fails closed if the actual approval capability envelope cannot be published (priorFault=%s)",
   async (priorFault) => {
     const h = preflightLifecycle();
-    await h.command("preflight Owned legacy source only");
+    beginPreflight(h.mock.api, h.ctx, "Owned legacy source only");
+    enableSessionScope(h.mock.api);
+    enterPlanningMode(h.mock.api, h.ctx);
     if (priorFault) currentRuntime().journalFault = "Earlier unrelated source uncertainty";
     h.mock.appendEntry.mockImplementation(() => {
       throw Error("Capability envelope write failed");
@@ -841,8 +886,10 @@ it("preserves the same open Start request after native deferral without repeatin
 });
 
 it("never materializes a cached-only planning preflight without the actual committed Goal seed", async () => {
-  const h = preflightLifecycle({ consolidated: true });
-  await h.command("preflight Owned missing physical source");
+  const h = preflightLifecycle();
+  beginPreflight(h.mock.api, h.ctx, "Owned missing physical source");
+  enableSessionScope(h.mock.api);
+  enterPlanningMode(h.mock.api, h.ctx);
   const root = dirname(h.path);
   h.ctx.cwd = root;
   h.entries.splice(0, h.entries.length);
@@ -1060,7 +1107,9 @@ it.each(["before", "after", "workspace"])(
 
 it("does not publish new protocol payloads when the actual SessionManager source read fails", async () => {
   const h = preflightLifecycle();
-  await h.command("preflight Owned read failure");
+  beginPreflight(h.mock.api, h.ctx, "Owned read failure");
+  enableSessionScope(h.mock.api);
+  enterPlanningMode(h.mock.api, h.ctx);
   vi.mocked(h.ctx.sessionManager.getBranch).mockImplementation(() => {
     throw Error("Actual source adapter unavailable");
   });
@@ -1081,7 +1130,7 @@ afterEach(() => {
 async function plannedBundle(
   options: { pending?: boolean; python?: boolean; manual?: boolean; retained?: boolean } = {},
 ) {
-  const h = preflightLifecycle({ consolidated: !options.retained });
+  const h = preflightLifecycle();
   const root = dirname(h.path);
   const header = JSON.parse(readFileSync(h.path, "utf8").split("\n")[0] ?? "{}");
   writeFileSync(h.path, JSON.stringify({ ...header, cwd: root }) + "\n");
@@ -1097,7 +1146,12 @@ async function plannedBundle(
         ? "import unittest,pathlib\nclass Output(unittest.TestCase):\n def test_output(self):\n  self.assertEqual(pathlib.Path('result.txt').read_text(),'made')\n"
         : checker,
     );
-  await h.command("preflight Confirm once before work");
+  if (options.retained) {
+    // Protocol-module fixture only; not a current command or native permission substitute.
+    beginPreflight(h.mock.api, h.ctx, "Confirm once before work");
+    enableSessionScope(h.mock.api);
+    enterPlanningMode(h.mock.api, h.ctx);
+  } else await h.command("supervise Confirm once before work");
   const proposal: AcceptanceProposal = {
     version: 1 as const,
     scopeId: "owned-output",

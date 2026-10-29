@@ -1,3 +1,6 @@
+import { startSupervisor } from "../supervisor";
+import { enableSessionScope } from "../scope";
+import { adoptSupervisedMode } from "../management-policy";
 // C1/C2/C3 public admission/source APIs. Owned physical/TUI boundary adapter;
 // negative calls must not spawn a checker, create approval or fabricate proof.
 import { readFileSync, writeFileSync, unlinkSync } from "node:fs";
@@ -193,7 +196,9 @@ async function setup(bound = true) {
   h.ctx.cwd = root;
   writeFileSync(join(root, "input.txt"), "owned");
   writeFileSync(join(root, "check.mjs"), 'console.log("unexecuted");\n');
-  await h.command("supervise-legacy Owned admission");
+  startSupervisor(h.mock.api, h.ctx, "Owned admission");
+  enableSessionScope(h.mock.api);
+  adoptSupervisedMode(h.mock.api, h.ctx);
   const proposal = {
     version: 1 as const,
     scopeId: "admission",

@@ -374,6 +374,7 @@ function validateSupervisorState(
     value.pending,
     value.bindings.length,
     value.acceptedDigest,
+    value.scopeRevisionRef,
     decoded.ledger?.receiptCount,
     decoded.ledger?.pending.length,
   ];

@@ -1,5 +1,6 @@
 import { beforeEach, describe, expect, it, vi } from "vitest";
 import { currentRuntime } from "../runtime";
+import { flowFacts, nextFlowStep } from "../flow";
 import { setSessionScopeEnabled } from "../scope";
 import { getBoard, resetState, setBoard } from "../state";
 import {
@@ -77,7 +78,7 @@ describe("ordinary supervised pause recovery", () => {
 
   it.each([
     [7, 4],
-    [40, 20],
+    [39, 19],
   ])(
     "preserves same-Goal recovery budget reviews=%i continuations=%i instead of renewing it",
     async (reviews, continuations) => {
@@ -102,6 +103,27 @@ describe("ordinary supervised pause recovery", () => {
     },
   );
 
+  it.each([
+    [40, 0],
+    [0, 20],
+  ])(
+    "does not pretend to recover an exhausted same-Goal budget (%i/%i)",
+    async (reviews, continuations) => {
+      const { mock, ctx, run } = setup();
+      Object.assign(supervisorState()!, { reviews, continuations, tokens: 800, cost: 0.25 });
+      holdSupervisor(mock.api, ctx, "fault", "Original failure", "run_failed");
+      const before = structuredClone(supervisorState()),
+        ledger = currentRuntime().receiptStore!.checkpoint();
+      mock.sendMessage.mockClear();
+      await run("recover");
+      expect(supervisorState()).toEqual(before);
+      expect(currentRuntime().receiptStore!.checkpoint()).toEqual(ledger);
+      expect(nextFlowStep(getBoard(), supervisorState(), flowFacts(ctx))).not.toContain(
+        "/task-supervisor recover",
+      );
+      expect(mock.sendMessage.mock.calls.some(([, options]) => options?.triggerTurn)).toBe(false);
+    },
+  );
   it("does not jointly resume a human pause with an unresolved host capture", async () => {
     const { run, fire } = setup();
     fire("tool_call", {
@@ -252,7 +274,7 @@ describe("ordinary supervised pause recovery", () => {
   it("gives Main a soft batch checkpoint without invoking an advisor or abort", async () => {
     const lane = lifecycle();
     setBoard(activeBoard());
-    await lane.command("supervise Finish authorized work");
+    startSupervisor(lane.mock.api, lane.ctx, "Finish authorized work");
     lane.ctx.abort = vi.fn();
     const result = await lane.fire("before_agent_start");
     expect(result.message.content).toContain("yield to the native supervisor checkpoint");
@@ -377,7 +399,7 @@ describe("ordinary supervised pause recovery", () => {
   it("rejects an unbound/no-op idle wait and does not retain a manual-pause intent", async () => {
     const lane = lifecycle();
     setBoard(activeBoard());
-    await lane.command("supervise Finish authorized work");
+    startSupervisor(lane.mock.api, lane.ctx, "Finish authorized work");
     vi.mocked(lane.ctx.isIdle).mockReturnValue(false);
     const board = getBoard();
     const state = structuredClone(supervisorState());
@@ -398,7 +420,7 @@ describe("ordinary supervised pause recovery", () => {
   it("recognizes only the host abort caused by an explicit busy pause command", async () => {
     const lane = lifecycle();
     setBoard(activeBoard());
-    await lane.command("supervise Finish authorized work");
+    startSupervisor(lane.mock.api, lane.ctx, "Finish authorized work");
     vi.mocked(lane.ctx.isIdle).mockReturnValue(false);
     vi.mocked(lane.ctx.waitForIdle).mockImplementation(async () => {
       lane.fire("agent_settled", { aborted: true });

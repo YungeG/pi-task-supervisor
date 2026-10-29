@@ -6,10 +6,13 @@ import { homedir, tmpdir } from "node:os";
 import { dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import { fauxAssistantMessage, fauxProvider, fauxToolCall } from "@earendil-works/pi-ai";
-import { createAgentSession, DefaultResourceLoader, ModelRuntime, SessionManager, SettingsManager } from "@earendil-works/pi-coding-agent";
+const sdk=await import(process.env.MANAGEMENT_SDK_ENTRY ?? '@earendil-works/pi-coding-agent');
+const {createAgentSession,DefaultResourceLoader,ModelRuntime,SessionManager,SettingsManager}=sdk;
 const root = resolve(dirname(fileURLToPath(import.meta.url)), "..");
 const sandbox = mkdtempSync(join(tmpdir(), "owned-management-sdk-"));
 const previous = process.env.PI_CODING_AGENT_DIR;
+const previousHostGoal=process.env.OWNED_HOST_MODULE_GOAL;
+const previousHostSession=process.env.OWNED_HOST_MODULE_SESSION;
 const settingsPath = join(homedir(), ".pi", "agent", "settings.json");
 const settingsHash = () => existsSync(settingsPath) ? createHash("sha256").update(readFileSync(settingsPath)).digest("hex") : "absent";
 const beforeSettings = settingsHash();
@@ -25,10 +28,11 @@ const latest = (manager, type) => [...manager.getBranch()].reverse().find(row =>
 const mode = manager => [...manager.getBranch()].reverse().find(row => row.type === "custom" && row.customType === "continuous-tasks:control-facts" && row.data.kind === "session-mode-changed")?.data;
 try {
   process.env.PI_CODING_AGENT_DIR = sandbox;
+  process.env.OWNED_HOST_MODULE_GOAL="Owned finite SDK management qualification";
   writeFileSync(join(sandbox, "fixed-input.txt"), "Owned finite SDK mode input\n");
   const settingsManager = SettingsManager.inMemory({ compaction: { enabled: false } });
   const freshLoader = async () => {
-    const loader = new DefaultResourceLoader({ cwd: sandbox, agentDir: sandbox, settingsManager, additionalExtensionPaths: [join(root, "src/index.ts")] });
+    const loader = new DefaultResourceLoader({ cwd: sandbox, agentDir: sandbox, settingsManager, additionalExtensionPaths: [join(root, "test/host-module-extension.ts")] });
     await loader.reload();
     return loader;
   };
@@ -52,6 +56,7 @@ try {
   const model = runtime.getModel("owned-management-faux", "test");
   assert(model);
   const manager = SessionManager.create(sandbox, join(sandbox, "sessions"));
+  process.env.OWNED_HOST_MODULE_SESSION=manager.getSessionId();
   const create = async sm => {
     const result = await createAgentSession({ cwd: sandbox, agentDir: sandbox, modelRuntime: runtime, model, resourceLoader: await freshLoader(), settingsManager, sessionManager: sm, noTools: "builtin", customTools: [] });
     assert.deepEqual(result.extensionsResult.errors, []);
@@ -62,7 +67,7 @@ try {
   await create(manager);
   const command = session.extensionRunner.getCommand("task-supervisor");
   assert(command);
-  await command.handler("supervise-legacy Owned finite SDK management qualification", session.extensionRunner.createCommandContext());
+  void session.prompt("Exercise the owned trusted-host management mechanism").catch(error=>errors.push(error));
   await until(() => reviewStarted, "first real SDK advisor boundary");
   assert.equal(session.extensionRunner.createCommandContext().isIdle(), false);
   const beforeBoard = structuredClone(latest(manager, "continuous-tasks:snapshot"));
@@ -98,12 +103,36 @@ try {
   assert.equal(Buffer.compare(bytes, readFileSync(file)), 0);
   assert.deepEqual(errors, []);
   assert.equal(settingsHash(), beforeSettings);
+  session.dispose();
+  delete process.env.OWNED_HOST_MODULE_GOAL;
+  const textCases=[];
+  for(const first of ["fresh","before","twice","after"]){
+    const sm=SessionManager.create(sandbox,join(sandbox,`text-${first}`));
+    await create(sm);
+    const canonical=session.extensionRunner.getCommand("task-supervisor");assert(canonical);
+    assert.equal(session.extensionRunner.getCommand("continuous-tasks"),undefined);
+    if(first!=="fresh")await canonical.handler("tasks-only",session.extensionRunner.createCommandContext());
+    if(first==="before"||first==="twice")await canonical.handler("disable",session.extensionRunner.createCommandContext());
+    faux.setResponses([fauxAssistantMessage("Owned pure text only; no tools or business execution")]);
+    await session.prompt("Persist one owned pure-text conversation");await session.waitForIdle();
+    if(first==="after"||first==="twice")await canonical.handler("disable",session.extensionRunner.createCommandContext());
+    const path=sm.getSessionFile();assert(existsSync(path));
+    await session.extensionRunner.emit({type:"session_shutdown"});session.dispose();
+    await create(SessionManager.open(path,join(sandbox,`text-${first}`)));
+    assert(!session.extensionRunner.getActiveTools().includes("write_tasks"));
+    assert.equal(mode(session.sessionManager)?.mode ?? "off","off");
+    assert(!session.sessionManager.getBranch().some(row=>row.type === "custom" && row.customType === "continuous-tasks:supervisor" && row.data?.version === 3));
+    textCases.push(first);session.dispose();
+  }
+  assert.deepEqual(errors,[]);assert.equal(settingsHash(),beforeSettings);
   passed = true;
-  console.log(JSON.stringify({ result: "PASS", mode: "owned-sdk-disable-in-flight-review", sdk: "1.1.0", finiteMainActuallyBusyBeforeDisable: true, actualMainIdleAndNoPendingAfterDisable: true, oldAdvisorNotAdopted: true, originalOwnerAccountingRetained: true, noForcedTaskCompletion: true, repeatDisableNoWrite: true, coldRestoreOffNoDispatch: true, ordinaryUnmanagedAdmissionOnly: true, realSettingsUntouched: true, productionHumanProof: false, sourceBoundary: "Owned createAgentSession/SessionManager/faux-provider and real command-context waitForIdle; explicit legacy fixture startup, no CLI/human or business acceptance" }));
+  console.log(JSON.stringify({ result: "PASS", mode: "owned-sdk-disable-in-flight-review", sdk: sdk.VERSION, canonicalTasksOnlyPureTextMatrix:textCases, finiteMainActuallyBusyBeforeDisable: true, actualMainIdleAndNoPendingAfterDisable: true, oldAdvisorNotAdopted: true, originalOwnerAccountingRetained: true, noForcedTaskCompletion: true, repeatDisableNoWrite: true, coldRestoreOffNoDispatch: true, ordinaryUnmanagedAdmissionOnly: true, realSettingsUntouched: true, productionHumanProof: false, sourceBoundary: "Owned createAgentSession/SessionManager/faux-provider and real command-context waitForIdle; explicit trusted-host module initialization for busy-advisor checks and canonical tasks-only for actual pure-text persistence/reopen; no CLI/human or business acceptance" }));
 } finally {
   release?.();
   session?.dispose();
   if (previous === undefined) delete process.env.PI_CODING_AGENT_DIR; else process.env.PI_CODING_AGENT_DIR = previous;
+  if(previousHostGoal===undefined)delete process.env.OWNED_HOST_MODULE_GOAL;else process.env.OWNED_HOST_MODULE_GOAL=previousHostGoal;
+  if(previousHostSession===undefined)delete process.env.OWNED_HOST_MODULE_SESSION;else process.env.OWNED_HOST_MODULE_SESSION=previousHostSession;
   if (passed) rmSync(sandbox, { recursive: true, force: true });
   else console.error(`Owned failed SDK fixture retained: ${sandbox}`);
 }

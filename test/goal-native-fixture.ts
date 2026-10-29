@@ -7,6 +7,7 @@ import { getBoardRef, setBoard } from "../src/state.ts";
 import { answerBoardDecision } from "../src/board-human.ts";
 import { approvalNativeResponses } from "./approval-native-responses.ts";
 import { readControlJournal } from "../src/control-journal.ts";
+import { assessEvidenceCapability } from "../src/execution-capability.ts";
 
 const proposal = {
   summary: "Owned offline native lifecycle check; no business operations",
@@ -108,6 +109,14 @@ export default function goalNativeFixture(pi: any) {
         sessionFile: manager.getSessionFile(),
         leafId: manager.getLeafId(),
         modelCalls: faux.state.callCount,
+        codemode: pi
+          .getAllTools()
+          .filter((tool: any) => tool.name === "codemode")
+          .map((tool: any) => ({
+            sourceInfo: tool.sourceInfo,
+            modelsAdvertised: tool.description.includes("`models`"),
+          })),
+        evidenceCapability: assessEvidenceCapability(pi),
         idles,
         // This command is outside the supervisor's private scopedAPI runtime.
         // Inspect actual published first-owner facts, not its unrelated default runtime.

@@ -20,7 +20,11 @@ export function approvalNativeResponses(
   branch: () => any[],
   legacyProposal: any,
 ) {
-  if (!["approval-existing", "approval-preparation", "permissions"].includes(scenario ?? ""))
+  if (
+    !["approval-existing", "approval-preparation", "approval-scope", "permissions"].includes(
+      scenario ?? "",
+    )
+  )
     return;
   const root = process.env.GOAL_NATIVE_OUT;
   if (!root) throw Error("No isolated CLI output workspace");
@@ -200,6 +204,7 @@ export function approvalNativeResponses(
     "native-draft",
   );
   const compile = tool("compile_tasks", { finalAcceptanceTaskId: "t-1.1" }, "native-compile");
+  const scope = scenario === "approval-scope";
   return [
     ...planning,
     ...(preparation
@@ -218,7 +223,37 @@ export function approvalNativeResponses(
         ]
       : [draft, compile]),
     fauxAssistantMessage("GOAL_NATIVE_PLAN_CHECKPOINT"),
-    advice("next_batch"),
+    ...(scope
+      ? [
+          advice("hold"),
+          tool(
+            "propose_scope_revision",
+            {
+              plan: {
+                ...proposal,
+                acceptance: [
+                  "Exactly declared output; precise synthetic timestamp exception A=1793178673175340907, B=1793178673175340907; every other original condition remains",
+                ],
+              },
+              contract: {
+                ...contract,
+                requirements: contract.requirements.map((requirement) => ({
+                  ...requirement,
+                  text:
+                    requirement.text +
+                    "; exact synthetic exception A=1793178673175340907, B=1793178673175340907 only, never latest values",
+                })),
+              },
+              reason:
+                "Precisely amend existing synthetic conditions; preserve original Goal/permissions/Start/budgets and all other guards",
+            },
+            "native-scope-proposal",
+          ),
+          fauxAssistantMessage(
+            "GOAL_NATIVE_SCOPE_PROPOSED: native review and separate recovery are still required",
+          ),
+        ]
+      : [advice("next_batch")]),
     tool("get_ready_tasks", { count: 1 }, "native-ready"),
     tool("advance_tasks", { transitions: [{ id: "t-1.1" }] }, "native-claim"),
     tool("write", { path: join(root, "result.txt"), content: "made\n" }, "native-produce"),

@@ -5,6 +5,7 @@ import type {
   ExtensionAPI,
 } from "@earendil-works/pi-coding-agent";
 import { vi } from "vitest";
+import { RunCheckParams } from "../../check-tool-schema";
 
 /** Creates a mock Theme that returns its arguments wrapped in brackets for assertion */
 export function createMockTheme(): Theme {
@@ -141,7 +142,22 @@ export function createMockAPI(): {
       getActiveTools,
       setActiveTools,
       appendEntry,
-      getAllTools: vi.fn(() => []),
+      // Unit-boundary metadata only; actual SDK/CLI fixtures establish provenance separately.
+      getAllTools: vi.fn(() => [
+        {
+          name: "run_check",
+          description: "Owned simulated registered checker",
+          parameters: RunCheckParams,
+          exposure: "direct",
+          sourceInfo: {
+            path: "owned-unit:run_check",
+            source: "path",
+            scope: "temporary",
+            origin: "top-level",
+          },
+        },
+      ]),
+      getSettings: vi.fn(() => ({})),
     } as unknown as ExtensionAPI,
     sendMessage,
     sendUserMessage,

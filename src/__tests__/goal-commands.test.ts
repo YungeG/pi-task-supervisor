@@ -70,7 +70,7 @@ it("routes supervise through native archive then one claimed read-only planning 
   expect(await f.fire("agent_before_settle", BOUNDARY)).toBeUndefined();
   await f.fire("agent_settled", { type: "agent_settled", aborted: false });
   expect(currentRuntime().goal?.current?.phase).toBe("planning-interrupted");
-  await f.command("preflight");
+  await f.command("supervise --replan");
   expect(currentRuntime().goal?.current?.scope.goalRunId).toBe(id);
   expect(currentRuntime().goal?.current?.planning.attemptNo).toBe(1);
   expect(sendSaw).toEqual(["dispatch-claimed", "dispatch-claimed"]);
@@ -199,7 +199,7 @@ it("does not redispatch on reopen and exposes explicit replan/stop instead of re
   await f.command("recover");
   expect(f.entries()).toHaveLength(count);
   expect(turns()).toBe(1);
-  await f.command("preflight");
+  await f.command("supervise --replan");
   expect(currentRuntime().goal?.current?.scope.goalRunId).toBe(id);
   expect(currentRuntime().goal?.current?.planning.attemptNo).toBe(1);
   expect(turns()).toBe(2);

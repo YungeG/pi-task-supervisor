@@ -69,7 +69,7 @@ it.each(["A", "B", "C"])(
       stage === "A" ? 1 : 0,
     );
     if (stage !== "A") {
-      await f.command("preflight");
+      await f.command("supervise --replan");
       expect(f.sendMessage.mock.calls.filter(([, options]) => options?.triggerTurn)).toHaveLength(
         1,
       );
@@ -160,7 +160,7 @@ it("does not replace a live goal with different text or redispatch while the rea
   expect(currentRuntime().goal?.current).toEqual(current);
   expect(f.entries()).toHaveLength(entries);
   vi.mocked(f.ctx.isIdle).mockReturnValue(false);
-  await f.command("preflight");
+  await f.command("supervise --replan");
   expect(f.entries()).toHaveLength(entries);
   expect(f.sendMessage.mock.calls.filter(([, options]) => options?.triggerTurn)).toHaveLength(0);
 });

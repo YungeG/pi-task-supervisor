@@ -6,7 +6,13 @@ import { registerEventHandlers } from "../events";
 import { currentRuntime } from "../runtime";
 import { setSessionScopeEnabled } from "../scope";
 import { getBoard, resetState, setBoard } from "../state";
-import { supervisorState, SUPERVISOR_ENTRY, type Advice, type Advisor } from "../supervisor";
+import {
+  startSupervisor,
+  supervisorState,
+  SUPERVISOR_ENTRY,
+  type Advice,
+  type Advisor,
+} from "../supervisor";
 import {
   activeBoard,
   ACTIVATION,
@@ -47,7 +53,7 @@ describe("supervisor stopping and recovery policy", () => {
     { ...guide, action: "waive-validation" },
   ])("turns invalid or premature advice into a visible fault", async (advice) => {
     const h = lifecycle(async () => ({ advice }) as Awaited<ReturnType<Advisor>>);
-    await h.command("supervise Complete approved work");
+    startSupervisor(h.mock.api, h.ctx, "Complete approved work");
     expect(await h.fire("agent_before_settle", BOUNDARY)).toBeUndefined();
     expect(supervisorState()).toMatchObject({ status: "fault", pending: false });
     expect(h.mock.sendMessage).toHaveBeenLastCalledWith(
@@ -60,7 +66,7 @@ describe("supervisor stopping and recovery policy", () => {
     const h = lifecycle(async () => ({
       advice: { ...guide, action: "hold", message: "Missing explicit deployment authority" },
     }));
-    await h.command("supervise Complete approved work");
+    startSupervisor(h.mock.api, h.ctx, "Complete approved work");
     expect(await h.fire("agent_before_settle", BOUNDARY)).toBeUndefined();
     expect(supervisorState()).toMatchObject({
       status: "paused",
@@ -75,7 +81,7 @@ describe("supervisor stopping and recovery policy", () => {
 
   it("does not let recovery approve a board pause or waiting decision", async () => {
     const h = lifecycle(async () => ({ advice: guide }));
-    await h.command("supervise Complete approved work");
+    startSupervisor(h.mock.api, h.ctx, "Complete approved work");
     await h.command("pause maintenance");
     h.mock.sendMessage.mockClear();
     await h.command("recover");
@@ -95,7 +101,7 @@ describe("supervisor stopping and recovery policy", () => {
 
   it("clears the supervisor status when the session shuts down", async () => {
     const h = lifecycle();
-    await h.command("supervise Complete approved work");
+    startSupervisor(h.mock.api, h.ctx, "Complete approved work");
     await h.fire("session_shutdown");
     expect(h.ctx.ui.setStatus).toHaveBeenLastCalledWith("continuous-supervisor", undefined);
   });
@@ -103,7 +109,7 @@ describe("supervisor stopping and recovery policy", () => {
   it("stops without falling back to automatic board continuation", async () => {
     const advisor = vi.fn<Advisor>(async () => ({ advice: guide }));
     const h = lifecycle(advisor);
-    await h.command("supervise Complete approved work");
+    startSupervisor(h.mock.api, h.ctx, "Complete approved work");
     await h.command("stop");
     expect(currentRuntime().supervisor?.status).toBe("stopped");
     expect(supervisorState()).toBeUndefined();
@@ -124,7 +130,7 @@ describe("supervisor stopping and recovery policy", () => {
     try {
       const reply = deferred<Awaited<ReturnType<Advisor>>>();
       const h = lifecycle(() => reply.promise);
-      await h.command("supervise Complete approved work");
+      startSupervisor(h.mock.api, h.ctx, "Complete approved work");
       const pending = h.fire("agent_before_settle", BOUNDARY);
       await vi.advanceTimersByTimeAsync(30_001);
       expect(await pending).toBeUndefined();
@@ -143,7 +149,7 @@ describe("supervisor stopping and recovery policy", () => {
   it("counts real progress, not generation churn or questions, and pauses a loop", async () => {
     const advisor = vi.fn<Advisor>(async () => ({ advice: guide }));
     const h = lifecycle(advisor);
-    await h.command("supervise Complete approved work");
+    startSupervisor(h.mock.api, h.ctx, "Complete approved work");
     for (let i = 0; i < 3; i++) {
       expect((await h.fire("agent_before_settle", BOUNDARY))?.continue).toBe(true);
       setBoard(activeBoard({ generation: 10 + i }));
@@ -161,7 +167,7 @@ describe("supervisor stopping and recovery policy", () => {
     async (budget) => {
       const advisor = vi.fn<Advisor>(async () => ({ advice: guide }));
       const h = lifecycle(advisor);
-      await h.command("supervise Complete approved work");
+      startSupervisor(h.mock.api, h.ctx, "Complete approved work");
       Object.assign(supervisorState()!, budget);
       expect(await h.fire("agent_before_settle", BOUNDARY)).toBeUndefined();
       expect(supervisorState()?.status).toBe("paused");
@@ -172,21 +178,17 @@ describe("supervisor stopping and recovery policy", () => {
   it("rejects non-finite usage instead of corrupting durable state", async () => {
     const usage = { totalTokens: NaN, cost: { total: Infinity } } as Usage;
     const h = lifecycle(async () => ({ advice: guide, usage }));
-    await h.command("supervise Complete approved work");
+    startSupervisor(h.mock.api, h.ctx, "Complete approved work");
     await h.fire("agent_before_settle", BOUNDARY);
     expect(supervisorState()).toMatchObject({ status: "fault", tokens: 0, cost: 0 });
   });
 
   it.each(['{"api_key":"quoted-private-value"}', "", "x".repeat(4001)])(
     "rejects unsafe or invalid human goals without recording them",
-    async (goal) => {
+    (goal) => {
       const h = lifecycle();
-      await h.command(`supervise ${goal}`);
+      expect(() => startSupervisor(h.mock.api, h.ctx, goal)).toThrow(/non-secret/);
       expect(supervisorState()).toBeUndefined();
-      expect(h.ctx.ui.notify).toHaveBeenLastCalledWith(
-        expect.stringContaining("non-secret"),
-        "error",
-      );
       expect(h.mock.sendMessage).not.toHaveBeenCalled();
     },
   );
@@ -205,18 +207,16 @@ describe("supervisor stopping and recovery policy", () => {
       }),
     );
     const h = lifecycle();
-    await h.command("supervise Complete approved work");
-    expect(supervisorState()).toBeUndefined();
-    expect(h.ctx.ui.notify).toHaveBeenLastCalledWith(
-      expect.stringContaining("at most 100 tasks"),
-      "error",
+    expect(() => startSupervisor(h.mock.api, h.ctx, "Complete approved work")).toThrow(
+      /at most 100 tasks/,
     );
+    expect(supervisorState()).toBeUndefined();
     expect(h.mock.sendMessage).not.toHaveBeenCalled();
   });
 
   it("does not recover an oversized legacy plan into an invalid journal", async () => {
     const h = lifecycle();
-    await h.command("supervise Complete approved work");
+    startSupervisor(h.mock.api, h.ctx, "Complete approved work");
     await h.command("pause inspect legacy plan");
     // Legacy paused checkpoints have no proven pause origin.
     supervisorState()!.holdCause = undefined;
@@ -252,7 +252,7 @@ describe("supervisor stopping and recovery policy", () => {
     "enforces the task ceiling for supervised writes: $mode $count",
     async ({ mode, count, blocked }) => {
       const h = lifecycle();
-      await h.command("supervise Complete approved work");
+      startSupervisor(h.mock.api, h.ctx, "Complete approved work");
       if (mode === "replace") setBoard(activeBoard({ tasks: [] }));
       const gate = await h.fire("tool_call", {
         toolName: "write_tasks",
@@ -281,7 +281,7 @@ describe("supervisor stopping and recovery policy", () => {
 
   it("leaves malformed write parameters to host schema validation without crashing its gate", async () => {
     const h = lifecycle();
-    await h.command("supervise Complete approved work");
+    startSupervisor(h.mock.api, h.ctx, "Complete approved work");
     for (const [index, phases] of [
       undefined,
       {},
@@ -298,7 +298,7 @@ describe("supervisor stopping and recovery policy", () => {
 
   it("prevents replacing a goal, discarding the board, or abandoning its requirements", async () => {
     const h = lifecycle();
-    await h.command("supervise Goal A");
+    startSupervisor(h.mock.api, h.ctx, "Goal A");
     await h.command("supervise Goal B");
     expect(supervisorState()?.goal).toBe("Goal A");
     for (const event of [
@@ -319,7 +319,7 @@ describe("supervisor stopping and recovery policy", () => {
     registerCommands(mock.api);
     await getHandler(mock, "session_start")({}, ctx);
     const command = mock.registerCommand.mock.calls[0]?.[1];
-    await command.handler("enable", ctx);
+    await command.handler("tasks-only", ctx);
     expect(mock.setActiveTools).toHaveBeenLastCalledWith(["read"]);
     expect(
       await getHandler(mock, "tool_call")({ toolName: "write_tasks", input: {} }, ctx),
@@ -328,7 +328,7 @@ describe("supervisor stopping and recovery policy", () => {
 
   it("restores an unfinished supervisor as interrupted, never as active-but-idle", async () => {
     const h = lifecycle();
-    await h.command("supervise Complete approved work");
+    startSupervisor(h.mock.api, h.ctx, "Complete approved work");
     const saved = structuredClone(supervisorState()!);
     const ctx = createMockContext([
       ACTIVATION,

@@ -1,3 +1,4 @@
+import { startSupervisor } from "../supervisor";
 import { beforeEach, describe, expect, it } from "vitest";
 import { setSessionScopeEnabled } from "../scope";
 import { getBoard, reconstructState, resetState, setBoard } from "../state";
@@ -15,7 +16,7 @@ beforeEach(() => {
 describe("task-board compilation invariants", () => {
   it("invalidates old compilation before saving a phase edit and keeps every snapshot restorable", async () => {
     const h = lifecycle();
-    await h.command("supervise Complete the approved synthetic board");
+    startSupervisor(h.mock.api, h.ctx, "Complete the approved synthetic board");
     const edit = createEditTasksTool(h.mock.api);
     const input = {
       tasks: [{ id: "t-1.1", type: "data" as const, data: { phase: 3 } }],

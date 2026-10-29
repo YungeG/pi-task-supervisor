@@ -1,5 +1,7 @@
+import { enterPlanningMode } from "../management-policy";
+import { enableSessionScope } from "../scope";
 import { afterEach, beforeEach, expect, it, vi } from "vitest";
-import { PREFLIGHT_ENTRY, preflightEvidence, restorePreflight } from "../preflight";
+import { beginPreflight, PREFLIGHT_ENTRY, preflightEvidence, restorePreflight } from "../preflight";
 import { approvePreflight, startApprovedPreflight } from "../preflight-human";
 import { requireNativeAnswer, type NativeAnswer } from "../human-ui";
 import { currentRuntime } from "../runtime";
@@ -19,7 +21,9 @@ afterEach(() => {
 
 async function submitted() {
   const h = preflightLifecycle();
-  await h.command("preflight Local fixture");
+  beginPreflight(h.mock.api, h.ctx, "Local fixture");
+  enableSessionScope(h.mock.api);
+  enterPlanningMode(h.mock.api, h.ctx);
   vi.mocked(h.ctx.ui.select).mockResolvedValue("稍后决定");
   await createSubmitPreflightTool(h.mock.api).execute(
     "submit",
@@ -128,7 +132,9 @@ it("partial approval missing a required permission stays awaiting_authorization"
 
 it("identical resubmit returns already_saved without a new native prompt", async () => {
   const h = preflightLifecycle();
-  await h.command("preflight Local fixture");
+  beginPreflight(h.mock.api, h.ctx, "Local fixture");
+  enableSessionScope(h.mock.api);
+  enterPlanningMode(h.mock.api, h.ctx);
   vi.mocked(h.ctx.ui.select).mockResolvedValue("稍后决定");
   const planning = currentRuntime().preflight!;
   const first = await createSubmitPreflightTool(h.mock.api).execute(

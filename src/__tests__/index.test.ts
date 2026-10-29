@@ -27,8 +27,8 @@ describe("index (default export)", () => {
 
     indexModule.default(mockObj.api);
 
-    // Original eight methods, independently gated check runner and untrusted proposal metadata.
-    expect(mockObj.registerTool).toHaveBeenCalledTimes(10);
+    // Eight task/planning methods, gated check runner and two untrusted proposal tools.
+    expect(mockObj.registerTool).toHaveBeenCalledTimes(11);
     const toolNames = mockObj.registerTool.mock.calls.map(
       (call: unknown) => (call as [{ name: string }])[0].name,
     );
@@ -42,13 +42,14 @@ describe("index (default export)", () => {
     expect(toolNames).toContain("submit_preflight");
     expect(toolNames).toContain("run_check");
     expect(toolNames).toContain("propose_contract");
+    expect(toolNames).toContain("propose_scope_revision");
 
-    expect(mockObj.registerCommand).toHaveBeenCalledTimes(2);
+    expect(mockObj.registerCommand).toHaveBeenCalledTimes(1);
     expect(mockObj.registerCommand).toHaveBeenCalledWith(
       "task-supervisor",
       expect.objectContaining({ description: expect.any(String) }),
     );
-    expect(mockObj.registerCommand).toHaveBeenCalledWith(
+    expect(mockObj.registerCommand).not.toHaveBeenCalledWith(
       "continuous-tasks",
       expect.objectContaining({ description: expect.any(String) }),
     );

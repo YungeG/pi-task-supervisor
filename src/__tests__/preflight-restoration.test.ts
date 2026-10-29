@@ -1,7 +1,10 @@
+import { enterPlanningMode } from "../management-policy";
+import { enableSessionScope } from "../scope";
 import { randomUUID } from "node:crypto";
 import { readFileSync } from "node:fs";
 import { beforeEach, expect, it, vi } from "vitest";
 import {
+  beginPreflight,
   PREFLIGHT_ENTRY,
   PREFLIGHT_CONTROL_ENTRY,
   preflightDigest,
@@ -20,7 +23,9 @@ beforeEach(() => {
 });
 async function proposed(approve = false) {
   const h = preflightLifecycle();
-  await h.command("preflight Local fixture");
+  beginPreflight(h.mock.api, h.ctx, "Local fixture");
+  enableSessionScope(h.mock.api);
+  enterPlanningMode(h.mock.api, h.ctx);
   vi.mocked(h.ctx.ui.select).mockResolvedValue(approve ? "允许上述范围" : "稍后决定");
   await createSubmitPreflightTool(h.mock.api).execute(
     "submit",
@@ -79,7 +84,9 @@ it("retires superseded requests and never revives them", async () => {
 it("rejects cross-owner reuse and recycled preflight identities", async () => {
   const h = await proposed();
   const first = state();
-  await h.command("preflight Another local goal");
+  beginPreflight(h.mock.api, h.ctx, "Another local goal");
+  enableSessionScope(h.mock.api);
+  enterPlanningMode(h.mock.api, h.ctx);
   const planning = structuredClone(currentRuntime().preflight!);
   h.mock.api.appendEntry(PREFLIGHT_ENTRY, {
     ...first,

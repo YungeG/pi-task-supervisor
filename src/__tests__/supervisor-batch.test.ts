@@ -3,7 +3,7 @@ import { beforeEach, describe, expect, it, vi } from "vitest";
 import { currentRuntime } from "../runtime";
 import { setSessionScopeEnabled } from "../scope";
 import { getBoard, resetState, setBoard } from "../state";
-import { supervisorState, type Advice } from "../supervisor";
+import { startSupervisor, supervisorState, type Advice } from "../supervisor";
 import { createAdvanceTasksTool, createGetReadyTasksTool } from "../tools";
 import { activeBoard, BOUNDARY, lifecycle } from "./helpers/lifecycle";
 
@@ -37,7 +37,11 @@ async function completeFirstBatch(advice: Advice, third = false) {
   Object.assign(h.ctx, {
     modelRegistry: { find: () => h.ctx.model, streamSimple },
   });
-  await h.command("supervise Complete both approved batches without repeated confirmation");
+  startSupervisor(
+    h.mock.api,
+    h.ctx,
+    "Complete both approved batches without repeated confirmation",
+  );
   const claim = createGetReadyTasksTool(h.mock.api);
   const advance = createAdvanceTasksTool(h.mock.api);
   expect(

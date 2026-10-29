@@ -4,6 +4,7 @@ import type {
   ExtensionCommandContext,
 } from "@earendil-works/pi-coding-agent";
 import { currentRuntime } from "./runtime";
+import { scopeControlAttention } from "./scope-revision-journal";
 import { invocationGraphIssue, invocationUnknownIssue } from "./invocation-tree";
 import {
   currentWorkOwner,
@@ -50,6 +51,8 @@ export interface ManagementState {
   attention: SessionModeChangedV1["attention"];
   source: "confirmed" | "volatile" | "legacy-compatible";
   record?: SessionModeView;
+  /** Original volatile choice identity; not durable proof or a wire field. */
+  volatileSource?: { sessionId: string; path: string | undefined; leafId: string | null };
 }
 function cachedInvocationIssue(unknownOnly = false): string | undefined {
   const runtime = currentRuntime(),
@@ -128,11 +131,28 @@ function managedOwnerFacts(
     };
   return selected.mode === "supervised" ? { goalPhase: planningPhase() } : {};
 }
+function volatileSource(ctx: ExtensionContext): NonNullable<ManagementState["volatileSource"]> {
+  return {
+    sessionId: ctx.sessionManager.getSessionId(),
+    path: ctx.sessionManager.getSessionFile(),
+    leafId: ctx.sessionManager.getLeafId(),
+  };
+}
 function managementIdentityIssue(
   ctx: ExtensionContext,
   selected: ManagementState,
 ): string | undefined {
-  const sessionId = ctx.sessionManager.getSessionId();
+  const sessionId = ctx.sessionManager.getSessionId(),
+    source = selected.volatileSource;
+  if (
+    selected.source === "volatile" &&
+    source &&
+    (source.sessionId !== sessionId ||
+      source.path !== ctx.sessionManager.getSessionFile() ||
+      (source.leafId !== null &&
+        !ctx.sessionManager.getBranch().some((entry) => entry.id === source.leafId)))
+  )
+    return "Volatile management belongs to another Session or original source";
   if (selected.record && selected.record.data.sessionId !== sessionId)
     return "Selected management record belongs to another Session";
   if (selected.activeWorkOwner && ownerSession(selected.activeWorkOwner) !== sessionId)
@@ -143,7 +163,10 @@ export function captureManagementSnapshot(ctx: ExtensionContext): ManagementSnap
   const runtime = currentRuntime(),
     selected = runtime.management ?? legacyManagement(ctx);
   const controlPending = Boolean(
-    runtime.goal?.pending || runtime.goal?.blocked || hasActiveNativeQuestion(ctx),
+    runtime.goal?.pending ||
+    runtime.goal?.blocked ||
+    hasActiveNativeQuestion(ctx) ||
+    scopeControlAttention(),
   );
   return {
     ...selected,
@@ -298,7 +321,7 @@ function holdInvalidatedTaskOwner(latest: SessionModeView, selected: ManagementS
     attention: [
       attention(
         "source",
-        "Actual board replacement invalidated the selected owner; explicit enable must repair retained-board metadata",
+        "Actual board replacement invalidated the selected owner; explicit tasks-only must repair retained-board metadata",
       ),
     ],
   };
@@ -401,6 +424,8 @@ function nativeControlAttention(ctx: ExtensionContext): SessionModeChangedV1["at
     issues.push(attention("control", "A real task decision remains unanswered"));
   if (hasActiveNativeQuestion(ctx))
     issues.push(attention("control", "A real native question is still open"));
+  const scope = scopeControlAttention();
+  if (scope) issues.push(attention("control", scope));
   const preflight = runtime.preflight;
   if (preflight) {
     const issue = currentPreflightRequestIssue(ctx, preflight);
@@ -556,6 +581,7 @@ export function enterPlanningMode(pi: ExtensionAPI, ctx: ExtensionContext): void
       lastGoal: snapshot.lastGoal,
       attention: [],
       source: "volatile",
+      volatileSource: volatileSource(ctx),
     };
     currentRuntime().enabled = true;
     return;
@@ -585,6 +611,7 @@ export function adoptSupervisedMode(
       lastGoal: snapshot.lastGoal,
       attention: [],
       source: "volatile",
+      volatileSource: volatileSource(ctx),
     };
     currentRuntime().enabled = true;
     return;
@@ -754,6 +781,7 @@ export async function enableTasksMode(
       lastGoal: snapshot.lastGoal,
       attention: [],
       source: "volatile",
+      volatileSource: volatileSource(ctx),
     };
     enableSessionScope(pi);
     runtime.enabled = true;
@@ -769,11 +797,17 @@ export function materializeManagement(pi: ExtensionAPI, ctx: ExtensionContext): 
     !selected ||
     selected.source !== "volatile" ||
     selected.state === "stopping-with-attention" ||
-    selected.mode === "off" ||
     !durableModeSource(ctx)
   )
     return;
   let snapshot = captureManagementSnapshot(ctx);
+  const identityIssue = managementIdentityIssue(ctx, selected);
+  if (identityIssue) throw new Error(identityIssue);
+  if (selected.mode === "off") {
+    // Source materialization is not proof that unrelated Main work is idle.
+    if (ctx.isIdle() && !ctx.hasPendingMessages()) completeModeChange(pi, ctx, snapshot);
+    return;
+  }
   if (selected.mode === "tasks") {
     snapshot = bootstrapTaskBoard(pi, ctx, { ...snapshot, mode: "off" }, true);
     finishTaskBootstrap(pi, ctx, snapshot);
@@ -829,6 +863,7 @@ export async function requestModeChange(
   if (snapshot.mode === "off" && snapshot.state === "active") {
     runtime.management = { ...snapshot };
     runtime.enabled = false;
+    if (snapshot.source === "volatile") materializeManagement(pi, ctx);
     return;
   }
   const current = modeRequestCurrent(ctx, runtime, snapshot),
@@ -892,6 +927,7 @@ function publishVolatileRelease(
     lastGoal: retainedGoal(snapshot, ctx),
     attention: issues,
     source: "volatile",
+    volatileSource: volatileSource(ctx),
     record: undefined,
   };
   runtime.enabled = issues.length > 0;

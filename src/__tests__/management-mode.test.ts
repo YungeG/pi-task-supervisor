@@ -63,7 +63,7 @@ it("enables a new task-only board after detach without reviving the old Supervis
   const previousOwner = structuredClone(f.owner);
   try {
     await f.command("disable");
-    await f.command("enable");
+    await f.command("tasks-only");
     expect(currentRuntime().management?.mode).toBe("tasks");
     const owner = currentWorkOwner(f.ctx.sessionManager.getSessionId());
     expect(owner?.kind).toBe("board");

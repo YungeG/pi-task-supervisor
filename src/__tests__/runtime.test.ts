@@ -4,9 +4,11 @@ import type {
   ToolDefinition,
 } from "@earendil-works/pi-coding-agent";
 import { beforeEach, describe, expect, it, vi } from "vitest";
-import extension from "../index";
+import { registerSupervisorComponents } from "../index";
+import { scopedAPI } from "../runtime";
+import { startSupervisor } from "../supervisor";
 import { resetState } from "../state";
-import { activeBoard, ACTIVATION, BOUNDARY, deferred, getHandler } from "./helpers/lifecycle";
+import { activeBoard, ACTIVATION, BOUNDARY, deferred } from "./helpers/lifecycle";
 import { attachMockJournal, createMockAPI, createMockContext } from "./helpers/mocks";
 
 function instance(id: string) {
@@ -18,17 +20,29 @@ function instance(id: string) {
   attachMockJournal(mock, ctx);
   vi.mocked(ctx.sessionManager.getSessionId).mockReturnValue(id);
   Object.assign(ctx, { model: { provider: "faux", id: "test" } });
-  extension(mock.api);
+  scopedAPI(mock.api, (api) => {
+    registerSupervisorComponents(api);
+    // Explicit host-module state for isolation tests, not a human command/approval.
+    api.on("session_start", (_event, context) => {
+      startSupervisor(api, context, id === "session-a" ? "Goal A" : "Goal B");
+    });
+  });
   const definition = mock.registerCommand.mock.calls[0]?.[1] as {
     handler: (args: string, ctx: ExtensionCommandContext) => Promise<void>;
   };
   return {
     mock,
     ctx,
-    // These are retained legacy instance-isolation scenarios, not scoped first-start.
-    command: (args: string) =>
-      definition.handler(args.replace(/^supervise(?=\s|$)/, "supervise-legacy"), ctx),
-    fire: (name: string, event: unknown = {}) => getHandler(mock, name)(event, ctx),
+    command: (args: string) => definition.handler(args, ctx),
+    async fire(name: string, event: unknown = {}) {
+      let result: unknown;
+      for (const [registered, handler] of mock.on.mock.calls)
+        if (registered === name) {
+          const value = await handler(event, ctx);
+          if (value !== undefined) result = value;
+        }
+      return result as BoundaryResult | undefined;
+    },
   };
 }
 
@@ -41,7 +55,6 @@ describe("extension instance isolation", () => {
     const a = instance("session-a");
     const b = instance("session-b");
     await Promise.all([a.fire("session_start"), b.fire("session_start")]);
-    await Promise.all([a.command("supervise Goal A"), b.command("supervise Goal B")]);
     await a.command("pause separate maintenance");
     await b.command("status");
     expect(b.ctx.ui.notify).toHaveBeenLastCalledWith(
@@ -68,7 +81,6 @@ describe("extension instance isolation", () => {
       },
     });
     await a.fire("session_start");
-    await a.command("supervise Goal A");
     const pending: Promise<BoundaryResult | undefined> = a.fire("agent_before_settle", BOUNDARY);
     await a.command("pause maintenance");
     const outcome = await Promise.race([

@@ -1,3 +1,6 @@
+import { startSupervisor } from "../supervisor";
+import { enableSessionScope } from "../scope";
+import { adoptSupervisedMode } from "../management-policy";
 // P7 adjacency: strict feature/owner admission never upgrades borrowed wire values.
 // Source rows came from owned SDK producers; rebinding copies below is exclusively
 // a NEGATIVE probe. No copy is an actual invocation, execution or permission.
@@ -48,7 +51,9 @@ const kinds = [
 ];
 it.each(kinds)("rejects borrowed %s before persistence without its actual source", async (kind) => {
   const h = preflightLifecycle();
-  await h.command("supervise-legacy Owned feature admission");
+  startSupervisor(h.mock.api, h.ctx, "Owned feature admission");
+  enableSessionScope(h.mock.api);
+  adoptSupervisedMode(h.mock.api, h.ctx);
   const owner = currentWorkOwner(h.ctx.sessionManager.getSessionId()),
     original = facts.get(kind);
   if (!owner || !original) throw Error("Actual owner/owned source unavailable");
@@ -82,7 +87,9 @@ it.each(kinds)(
 );
 it("rejects unsupported acceptance/proposal values before append, never guessing a source grant", async () => {
   const h = preflightLifecycle();
-  await h.command("supervise-legacy Owned unsupported values");
+  startSupervisor(h.mock.api, h.ctx, "Owned unsupported values");
+  enableSessionScope(h.mock.api);
+  adoptSupervisedMode(h.mock.api, h.ctx);
   const before = readFileSync(h.path, "utf8");
   expect(() =>
     appendAcceptanceFact(h.mock.api, h.ctx, { trusted: true } as unknown as AcceptanceFact),

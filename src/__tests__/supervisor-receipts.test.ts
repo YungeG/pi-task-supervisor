@@ -313,7 +313,7 @@ describe("original V2 receipt regressions across V3 integration", () => {
 
   it("keeps ordinary resume on the same journal and preserves its proofs", async () => {
     const h = lifecycle();
-    await h.command("supervise Preserve approved work");
+    startSupervisor(h.mock.api, h.ctx, "Preserve approved work");
     await h.fire("tool_call", { ...event("before-pause"), type: "tool_call" });
     await h.fire("tool_result", event("before-pause"));
     await h.command("pause maintenance");

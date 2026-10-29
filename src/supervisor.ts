@@ -1,4 +1,7 @@
+import { currentScopeState, scopeCaptureReference } from "./scope-revision-journal";
+import { ApprovalReferenceSchema } from "./approval-schema";
 import type { RestoreJournalRead } from "./restore-journal";
+import { requireCurrentEvidenceCapability } from "./execution-capability";
 import {
   acceptanceContractIssue,
   cachedAcceptanceReviewMaterial,
@@ -36,7 +39,7 @@ import {
   observeAdvisorCall,
   advisorUsageFor,
   advisorUsageForCurrent,
-  advisorExtraCalls,
+  advisorBudgetAssessment,
   type AdvisorCall,
 } from "./advisor-calls";
 import { StringEnum, type AssistantMessage, type Usage } from "@earendil-works/pi-ai";
@@ -149,6 +152,7 @@ function supervisorSchema() {
     ),
     preflightBinding: Type.Optional(PreflightBindingSchema),
     acceptedDigest: Type.Optional(text(64)),
+    scopeRevisionRef: Type.Optional(ApprovalReferenceSchema),
     receipts: Type.Array(ReceiptSchema, { maxItems: 500 }),
     receiptGapEpoch: Type.Optional(Type.Integer({ minimum: 0, maximum: Number.MAX_SAFE_INTEGER })),
     bindings: Type.Array(BindingSchema, { maxItems: SUPERVISOR_LIMITS.tasks }),
@@ -856,6 +860,11 @@ export function recoverSupervisor(pi: ExtensionAPI, ctx?: ExtensionContext): voi
   }
   const association = preflightAssociationIssue(ctx);
   if (association) throw Error(association);
+  const scope = currentScopeState(ctx);
+  if (scope.issue) throw Error(scope.issue);
+  const budget = advisorBudgetAssessment(state);
+  if (budget.status !== "available") throw new Error(budget.reason);
+  if (ctx) requireCurrentEvidenceCapability(pi, ctx);
   try {
     const store = receiptRecoveryStore(pi, ctx, state);
     store.promoteV2();
@@ -868,6 +877,12 @@ export function recoverSupervisor(pi: ExtensionAPI, ctx?: ExtensionContext): voi
       holdCause: undefined,
       stagnant: 0,
       pending: false,
+      ...(scope.revision
+        ? {
+            scopeRevisionRef: { entryId: scope.revision.entryId, digest: scope.revision.digest },
+            acceptedDigest: undefined,
+          }
+        : {}),
     };
     saveSupervisor(pi, next);
     currentRuntime().supervisor = next;
@@ -883,7 +898,10 @@ export function recoverSupervisor(pi: ExtensionAPI, ctx?: ExtensionContext): voi
 }
 
 function capturedTool(toolName: string): boolean {
-  return !TASK_TOOL_NAMES.includes(toolName) && toolName !== "submit_preflight";
+  return (
+    !TASK_TOOL_NAMES.includes(toolName) &&
+    !["submit_preflight", "propose_contract", "propose_scope_revision"].includes(toolName)
+  );
 }
 function readOnlyTool(pi: ExtensionAPI, name: string): boolean {
   return (
@@ -921,6 +939,7 @@ export function prepareToolCapture(
         ...(ctx ? finalValidationReviewDigests(ctx, event) : []),
       ],
       readOnlyTool(pi, event.toolName),
+      scopeCaptureReference(ctx),
     );
   } finally {
     syncReceiptState(state);
@@ -1313,18 +1332,14 @@ export function supervisorBudgetAvailable(
   ctx: ExtensionContext,
   state: SupervisorState,
 ): boolean {
-  const owner = currentWorkOwner(ctx.sessionManager.getSessionId());
-  const spentSlots = state.reviews + (owner?.kind === "goal" ? advisorExtraCalls(owner.goal) : 0);
-  if (
-    spentSlots >= SUPERVISOR_LIMITS.reviews ||
-    state.continuations >= SUPERVISOR_LIMITS.continuations
-  ) {
+  const budget = advisorBudgetAssessment(state);
+  if (budget.status !== "available") {
     holdSupervisor(
       pi,
       ctx,
       "paused",
-      "Supervisor call/resume budget exhausted; explicit recovery is required",
-      "budget_exhausted",
+      budget.reason ?? "Supervisor budget cannot be established",
+      budget.status === "exhausted" ? "budget_exhausted" : "unknown",
     );
     return false;
   }
@@ -1763,9 +1778,7 @@ function hostWorkingDecision(
     pending: pendingHostProgress(ctx),
     unknownExecution:
       !batchFacts(board).claimedTaskIds.length && unknownBatchExecution(ctx, board, owner),
-    budgetAvailable:
-      state.reviews + (owner?.kind === "goal" ? advisorExtraCalls(owner.goal) : 0) <
-        SUPERVISOR_LIMITS.reviews && state.continuations < SUPERVISOR_LIMITS.continuations,
+    budgetAvailable: advisorBudgetAssessment(state).status === "available",
     reviewed:
       !!owner &&
       reviewedPlan(owner, board, authorityDigest(state), !ctx.sessionManager.getSessionFile()),

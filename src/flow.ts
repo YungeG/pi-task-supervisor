@@ -4,8 +4,16 @@ import { stripTerminalSequences } from "@earendil-works/pi-tui";
 import { currentRuntime, type TaskRuntime } from "./runtime";
 import type { PreflightState } from "./preflight";
 import { acceptanceLayersFromCache } from "./acceptance-contract";
-import type { AdvisorUsage } from "./advisor-calls";
+import { advisorBudgetAssessment, type AdvisorUsage } from "./advisor-calls";
+import {
+  SUPERVISOR_LIMITS,
+  assessSupervisorBudget,
+  type SupervisorBudgetAssessment,
+} from "./supervisor-budget";
+export { SUPERVISOR_LIMITS } from "./supervisor-budget";
 import type { ManagementState } from "./management-policy";
+import { cachedScopeFlow } from "./scope-revision-journal";
+import { SCOPE_REVISION_FAULT } from "./scope-revision-facts";
 import { cachedProgressSummary } from "./progress-facts";
 import type { FinalReviewStateV1 } from "./final-review";
 import { goalControlIssue } from "./goal-scope";
@@ -18,13 +26,6 @@ import {
 import { executionActivityIssue } from "./control-journal";
 import type { SupervisorState } from "./supervisor";
 import type { TaskBoardSnapshot, AcceptanceLayers } from "./types";
-
-export const SUPERVISOR_LIMITS = {
-  tasks: 100,
-  reviews: 40,
-  continuations: 20,
-  stagnant: 3,
-} as const;
 
 export interface FlowFacts {
   enabled: boolean;
@@ -42,9 +43,11 @@ export interface FlowFacts {
   }>;
   preflightIssue?: string;
   approval?: Readonly<ApprovalAction>;
+  scope?: ReturnType<typeof cachedScopeFlow>;
   activityIssue?: string;
   receiptIssue?: string;
   advisorUsage?: AdvisorUsage;
+  budget?: Readonly<SupervisorBudgetAssessment>;
   finalReview?: Readonly<FinalReviewStateV1>;
   progress?: ReturnType<typeof cachedProgressSummary>;
   acceptance?: Readonly<AcceptanceLayers>;
@@ -162,6 +165,13 @@ export function cachedApprovalAction(sessionId: string): ApprovalAction | undefi
     block !== undefined,
   );
   if (!action || !block) return action;
+  if (block.kind === "capability")
+    return {
+      kind: "materials",
+      actor: "Main",
+      proposalId: state.proposal?.contractProposalId,
+      effect: `上次实际宿主检测没有合格证据通道；Main先核对工具模式与正式检查入口，不重批权限或Start。${block.reason}`,
+    };
   if (block.kind === "materials")
     return {
       kind: "materials",
@@ -179,6 +189,10 @@ export function cachedApprovalAction(sessionId: string): ApprovalAction | undefi
     };
   return action;
 }
+function cachedBudgetFacts(managedGoal: boolean): FlowFacts["budget"] {
+  const state = currentRuntime().supervisor;
+  return managedGoal && state ? advisorBudgetAssessment(state) : undefined;
+}
 export function flowFacts(ctx: ExtensionContext, restoration?: RestoreJournalRead): FlowFacts {
   const runtime = currentRuntime();
   const managedGoal = !runtime.management || runtime.management.activeWorkOwner?.kind === "goal";
@@ -189,8 +203,10 @@ export function flowFacts(ctx: ExtensionContext, restoration?: RestoreJournalRea
     goal: currentGoalFacts(),
     finalReview: cachedFinalReview(ctx),
     management: managementFacts(),
+    budget: cachedBudgetFacts(managedGoal),
     progress: cachedProgressSummary(),
     acceptance: acceptanceLayersFromCache(runtime),
+    scope: cachedScopeFlow(),
     approval: cachedApprovalAction(ctx.sessionManager.getSessionId()),
     activityIssue: managedGoal
       ? executionActivityIssue(ctx.sessionManager.getSessionId())
@@ -228,6 +244,7 @@ export function resumeControlIssue(
   if (facts.journalFault) return "Inspect the journal before recovery";
   if (facts.goalIssue) return facts.goalIssue;
   if (facts.preflightIssue) return facts.preflightIssue;
+  if (facts.scope && !facts.scope.recoveryRequired) return facts.scope.issue;
   if (!facts.idle || facts.pending || board.decision)
     return "Wait for Main and pending messages; resolve any decision before resuming";
   if (
@@ -242,7 +259,7 @@ export function resumeControlIssue(
 
 function controlFault(facts: FlowFacts): string | undefined {
   if (facts.journalFault) return "Inspect the journal before recovery";
-  return facts.goalIssue ?? facts.preflightIssue ?? facts.receiptIssue;
+  return facts.goalIssue ?? facts.scope?.issue ?? facts.preflightIssue ?? facts.receiptIssue;
 }
 
 /** Pure qualification shared by command control and read-only status projection. */
@@ -263,19 +280,21 @@ export function ordinaryResumeIssue(
   if (board.tasks.length > SUPERVISOR_LIMITS.tasks)
     return "Stop and repair the oversized plan before a new goal";
   if (state.holdCause !== "user_pause") return "Inspect the hold before explicit recover";
-  if (
-    state.reviews >= SUPERVISOR_LIMITS.reviews ||
-    state.continuations >= SUPERVISOR_LIMITS.continuations ||
-    state.stagnant >= SUPERVISOR_LIMITS.stagnant
-  )
-    return "Inspect exhausted limits before explicit recover";
+  const budget = facts.budget ?? assessSupervisorBudget(state, 0);
+  if (budget.status !== "available") return budget.reason;
+  if (state.stagnant >= SUPERVISOR_LIMITS.stagnant)
+    return "Inspect the progress hold before explicit recovery";
   return undefined;
 }
 
 function heldNextStep(
   board: Readonly<TaskBoardSnapshot>,
   state: Readonly<SupervisorState>,
+  facts?: FlowFacts,
 ): string {
+  const budget = facts?.budget ?? assessSupervisorBudget(state, 0);
+  if (budget.status !== "available")
+    return budget.reason ?? "Inspect unknown budget; no automatic recovery";
   if (board.workflowStatus === "completed" || board.tasks.length > SUPERVISOR_LIMITS.tasks)
     return "inspect and stop/re-plan; recover cannot reopen this board";
   if (state.status === "stopped") return "prepare a valid board and a new supervise <goal>";
@@ -300,12 +319,13 @@ function decisionNextStep(board: Readonly<TaskBoardSnapshot>, after: string): st
 function decisionGateStep(
   board: Readonly<TaskBoardSnapshot>,
   state: Readonly<SupervisorState> | undefined,
+  facts: FlowFacts,
 ): string {
   if (!board.decision || board.workflowStatus !== "waiting_for_decision")
     return "inspect inconsistent decision gate";
   const after =
     state && ["paused", "fault"].includes(state.status)
-      ? `; then ${heldNextStep(board, state)}`
+      ? `; then ${heldNextStep(board, state, facts)}`
       : "; remaining gates still apply";
   return decisionNextStep(board, after);
 }
@@ -326,6 +346,11 @@ function stoppingManagementNext(
   return `Inspect exact existing writer/capture/control facts and repair metadata only; ${finish}`;
 }
 function journalNext(facts: FlowFacts): string {
+  if (facts.journalFault === SCOPE_REVISION_FAULT)
+    return (
+      facts.scope?.next.replace("review-scope", "repair-scope") ??
+      "Inspect original scope source; no recovery or replay"
+    );
   return facts.journalFault === PREFLIGHT_ASSOCIATION_FAULT &&
     facts.idle &&
     !facts.pending &&
@@ -333,6 +358,16 @@ function journalNext(facts: FlowFacts): string {
     !facts.activityIssue
     ? "user: /task-supervisor repair-preflight — 只精确修复已确认定义的关联；不重批、不 Start、不派发，原暂停与预算保留"
     : "inspect journal; control recovery is disabled";
+}
+function inactiveManagementNext(facts: FlowFacts): string | undefined {
+  if (facts.management?.mode === "off")
+    return "Unmanaged: ordinary host-authorized work needs no task management; explicitly choose a management mode only if wanted";
+  return facts.enabled
+    ? undefined
+    : "/task-supervisor tasks-only (task board only), then recheck status";
+}
+function scopeNext(facts: FlowFacts): string | undefined {
+  return facts.scope ? (facts.activityIssue ?? facts.receiptIssue ?? facts.scope.next) : undefined;
 }
 function flowBlocker(
   board: Readonly<TaskBoardSnapshot>,
@@ -345,14 +380,15 @@ function flowBlocker(
   if (planning) return planning;
   if (facts.journalFault) return journalNext(facts);
   if (facts.goalIssue) return `inspect goal lifecycle: ${facts.goalIssue}`;
-  if (!facts.enabled) return "/task-supervisor enable (tools only), then recheck status";
+  const inactive = inactiveManagementNext(facts);
+  if (inactive) return inactive;
   if (state && state.sessionId !== facts.sessionId) return "inspect foreign supervisor identity";
-  const approval = approvalNext(board, state, facts);
+  const approval = scopeNext(facts) ?? approvalNext(board, state, facts);
   if (approval) return approval;
   const preflight = preflightControlBlocker(facts);
   if (preflight) return preflight;
   if (board.decision || board.workflowStatus === "waiting_for_decision") {
-    return decisionGateStep(board, state);
+    return decisionGateStep(board, state, facts);
   }
   if (!facts.idle || facts.pending)
     return "wait for the current host run/check and pending messages";
@@ -392,7 +428,7 @@ function unstartedGoalNext(
     return "/task-supervisor start (separate native first-start; approval alone does not execute)";
   if (goal.hasProposal)
     return "/task-supervisor approve (current native permission request; not chat approval)";
-  return "/task-supervisor preflight (explicit same-GoalRun read-only replan), or /task-supervisor stop (end this unstarted goal)";
+  return "/task-supervisor supervise --replan (same unstarted Goal, read-only), or /task-supervisor stop (end this unstarted goal)";
 }
 
 function approvalControlNext(
@@ -401,7 +437,7 @@ function approvalControlNext(
   facts: FlowFacts,
 ): string | undefined {
   if (board.decision || board.workflowStatus === "waiting_for_decision")
-    return decisionGateStep(board, state);
+    return decisionGateStep(board, state, facts);
   if (facts.activityIssue || facts.receiptIssue)
     return `先检查未闭合/未知执行：${facts.activityIssue ?? facts.receiptIssue}；不得自动重派或补授权`;
   if (!facts.idle || facts.pending || state?.pending)
@@ -412,6 +448,7 @@ function preparationNext(
   board: Readonly<TaskBoardSnapshot>,
   state: Readonly<SupervisorState> | undefined,
   action: Readonly<ApprovalAction>,
+  facts: FlowFacts,
 ): string | undefined {
   if (
     state?.status === "paused" &&
@@ -420,7 +457,7 @@ function preparationNext(
   )
     return `user: ${action.laterCommand} — 检查准备是否就绪，仅审核具体定义；既有暂停不变，其他门仍有效`;
   if (state?.status === "fault")
-    return `${heldNextStep(board, state)}；仅回到已批准备，不跳过定义审核`;
+    return `${heldNextStep(board, state, facts)}；仅回到已批准备，不跳过定义审核`;
   return undefined;
 }
 function approvalNext(
@@ -439,7 +476,7 @@ function approvalNext(
   const blocker = approvalControlNext(board, state, facts);
   if (blocker) return blocker;
   if (action.kind === "preparing") {
-    const preparing = preparationNext(board, state, action);
+    const preparing = preparationNext(board, state, action, facts);
     if (preparing) return preparing;
   }
   return `${action.actor}: ${action.command ? action.command + " — " : ""}${action.effect}${action.laterCommand ? ` 完成准备后：${action.laterCommand}` : ""}`;
@@ -482,12 +519,12 @@ export function nextFlowStep(
     if (!state) return "/task-supervisor resume (board-only)";
     if (!ordinaryResumeIssue(board, state, facts))
       return "/task-supervisor resume (ordinary pause; limits unchanged)";
-    return `/task-supervisor resume (board only); then ${heldNextStep(board, state)}`;
+    return `/task-supervisor resume (board only); then ${heldNextStep(board, state, facts)}`;
   }
   switch (state?.status) {
     case "paused":
     case "fault":
-      return heldNextStep(board, state);
+      return heldNextStep(board, state, facts);
     case "stopped":
       return "prepare a valid board, then /task-supervisor supervise <goal>";
     case "completed":
@@ -531,8 +568,10 @@ function advisorStatusLines(usage: AdvisorUsage | undefined): string[] {
 function supervisorBudgetLine(
   state: Readonly<SupervisorState>,
   usage: AdvisorUsage | undefined,
+  budget: FlowFacts["budget"],
 ): string {
-  return `Budget: reviews ${state.reviews}/${SUPERVISOR_LIMITS.reviews}; auto continuations ${state.continuations}/${SUPERVISOR_LIMITS.continuations}; stagnant ${state.stagnant}/${SUPERVISOR_LIMITS.stagnant}; advisor known tokens ${usage?.knownTokens ?? state.tokens}; known cost ${usage?.knownCost ?? state.cost}`;
+  const spent = budget ? (budget.spentReviews ?? "unknown") : state.reviews;
+  return `Budget: reviews ${spent}/${SUPERVISOR_LIMITS.reviews}; auto continuations ${state.continuations}/${SUPERVISOR_LIMITS.continuations}; stagnant ${state.stagnant}/${SUPERVISOR_LIMITS.stagnant}; advisor known tokens ${usage?.knownTokens ?? state.tokens}; known cost ${usage?.knownCost ?? state.cost}`;
 }
 function finalReviewStatusLines(
   board: Readonly<TaskBoardSnapshot>,
@@ -576,7 +615,7 @@ function supervisorStatusLines(
   return [
     `Supervisor: ${state.status}${state.reason ? ` — ${state.reason}` : ""}`,
     `Hold source: ${state.holdCause ?? "unknown"}`,
-    supervisorBudgetLine(state, facts.advisorUsage),
+    supervisorBudgetLine(state, facts.advisorUsage, facts.budget),
     ...advisorStatusLines(facts.advisorUsage),
   ];
 }
@@ -599,7 +638,9 @@ export function formatFlowStatus(
     `Goal: ${state?.goal ?? "no supervised goal"}`,
     `Main: ${facts.idle ? "idle" : "host run busy (execution/settling)"}${facts.pending ? "; pending messages" : ""}`,
     claimedBatchLine(claimed, facts),
-    "Next checkpoint: native end-of-run; batch guidance only",
+    facts.management?.mode === "off"
+      ? "Next checkpoint: none; unmanaged work"
+      : "Next checkpoint: native end-of-run; batch guidance only",
   ];
   lines.push(...supervisorStatusLines(state, facts));
   lines.push(...acceptanceStatusLines(facts.acceptance));
@@ -611,6 +652,7 @@ export function formatFlowStatus(
   lines.push(...receiptStatusLines());
   lines.push(`External wait: ${externalWaitText(state)}`);
   if (facts.journalFault) lines.push(`Fault: ${facts.journalFault}`);
+  if (facts.scope) lines.push(`Scope: ${facts.scope.issue}`);
   lines.push(...evidenceBlockerStatus(facts));
   if (board.pauseReason) lines.push(`Paused: ${board.pauseReason}`);
   if (board.decision) lines.push(`Decision ${board.decision.id}: ${board.decision.question}`);

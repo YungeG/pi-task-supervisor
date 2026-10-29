@@ -93,7 +93,7 @@ try {
   const before = hash(path);
   const count = manager.getBranch().length;
   await command.handler("supervise Ordinary SDK cannot archive a new goal", ctx);
-  await command.handler("preflight Ordinary SDK cannot archive a new goal", ctx);
+  await command.handler("supervise Ordinary SDK cannot archive a new goal", ctx);
   assert.equal(uiCalls, 0);
   assert.equal(hash(path), before);
   assert.equal(manager.getBranch().length, count);

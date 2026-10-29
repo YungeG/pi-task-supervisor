@@ -1,4 +1,5 @@
 import { randomUUID } from "node:crypto";
+import { ProposeScopeRevisionParams } from "./scope-revision-schema";
 import { ProposeContractParams } from "./acceptance-proposal";
 import type {
   ExtensionAPI,
@@ -41,7 +42,8 @@ import {
   type InvocationNodeV1,
   type InvocationReference,
   type InvocationEndedV1,
-  type InvocationRootSealedV1,
+  type InvocationRootSeal,
+  directInvocationIssue,
   type InvocationRootIndex,
 } from "./invocation-tree";
 import type { HostReceipt } from "./receipt-store";
@@ -87,6 +89,7 @@ const metadataSchemas = new Map<string, unknown>([
   ["advance_tasks", AdvanceTasksParams],
   ["workflow_gate", WorkflowGateParams],
   ["propose_contract", ProposeContractParams],
+  ["propose_scope_revision", ProposeScopeRevisionParams],
 ]);
 function invocationRuntime(): InvocationRuntime {
   return (currentRuntime().invocation ??= {
@@ -108,14 +111,22 @@ function appendInvocation(
   ctx: ExtensionContext,
   data: InvocationFact,
 ): InvocationReference {
-  if (!currentRuntime().controlJournal?.latestFence?.data.features.includes("invocation-tree-v1")) {
+  const required =
+    data.kind === "invocation-root-sealed" && data.version === 2
+      ? (["invocation-tree-v1", "invocation-direct-v1"] as const)
+      : (["invocation-tree-v1"] as const);
+  if (
+    !required.every((feature) =>
+      currentRuntime().controlJournal?.latestFence?.data.features.includes(feature),
+    )
+  ) {
     const view = readControlJournal(ctx);
     currentRuntime().controlJournal = view;
-    if (!view.latestFence?.data.features.includes("invocation-tree-v1"))
+    if (!required.every((feature) => view.latestFence?.data.features.includes(feature)))
       appendControlFence(
         pi,
         ctx,
-        [...new Set([...(view.latestFence?.data.features ?? []), "invocation-tree-v1" as const])],
+        [...new Set([...(view.latestFence?.data.features ?? []), ...required])],
         captureControlLease(ctx),
       );
   }
@@ -253,6 +264,17 @@ function resultEffects(
   graph: InvocationGraph,
 ): string[] {
   if (node.parentId !== null) return [];
+  if (node.toolName === "codemode") return containerResultEffects(ctx, event, node, graph);
+  return [...graph.nodes.values()].some((child) => child.parentId === node.operationId)
+    ? ["Direct SDK tool has unexplained descendants"]
+    : [];
+}
+function containerResultEffects(
+  ctx: ExtensionContext,
+  event: ToolResultEvent,
+  node: InvocationNodeV1,
+  graph: InvocationGraph,
+): string[] {
   const reasons: string[] = [];
   if (!node.capability) reasons.push("Container source or models API capability is unqualified");
   if (event.content.some((block) => block.type === "image"))
@@ -425,10 +447,10 @@ function rootSealFact(
   messageRef: InvocationReference,
   version: ReviewVersionV1 | undefined,
   reason: string | undefined,
-): InvocationRootSealedV1 {
-  return {
-    version: 1,
-    kind: "invocation-root-sealed",
+  direct: boolean,
+): InvocationRootSeal {
+  const common = {
+    kind: "invocation-root-sealed" as const,
     recordId: randomUUID(),
     owner: frame.owner,
     rootId,
@@ -439,9 +461,15 @@ function rootSealFact(
     historyDigest: index.digest,
     epoch: currentRuntime().receiptStore?.epoch ?? 0,
     artifactVersion: version ?? null,
-    outcome: reason ? "held" : "qualified",
-    reason: reason ?? "Actual SDK root and children kernel-ended with qualified tool-only effects",
+    reason:
+      reason ??
+      (direct
+        ? "Actual direct SDK tool kernel-ended; validation still requires its original receipt"
+        : "Actual SDK root and children kernel-ended with qualified tool-only effects"),
   };
+  return direct
+    ? { ...common, version: 2, rootKind: "direct", outcome: reason ? "held" : "observed" }
+    : { ...common, version: 1, outcome: reason ? "held" : "qualified" };
 }
 function sealOneManagedRoot(
   pi: ExtensionAPI,
@@ -461,9 +489,11 @@ function sealOneManagedRoot(
   );
   if (!message) return;
   const version = currentReviewArtifactVersion(ctx),
-    reason =
-      invocationSealIssue(graph, rootId) ??
-      (!version ? "Managed artifact scope/version is unknown" : undefined);
+    direct = root.toolName !== "codemode",
+    reason = direct
+      ? directInvocationIssue(graph, rootId)
+      : (invocationSealIssue(graph, rootId) ??
+        (!version ? "Managed artifact scope/version is unknown" : undefined));
   appendInvocation(
     pi,
     ctx,
@@ -475,6 +505,7 @@ function sealOneManagedRoot(
       { entryId: message.id, digest: message.digest },
       version,
       reason,
+      direct,
     ),
   );
 }

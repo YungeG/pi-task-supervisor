@@ -2,7 +2,39 @@ import type { ExtensionAPI, ToolDefinition } from "@earendil-works/pi-coding-age
 import { Type } from "typebox";
 import { executeRegisteredCheck, proposeAcceptanceContract } from "./acceptance-runtime";
 import { ProposeContractParams } from "./acceptance-proposal";
+import { RunCheckParams } from "./check-tool-schema";
+export { RunCheckParams } from "./check-tool-schema";
 export { ProposeContractParams } from "./acceptance-proposal";
+import { ProposeScopeRevisionParams } from "./scope-revision-schema";
+import { proposeScopeRevision } from "./scope-revision";
+export function createProposeScopeRevisionTool(
+  pi: ExtensionAPI,
+): ToolDefinition<typeof ProposeScopeRevisionParams> {
+  return {
+    name: "propose_scope_revision",
+    label: "Propose Same-Goal Scope Revision",
+    parameters: ProposeScopeRevisionParams,
+    description:
+      "Submit complete untrusted same-Goal scope/acceptance amendment metadata for the held, already started Goal. Existing permission objects, workspace, owner, first Start and budgets cannot expand/reset. Only native review-scope can commit exact material; explicit recover and fresh evidence remain separate. No execution or authority from this proposal.",
+    execute(_id, params, _signal, _update, ctx) {
+      try {
+        const result = proposeScopeRevision(pi, ctx, params);
+        return Promise.resolve({
+          content: [{ type: "text" as const, text: JSON.stringify(result) }],
+          details: result,
+          structuredContent: result,
+        });
+      } catch (error) {
+        const message = error instanceof Error ? error.message : "Scope proposal failed";
+        return Promise.resolve({
+          content: [{ type: "text" as const, text: message }],
+          details: { error: true },
+          isError: true,
+        });
+      }
+    },
+  };
+}
 export function createProposeContractTool(
   pi: ExtensionAPI,
 ): ToolDefinition<typeof ProposeContractParams> {
@@ -35,10 +67,6 @@ export function createProposeContractTool(
     },
   };
 }
-export const RunCheckParams = Type.Object(
-  { checkId: Type.String({ minLength: 1, maxLength: 100 }) },
-  { additionalProperties: false },
-);
 const Output = Type.Object({
   id: Type.String(),
   runId: Type.String(),

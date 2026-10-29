@@ -1,3 +1,6 @@
+import { enterPlanningMode } from "../management-policy";
+import { enableSessionScope } from "../scope";
+import { beginPreflight } from "../preflight";
 // C2 approved normal planning -> independent permission/start -> native contract
 // review -> first compilation. Owned physical adapter + public component simulation,
 // not actual person/product/CLI acceptance or a new permission grant.
@@ -488,7 +491,9 @@ async function plannedFixture() {
     join(root, "checker.mjs"),
     "import assert from 'node:assert/strict';import{readFileSync}from'node:fs';assert.equal(readFileSync(new URL('./input.txt',import.meta.url),'utf8'),'owned');console.log(JSON.stringify({protocol:'check-result-v1',tests:1,passed:1,failed:0,skipped:0,requiredCases:{input:'passed'},skippedIds:[]}));\n",
   );
-  await h.command("preflight Owned planned contract");
+  beginPreflight(h.mock.api, h.ctx, "Owned planned contract");
+  enableSessionScope(h.mock.api);
+  enterPlanningMode(h.mock.api, h.ctx);
   const proposal = {
     version: 1 as const,
     scopeId: "planned",

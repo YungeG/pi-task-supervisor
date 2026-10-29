@@ -1,3 +1,5 @@
+import { enterPlanningMode } from "../management-policy";
+import { enableSessionScope } from "../scope";
 import { installCustomUI } from "./helpers/custom-ui";
 import { visibleWidth } from "@earendil-works/pi-tui";
 import { afterEach, beforeEach, expect, it, vi } from "vitest";
@@ -385,7 +387,9 @@ it("retains the confirmed start response when S persistence fails without retryi
 it("retains Supervisor counters in a read-only hold when preflight restoration throws", async () => {
   const { preflightLifecycle } = await import("./helpers/preflight");
   const h = preflightLifecycle();
-  await h.command("preflight Local fixture");
+  beginPreflight(h.mock.api, h.ctx, "Local fixture");
+  enableSessionScope(h.mock.api);
+  enterPlanningMode(h.mock.api, h.ctx);
   vi.mocked(h.ctx.ui.select).mockResolvedValue("允许上述范围");
   await createSubmitPreflightTool(h.mock.api).execute(
     "submit",
@@ -442,7 +446,9 @@ it("retains Supervisor counters in a read-only hold when preflight restoration t
 it("shows one concise permission notification and keeps technical status explicitly available", async () => {
   const { preflightLifecycle } = await import("./helpers/preflight");
   const h = preflightLifecycle();
-  await h.command("preflight Local fixture");
+  beginPreflight(h.mock.api, h.ctx, "Local fixture");
+  enableSessionScope(h.mock.api);
+  enterPlanningMode(h.mock.api, h.ctx);
   vi.mocked(h.ctx.ui.select).mockResolvedValue("稍后决定");
   await createSubmitPreflightTool(h.mock.api).execute(
     "submit",
@@ -466,7 +472,9 @@ it("shows one concise permission notification and keeps technical status explici
 it("native no-ID first start confirms separately and dispatches once", async () => {
   const { preflightLifecycle } = await import("./helpers/preflight");
   const h = preflightLifecycle();
-  await h.command("preflight Local fixture");
+  beginPreflight(h.mock.api, h.ctx, "Local fixture");
+  enableSessionScope(h.mock.api);
+  enterPlanningMode(h.mock.api, h.ctx);
   vi.mocked(h.ctx.ui.select).mockResolvedValue("允许上述范围");
   const outcome = await createSubmitPreflightTool(h.mock.api).execute(
     "submit",

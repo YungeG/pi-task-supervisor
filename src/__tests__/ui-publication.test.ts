@@ -472,7 +472,7 @@ describe("resident UI publication", () => {
     expect(getBoard().workflowStatus).toBe("paused");
     expect(currentRuntime().supervisor?.status).toBe("stopped");
     expect(supervisorState()).toBeUndefined();
-    await h.command("enable");
+    await h.command("tasks-only");
     expect(currentRuntime().management?.mode).toBe("tasks");
     expect(getBoard().tasks).toHaveLength(0);
     // UI-only new-board shape, not evidence or a revived permission grant.
@@ -706,7 +706,7 @@ describe("resident UI publication", () => {
 
   it("publishes restored owner facts, never the transient pre-recovery view", async () => {
     const h = lifecycle();
-    await h.command("supervise Restored goal");
+    startSupervisor(h.mock.api, h.ctx, "Restored goal");
     const captured = vi.spyOn(capture, "captureUiSummary");
     currentRuntime().supervisor = undefined;
     await h.fire("session_tree");

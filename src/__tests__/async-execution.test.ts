@@ -4,7 +4,7 @@ import { registerCommands } from "../commands";
 import { DEFAULT_CONFIG } from "../config";
 import { setSessionScopeEnabled } from "../scope";
 import { getBoard, resetState, setBoard } from "../state";
-import { supervisorState, type Advisor } from "../supervisor";
+import { startSupervisor, supervisorState, type Advisor } from "../supervisor";
 import { activeBoard, ACTIVATION, BOUNDARY, deferred, getHandler } from "./helpers/lifecycle";
 import { attachMockJournal, createMockAPI, createMockContext } from "./helpers/mocks";
 
@@ -102,14 +102,14 @@ function fixture() {
     requests,
     statusRequested: statusRequested.promise,
     reply: () => delayedReply?.(),
-    start: async () => {
+    start: () => {
       const board = activeBoard();
       board.tasks[0]!.status = "implementing";
       board.tasks[0]!.executionRef = { source: "pi-subagents", runId: "run-1" };
       setBoard(board);
-      // Exercise the explicit legacy execution-wait adapter; fresh supervise now plans.
-      await command.handler("supervise-legacy Finish authorized work", ctx);
-      return board;
+      // Trusted-host execution-wait module setup, not a human command or first Start.
+      startSupervisor(mock.api, ctx, "Finish authorized work");
+      return Promise.resolve(board);
     },
     command: (args: string) => command.handler(args, ctx),
     fire: (name: string, value: unknown = {}) => getHandler(mock, name)(value, ctx),

@@ -3,7 +3,13 @@ import { beforeEach, describe, expect, it, vi } from "vitest";
 import * as acceptanceRuntime from "../acceptance-runtime";
 import { setSessionScopeEnabled } from "../scope";
 import { getBoard, resetState, setBoard } from "../state";
-import { supervisorState, SUPERVISOR_ENTRY, prepareToolCapture, type Advice } from "../supervisor";
+import {
+  startSupervisor,
+  supervisorState,
+  SUPERVISOR_ENTRY,
+  prepareToolCapture,
+  type Advice,
+} from "../supervisor";
 import { createAdvanceTasksTool } from "../tools";
 import type { CompletionEvidence } from "../types";
 import { activeBoard, ACTIVATION, BOUNDARY, getHandler, lifecycle } from "./helpers/lifecycle";
@@ -42,7 +48,7 @@ function event(id = "validation", toolName = "bash"): ToolResultEvent {
 async function ready(advice: Advice = accept) {
   const h = lifecycle(async () => ({ advice }));
   setBoard(single());
-  await h.command("supervise Complete and verify approved work");
+  startSupervisor(h.mock.api, h.ctx, "Complete and verify approved work");
   await h.fire("tool_result", event());
   const result = await createAdvanceTasksTool(h.mock.api).execute(
     "done",
@@ -235,7 +241,7 @@ describe("complete acceptance, not a percentage heuristic", () => {
   it("preserves real receipts through compaction and an interrupted restart", async () => {
     const h = lifecycle(async () => ({ advice: { ...accept, action: "guide" } }));
     setBoard(single());
-    await h.command("supervise Complete approved work");
+    startSupervisor(h.mock.api, h.ctx, "Complete approved work");
     await h.fire("tool_result", event());
     await h.fire("session_before_compact");
     const ctx = createMockContext([

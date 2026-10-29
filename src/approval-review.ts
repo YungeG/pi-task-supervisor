@@ -38,6 +38,7 @@ export class ApprovalReview implements Component {
   private layout?: { lines: string[]; capacity: number; pages: number };
   private message = "浏览与选择都是草稿，不产生批准。";
   private readonly definition: boolean;
+  private readonly scopeRevision: boolean;
 
   constructor(
     private readonly question: NativeQuestion,
@@ -45,6 +46,7 @@ export class ApprovalReview implements Component {
     private readonly done: (value: ApprovalSelection | undefined) => void,
   ) {
     this.definition = question.purpose === "contract-definition";
+    this.scopeRevision = question.purpose === "scope-revision";
     if (this.definition) this.message = "查看材料不会绑定，也不会新增权限或执行。";
     for (const id of question.approval?.selectedIds ?? []) this.selected.add(id);
   }
@@ -73,6 +75,8 @@ export class ApprovalReview implements Component {
     return !!this.layout && this.shown.size === this.layout.pages;
   }
   private choices(width: number): string[] {
+    if (this.scopeRevision)
+      return [materialLine("仅提交所示范围修订；保留原 Goal/权限对象/Start/暂停/账本。", width)];
     if (this.definition)
       return [materialLine("只保存定义关联；原权限、Start 与暂停保持不变。", width)];
     const options = this.options();
@@ -85,6 +89,17 @@ export class ApprovalReview implements Component {
     });
   }
   private labels() {
+    if (this.scopeRevision)
+      return {
+        heading: "范围修订审核 · 同一 Goal · 仍暂停",
+        choices: "本次操作的影响（不新增权限对象）",
+        incomplete: "材料未完整核对，不会提交修订",
+        suffix: "提交不是恢复或验收通过",
+        actions: "Enter 批准本版修订 | r 拒绝本版 | Esc 稍后",
+        help: "PgUp/PgDn 阅读 · 只提交所示修订，不另行 Start",
+        unread: "请先用 PgDn 完整查看修订材料；本次没有提交。",
+        ready: "材料已完整展示；Enter 才保存修订，仍不会执行。",
+      };
     if (this.definition)
       return {
         heading: "契约定义审核 · 不新增权限或执行",

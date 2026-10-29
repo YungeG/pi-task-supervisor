@@ -1,7 +1,9 @@
+import { enterPlanningMode } from "../management-policy";
+import { beginPreflight } from "../preflight";
 import { preflightNotice } from "../human-presentation";
 import { beforeEach, describe, expect, it, vi } from "vitest";
 import { resetState, getBoard } from "../state";
-import { setSessionScopeEnabled } from "../scope";
+import { enableSessionScope, setSessionScopeEnabled } from "../scope";
 import { supervisorState } from "../supervisor";
 import { createSubmitPreflightTool } from "../tools";
 import { preflightLifecycle, localProposal } from "./helpers/preflight";
@@ -23,7 +25,7 @@ describe("opt-in human preflight commands", () => {
 
   it("starts only read-only planning, not supervision or an execution board", async () => {
     const h = preflightLifecycle();
-    await h.command("preflight Implement the local fixture");
+    await h.command("supervise Implement the local fixture");
     await h.command("status");
     expect(h.ctx.ui.notify).toHaveBeenLastCalledWith(
       expect.stringContaining("Preflight: planning"),
@@ -44,7 +46,9 @@ describe("opt-in human preflight commands", () => {
 
   it("records a model proposal without accepting model-supplied approval", async () => {
     const h = preflightLifecycle();
-    await h.command("preflight Implement the local fixture");
+    beginPreflight(h.mock.api, h.ctx, "Implement the local fixture");
+    enableSessionScope(h.mock.api);
+    enterPlanningMode(h.mock.api, h.ctx);
     const planning = latest(h);
     const tool = createSubmitPreflightTool(h.mock.api);
     const forged = await tool.execute(
@@ -73,7 +77,9 @@ describe("opt-in human preflight commands", () => {
 
   it("keeps partial user approval blocked and never starts from approve itself", async () => {
     const h = preflightLifecycle();
-    await h.command("preflight Implement the local fixture");
+    beginPreflight(h.mock.api, h.ctx, "Implement the local fixture");
+    enableSessionScope(h.mock.api);
+    enterPlanningMode(h.mock.api, h.ctx);
     await createSubmitPreflightTool(h.mock.api).execute(
       "submit",
       { preflightId: latest(h).preflightId, proposal: localProposal },
@@ -104,7 +110,9 @@ describe("opt-in human preflight commands", () => {
 
   it("accepts no-ID native start but rejects prefix-only start IDs", async () => {
     const h = preflightLifecycle();
-    await h.command("preflight Implement the local fixture");
+    beginPreflight(h.mock.api, h.ctx, "Implement the local fixture");
+    enableSessionScope(h.mock.api);
+    enterPlanningMode(h.mock.api, h.ctx);
     await createSubmitPreflightTool(h.mock.api).execute(
       "submit",
       { preflightId: latest(h).preflightId, proposal: localProposal },
@@ -125,7 +133,9 @@ describe("opt-in human preflight commands", () => {
   it("requires exact trusted approval and a separate start before binding supervision", async () => {
     const h = preflightLifecycle();
     const goal = "Implement the local fixture";
-    await h.command(`preflight ${goal}`);
+    beginPreflight(h.mock.api, h.ctx, goal);
+    enableSessionScope(h.mock.api);
+    enterPlanningMode(h.mock.api, h.ctx);
     await createSubmitPreflightTool(h.mock.api).execute(
       "submit",
       { preflightId: latest(h).preflightId, proposal: localProposal },
@@ -162,7 +172,9 @@ it.each(["tui", "rpc", "print"] as const)(
     resetState();
     setSessionScopeEnabled(false);
     const h = preflightLifecycle();
-    await h.command("preflight Local fixture");
+    beginPreflight(h.mock.api, h.ctx, "Local fixture");
+    enableSessionScope(h.mock.api);
+    enterPlanningMode(h.mock.api, h.ctx);
     await createSubmitPreflightTool(h.mock.api).execute(
       "submit",
       {

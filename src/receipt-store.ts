@@ -14,6 +14,10 @@ const text = (maxLength: number) => Type.String({ minLength: 1, maxLength });
 const natural = Type.Integer({ minimum: 0, maximum: Number.MAX_SAFE_INTEGER });
 const nullableId = Type.Union([text(300), Type.Null()]);
 const ReviewSchema = Type.Object({ taskId: text(100), digest: text(64) });
+const ScopeRevisionRefSchema = Type.Object(
+  { entryId: text(200), digest: Type.String({ pattern: "^[a-f0-9]{64}$" }) },
+  { additionalProperties: false },
+);
 export const ReceiptSchema = Type.Object({
   id: text(300),
   tool: text(200),
@@ -26,6 +30,7 @@ export const ReceiptSchema = Type.Object({
   input: text(2000),
   output: text(2000),
   eligible: Type.Optional(Type.Boolean()),
+  scopeRevisionRef: Type.Optional(ScopeRevisionRefSchema),
 });
 export type HostReceipt = Static<typeof ReceiptSchema>;
 const CaptureSchema = Type.Object({
@@ -35,6 +40,7 @@ const CaptureSchema = Type.Object({
   reviews: Type.Array(ReviewSchema, { maxItems: 100 }),
   overlap: Type.Boolean(),
   readOnly: Type.Boolean(),
+  scopeRevisionRef: Type.Optional(ScopeRevisionRefSchema),
 });
 type Capture = Static<typeof CaptureSchema>;
 export const ReceiptLedgerSchema = Type.Object({
@@ -325,7 +331,8 @@ export class ReceiptStore {
       receipt.epoch === c.epoch &&
       !this.index.has(c.id) &&
       !this.closed.has(c.id) &&
-      digest(receipt.reviews) === digest(c.reviews)
+      digest(receipt.reviews) === digest(c.reviews) &&
+      digest(receipt.scopeRevisionRef ?? null) === digest(c.scopeRevisionRef ?? null)
     );
   }
   private intentMatches(c: Capture): boolean {
@@ -375,6 +382,7 @@ export class ReceiptStore {
     event: ToolCallEvent,
     reviews: HostReceipt["reviews"],
     readOnly: boolean,
+    scopeRevisionRef?: Static<typeof ScopeRevisionRefSchema>,
   ): void {
     this.syncBranch();
     const id = `tool:${event.toolCallId}`;
@@ -390,6 +398,7 @@ export class ReceiptStore {
       reviews: structuredClone(reviews),
       overlap: this.pending.size > 0,
       readOnly,
+      ...(scopeRevisionRef ? { scopeRevisionRef: structuredClone(scopeRevisionRef) } : {}),
     };
     if (!readOnly)
       this.append({ ...this.base(capture.epoch), kind: "intent", capture } as Omit<
@@ -444,6 +453,9 @@ export class ReceiptStore {
       input: redactedJSON(event.input).slice(0, 2000),
       output: redact(event.content.flatMap((c) => (c.type === "text" ? [c.text] : [])).join("\n")),
       eligible,
+      ...(capture.scopeRevisionRef
+        ? { scopeRevisionRef: structuredClone(capture.scopeRevisionRef) }
+        : {}),
     };
     if (!Check(ReceiptSchema, receipt)) return this.fail("Invalid bounded host receipt");
     const epoch =

@@ -14,6 +14,16 @@ import { readGoalJournal } from "./goal-journal";
 import { invalidateGoalCallbacks } from "./goal-scope";
 
 const normalize = (value: string) => value.trim().split(/\s+/).join(" ");
+export function parseSuperviseArgs(text: string): { goal: string; replan: boolean } {
+  const input = normalize(text);
+  if (input === "--" || input.startsWith("-- "))
+    return { goal: input.slice(2).trim(), replan: false };
+  const replan = input === "--replan" || input.startsWith("--replan ");
+  const goal = replan ? input.slice(8).trim() : input;
+  if (goal === "--" || goal.startsWith("-- ")) return { goal: goal.slice(2).trim(), replan };
+  if (goal.startsWith("--")) throw Error("Unknown supervise flag; use -- before literal goal text");
+  return { goal, replan };
+}
 function notify(ctx: ExtensionCommandContext, text: string, error = false): void {
   if (ctx.hasUI) ctx.ui.notify(text, error ? "error" : "info");
 }
@@ -36,7 +46,7 @@ export function goalStatusText(): string | undefined {
     lines.push(
       current.phase === "stopped"
         ? "Goal stopped before execution; a new supervise <goal> can archive it"
-        : "Explicit /task-supervisor preflight replans this same goal; /task-supervisor stop ends it. No business execution before separate approval/start.",
+        : "Explicit /task-supervisor supervise --replan replans this same goal; /task-supervisor stop ends it. No business execution before separate approval/start.",
     );
   return lines.join("\n");
 }
@@ -70,7 +80,7 @@ function reconcileTransitionCache(pi: ExtensionAPI, ctx: ExtensionCommandContext
 async function routeSameGoal(
   pi: ExtensionAPI,
   ctx: ExtensionCommandContext,
-  action: "supervise" | "preflight",
+  replan: boolean,
   goal: string,
 ): Promise<boolean> {
   const current = currentRuntime().goal?.current;
@@ -80,7 +90,7 @@ async function routeSameGoal(
     ["stopped", "completed"].includes(current.phase)
   )
     return false;
-  if (action === "preflight") {
+  if (replan) {
     const result = await replanCurrentGoal(pi, ctx);
     if (result.status === "planning-ready" && result.planning) {
       prepareTools(pi, ctx);
@@ -93,17 +103,30 @@ async function routeSameGoal(
 async function routeGoalInput(
   pi: ExtensionAPI,
   ctx: ExtensionCommandContext,
-  action: "supervise" | "preflight",
   text: string,
+  replan: boolean,
 ): Promise<void> {
   reconcileTransitionCache(pi, ctx);
-  if (await routeSameGoal(pi, ctx, action, normalize(text))) return;
+  if (replan) {
+    const current = currentRuntime().goal?.current;
+    if (!current || (text && normalize(text) !== current.seed.goal))
+      throw Error(
+        "--replan requires the same current unstarted Goal; it cannot create another target",
+      );
+    if (current.supervisor !== null)
+      throw Error(
+        "Started Goal: use propose_scope_revision and native review-scope, not replan or another Start",
+      );
+  }
+  if (await routeSameGoal(pi, ctx, replan, normalize(text))) return;
+  if (replan)
+    throw Error("A closed Goal cannot be replanned; explicitly prepare an independent goal");
   const goal = currentRuntime().goal;
   if (goal?.blocked) {
     notify(ctx, goal.blocked, true);
     return;
   }
-  const result = await requestGoalTransition(pi, ctx, { goal: text, intent: action });
+  const result = await requestGoalTransition(pi, ctx, { goal: text, intent: "supervise" });
   if (result.status === "committed-planning" && result.planning) {
     prepareTools(pi, ctx);
     dispatchGoalPlanning(pi, ctx, result.planning);
@@ -127,7 +150,7 @@ async function routeUnstartedControl(
   if (action === "resume" || action === "recover") {
     notify(
       ctx,
-      "该目标尚未启动监督；请显式 preflight 重规划，或 stop 结束它。恢复命令不能创建 Supervisor。",
+      "该目标尚未启动监督；请显式 supervise --replan 重规划，或 stop 结束它。恢复命令不能创建 Supervisor。",
       true,
     );
     return true;
@@ -143,9 +166,10 @@ export async function routeGoalCommand(
   text: string,
 ): Promise<boolean> {
   const lifecycle = currentRuntime().goal;
-  if (action === "supervise" || action === "preflight") {
+  if (action === "supervise") {
+    const request = parseSuperviseArgs(text);
     if (!lifecycle && !legacyHistory()) return false;
-    await routeGoalInput(pi, ctx, action, text);
+    await routeGoalInput(pi, ctx, request.goal, request.replan);
     return true;
   }
   if (!lifecycle) return false;

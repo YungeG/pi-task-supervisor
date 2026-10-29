@@ -62,7 +62,7 @@ export interface TaskRuntime {
     preflightId: string;
     planDigest: string;
     controlEntryId: string;
-    kind: "definitions" | "materials" | "scope";
+    kind: "definitions" | "materials" | "scope" | "capability";
     reason: string;
   };
   boardRepair?: ProjectionRepairHint;
