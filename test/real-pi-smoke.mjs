@@ -651,7 +651,10 @@ try {
             },
           );
           const render = (width = 120) => {
-            const lines = component.render(width).map(stripTerminalSequences);
+            const framed = component.render(width).map(stripTerminalSequences);
+            const lines = framed[0]?.startsWith("╭")
+              ? framed.slice(1, -1).map(line => line.replace(/^│ /u, "").replace(/ │$/u, "").trimEnd())
+              : framed;
             if (customMode === "scope") {
               if (lines[0] === "只读核对（非作答）") {
                 originalRendered = true;

@@ -11,6 +11,9 @@ import { RunCheckParams } from "../../check-tool-schema";
 export function createMockTheme(): Theme {
   return {
     fg: vi.fn((color: string, text: string) => `[${color}]${text}`),
+    bg: vi.fn((_color: string, text: string) => text),
+    getFgAnsi: vi.fn(() => ""),
+    getBgAnsi: vi.fn(() => ""),
     bold: vi.fn((text: string) => `**${text}**`),
     italic: vi.fn((text: string) => text),
     underline: vi.fn((text: string) => text),

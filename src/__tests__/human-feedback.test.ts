@@ -16,6 +16,7 @@ import { resetState, setBoard, updateUI } from "../state";
 import * as uiCapture from "../ui-capture";
 import { validDecisionInformation } from "../decision-spec";
 import { createMockTheme } from "./helpers/mocks";
+import { questionContent } from "./helpers/custom-ui";
 
 vi.mock("node:fs", () => ({
   realpathSync: vi.fn((path: string) => path),
@@ -84,7 +85,7 @@ function harness() {
   function drive(action: "review" | "cancel" = "review"): void {
     const component = components.at(-1)!;
     for (let page = 0; page < 10000 && !completionDone; page++) {
-      const lines = component.render(control.width);
+      const lines = questionContent(component.render(control.width));
       rendered.push(lines);
       if (action !== "cancel" && lines[0]?.includes("需要你回应")) {
         if (lines.some((line) => /→\s*稍后决定（不提交）/u.test(line)))
@@ -125,7 +126,7 @@ function harness() {
         components.push(component);
         control.afterFactory?.();
         if (control.action === "hold") {
-          rendered.push(component.render(control.width));
+          rendered.push(questionContent(component.render(control.width)));
         } else drive(control.action);
       }),
   );
@@ -912,7 +913,7 @@ describe("public custom failure closure, explicit cleanup and bounded controls",
 
   it.each([
     [23, 24],
-    [80, 17],
+    [80, 10],
   ] as const)(
     "tiny viewport %s×%s is cancel-only, without summary fallback",
     async (width, rows) => {
@@ -1000,7 +1001,9 @@ describe("public custom failure closure, explicit cleanup and bounded controls",
     }
     expect(
       h.rendered.every(
-        (lines) => lines.length <= 14 && lines.every((line) => visibleWidth(line) <= 80),
+        (lines) =>
+          lines.length + 2 <= Math.floor(h.control.rows * 0.9) &&
+          lines.every((line) => visibleWidth(line) + 4 <= h.control.width),
       ),
     ).toBe(true);
   });

@@ -5,6 +5,7 @@ import { fileURLToPath } from "node:url";
 import { isGoalReadbackFrame, type NativeReadbackFrame } from "./human-journal";
 import { isSafeBoundedText } from "./validation";
 import { createScopeReview } from "./human-scope-view";
+import { frameQuestion } from "./human-question-frame";
 import { materialLine, type HumanMaterial } from "./human-material-view";
 import { suspendTaskWidget } from "./board-ui";
 import { closeReadOnlyView } from "./ui-view-lifecycle";
@@ -414,8 +415,6 @@ type Purpose = NonNullable<NativeQuestion["purpose"]>;
 const REVIEW_AGAIN = Symbol("review-again");
 const RETRY_INPUT = Symbol("retry-input");
 const REVIEW_LABEL = "重新核对全文";
-// Non-overlay custom replaces only the editor. Same explicit host budget as C0.
-const HOST_CHROME_ROWS = 10;
 
 function canonicalLaterStart(question: NativeQuestion): boolean {
   return (
@@ -546,7 +545,6 @@ async function questionView<T>(
     env: UiViewEnvironment,
     done: (value: T | undefined) => void,
   ) => Component & { dispose(): void },
-  expanded = false,
 ): Promise<T | undefined> {
   if (!current()) return undefined;
   let component: (Component & { dispose(): void }) | undefined;
@@ -562,22 +560,20 @@ async function questionView<T>(
           completion.value = value;
           done(value);
         };
-        component = create(
-          {
-            theme,
-            keybindings,
-            requestRender: () => {
-              tui.requestRender();
+        component = frameQuestion(
+          create(
+            {
+              theme,
+              keybindings,
+              requestRender: () => {
+                tui.requestRender();
+              },
+              // The shared frame consumes two rows inside the host overlay budget.
+              rows: () => Math.max(0, Math.floor(tui.terminal.rows * 0.9) - 2),
             },
-            rows: () =>
-              Math.max(
-                0,
-                expanded
-                  ? Math.floor(tui.terminal.rows * 0.9) - 2
-                  : tui.terminal.rows - HOST_CHROME_ROWS,
-              ),
-          },
-          finish,
+            finish,
+          ),
+          theme,
         );
         abort = () => {
           component?.dispose();
@@ -587,9 +583,7 @@ async function questionView<T>(
         if (!validBeforeFactory || !current()) abort();
         return component;
       },
-      expanded
-        ? { overlay: true, overlayOptions: { width: "95%", maxHeight: "90%", anchor: "center" } }
-        : undefined,
+      { overlay: true, overlayOptions: { width: "95%", maxHeight: "90%", anchor: "center" } },
     );
     return current() && completion.done && result === completion.value
       ? completion.value
@@ -788,7 +782,6 @@ async function invokeApprovalReview(
     current,
     signal,
     (env, done) => new ApprovalReview(question, env, done),
-    true,
   );
   if (!current() || !isApprovalSelection(selected, question)) return undefined;
   if (question.purpose === "scope-revision")

@@ -12,6 +12,14 @@ export const DOWN = "\u001b[B";
 export const ESC = "\u001b";
 export const ENTER = "\r";
 
+/** Inspect content without treating the presentation frame as a question page. */
+export function questionContent(rendered: string[]): string[] {
+  const lines = rendered.map(stripTerminalSequences);
+  return lines[0]?.startsWith("╭")
+    ? lines.slice(1, -1).map((line) => line.replace(/^│ /u, "").replace(/ │$/u, "").trimEnd())
+    : lines;
+}
+
 /** Opt-in public factory driver. No synthetic review result or native answer. */
 export function installCustomUI(ctx: ExtensionContext, script?: (driver: Driver) => void) {
   const rendered: string[] = [];
@@ -60,7 +68,7 @@ export function installCustomUI(ctx: ExtensionContext, script?: (driver: Driver)
     reviewAll() {
       const before = doneCount;
       for (let page = 0; page < 10000; page++) {
-        const lines = driver.render().split("\n");
+        const lines = questionContent(driver.render().split("\n"));
         if (
           lines[0]?.includes("集中审核") ||
           lines[0]?.includes("契约定义审核") ||
