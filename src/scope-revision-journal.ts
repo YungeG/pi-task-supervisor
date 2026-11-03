@@ -1,4 +1,5 @@
 import { isDeepStrictEqual } from "node:util";
+import { SCOPE_CORRECT_MATERIAL } from "./scope-guidance";
 import { journalDigest, type SessionJournal } from "./human-journal";
 import {
   ControlJournalError,
@@ -14,6 +15,7 @@ import { invocationOwnerKey } from "./invocation-tree";
 import {
   contractReviewSubject,
   acceptanceGoalSource,
+  selectedAcceptanceContract,
   type AcceptanceBoundFact,
   type AcceptanceDefinitionFact,
   type AcceptanceJournalView,
@@ -165,7 +167,55 @@ function latestScopeProposal(view: AcceptanceJournalView | undefined, owner: Wor
     ?.filter((p) => invocationOwnerKey(p.data.owner) === invocationOwnerKey(owner))
     .at(-1);
 }
-export function cachedScopeFlow() {
+const scopeReviewHints = new WeakMap<
+  ReturnType<typeof currentRuntime>,
+  { token: string; kind: "needs_review" | "unreviewable"; next?: string }
+>();
+function scopeReviewHintToken(ctx: ExtensionContext): string {
+  const source = currentScopeState(),
+    owner = source.owner;
+  const references = owner
+    ? [
+        latestScopeProposal(source.view, owner),
+        ownerScopeReviews(source.view, owner).at(-1)?.control,
+        selectedAcceptanceContract(source.view, owner),
+      ].map((entry) => (entry ? [entry.entryId, entry.digest] : null))
+    : [];
+  return journalDigest([
+    ctx.sessionManager.getSessionId(),
+    ctx.sessionManager.getSessionFile(),
+    currentRuntime().goalEpoch,
+    owner,
+    references,
+    scopeLeaseToken(),
+  ]);
+}
+/** Last actual repair observation only. Never used by authorization or execution admission. */
+function rememberScopeHint(
+  ctx: ExtensionContext,
+  proposalId: string,
+  kind: "needs_review" | "unreviewable",
+  next?: string,
+): void {
+  const source = currentScopeState();
+  if (
+    !source.owner ||
+    latestScopeProposal(source.view, source.owner)?.data.proposalId !== proposalId
+  )
+    return;
+  scopeReviewHints.set(currentRuntime(), { token: scopeReviewHintToken(ctx), kind, next });
+}
+export function rememberScopeMaterialChange(ctx: ExtensionContext, proposalId: string): void {
+  rememberScopeHint(ctx, proposalId, "needs_review");
+}
+export function rememberUnreviewableScope(
+  ctx: ExtensionContext,
+  proposalId: string,
+  next: string,
+): void {
+  rememberScopeHint(ctx, proposalId, "unreviewable", next);
+}
+export function cachedScopeFlow(ctx?: ExtensionContext) {
   const source = currentScopeState(),
     issue = source.executionIssue;
   if (!issue || !source.owner) return undefined;
@@ -174,22 +224,71 @@ export function cachedScopeFlow() {
     return {
       issue,
       next: "/task-supervisor recover (explicitly adopt current committed scope; clear a separate board gate first)",
+      stage: "recover" as const,
       recoveryRequired: true,
     };
-  const owner = source.owner;
-  const proposal = latestScopeProposal(source.view, owner),
-    review = ownerScopeReviews(source.view, owner).at(-1);
-  const repair =
+  const pendingFlow = pendingScopeFlow(source, source.owner, ctx);
+  if (
+    currentRuntime().board.workflowStatus === "completed" &&
+    ["review", "needs_review", "unreviewable"].includes(pendingFlow.stage)
+  )
+    return {
+      ...pendingFlow,
+      stage: "closed" as const,
+      next: "Completed work stays closed; inspect original saved scope metadata and existing final review. No new proposal, approval or adoption; the user may explicitly end this Goal and plan independent work",
+    };
+  return pendingFlow;
+}
+function observedScopeHint(ctx?: ExtensionContext) {
+  if (!ctx) return;
+  const hint = scopeReviewHints.get(currentRuntime());
+  return hint?.token === scopeReviewHintToken(ctx) ? hint : undefined;
+}
+function witnessedScopeRepair(source: ReturnType<typeof currentScopeState>, owner: WorkOwnerKey) {
+  const review = ownerScopeReviews(source.view, owner).at(-1);
+  return (
     review?.witness &&
     review.control.data.value === "Approve revision" &&
-    sameScopeRef(review.control.data.proposalRef, proposal);
-  const next =
-    source.revision && source.view && scopeIsRevoked(source.view, source.revision)
-      ? "/task-supervisor status (revoked scope remains held; no fallback)"
-      : proposal
-        ? `/task-supervisor ${repair ? "repair-scope" : "review-scope"} ${proposal.data.proposalId}`
-        : "Main: propose_scope_revision with complete exact material";
-  return { issue, next, recoveryRequired: false };
+    sameScopeRef(review.control.data.proposalRef, latestScopeProposal(source.view, owner))
+  );
+}
+function pendingScopeFlow(
+  source: ReturnType<typeof currentScopeState>,
+  owner: WorkOwnerKey,
+  ctx?: ExtensionContext,
+) {
+  const issue = source.executionIssue;
+  const proposal = latestScopeProposal(source.view, owner);
+  if (source.revision && source.view && scopeIsRevoked(source.view, source.revision))
+    return {
+      issue,
+      next: "/task-supervisor status (revoked scope remains held; no fallback)",
+      stage: "revoked" as const,
+      recoveryRequired: false,
+    };
+  const hint = observedScopeHint(ctx),
+    needsReview = hint?.kind === "needs_review";
+  const repair = !needsReview && witnessedScopeRepair(source, owner);
+  if (hint?.kind === "unreviewable")
+    return {
+      issue: `${issue}; last actual review found material unreviewable`,
+      next: hint.next ?? SCOPE_CORRECT_MATERIAL,
+      stage: "unreviewable" as const,
+      recoveryRequired: false,
+    };
+  const next = proposal
+    ? `/task-supervisor ${repair ? "repair-scope" : "review-scope"} ${proposal.data.proposalId}`
+    : "Main: propose_scope_revision with complete exact material";
+  return {
+    issue,
+    next: repair ? `${next} (inspect original material first; repair only if unchanged)` : next,
+    stage: needsReview
+      ? ("needs_review" as const)
+      : repair
+        ? ("inspect_repair" as const)
+        : ("review" as const),
+    recoveryRequired: false,
+  };
 }
 export function scopeControlAttention(): string | undefined {
   const runtime = currentRuntime(),

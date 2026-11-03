@@ -3,10 +3,16 @@ import { resetState, getBoard } from "../state";
 import { currentRuntime } from "../runtime";
 import { preflightLifecycle } from "./helpers/preflight";
 import { goalFixture } from "./helpers/goal";
-import { rmSync } from "node:fs";
+import { rmSync, readFileSync } from "node:fs";
 import { lifecycle } from "./helpers/lifecycle";
 import { routeGoalCommand, parseSuperviseArgs } from "../goal-commands";
 beforeEach(resetState);
+it("documents only callable canonical planning paths, not removed compatibility commands", () => {
+  const readme = readFileSync(new URL("../../README.md", import.meta.url), "utf8");
+  expect(readme).not.toContain("`preflight <goal>`");
+  expect(readme).not.toContain("`supervise-legacy` retains immediate compatibility behavior");
+  expect(readme).toContain("Main未排队");
+});
 it.each([
   ["goal text", { goal: "goal text", replan: false }],
   ["--replan", { goal: "", replan: true }],

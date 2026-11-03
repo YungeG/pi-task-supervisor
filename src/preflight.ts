@@ -1,4 +1,5 @@
-import { currentScopeState, scopeEffectivePlan } from "./scope-revision-journal";
+import { currentScopeState, scopeEffectivePlan, cachedScopeFlow } from "./scope-revision-journal";
+import { SCOPE_REVISION_FAULT } from "./scope-revision-facts";
 import { RestoreReadInvalidated, type RestoreJournalRead } from "./restore-journal";
 import { createHash, randomUUID } from "node:crypto";
 import { isDeepStrictEqual } from "node:util";
@@ -36,6 +37,7 @@ import {
   approvalContractProposal,
   ensureApprovalWorkflowFence,
   approvalAction,
+  PREFLIGHT_ASSOCIATION_FAULT,
 } from "./approval-bundle";
 import { ApprovalContractCaptureSchema, ApprovalReferenceSchema } from "./approval-schema";
 import { acceptanceLayersFromCache } from "./acceptance-contract";
@@ -1881,17 +1883,11 @@ function permissionResponseText(ctx: ExtensionContext, state: PreflightState): s
 }
 
 function permissionContext(ctx: ExtensionContext, state: PreflightState): string | undefined {
-  const runtime = currentRuntime(),
-    block = runtime.preflightDefinitionBlock;
-  const stale =
-    state.version === 2 &&
-    block?.preflightId === state.preflightId &&
-    block.planDigest === state.planDigest &&
-    block.controlEntryId === state.definitionApproval?.controlEntryId;
+  const runtime = currentRuntime();
   const action = approvalAction(
     state,
     Boolean(acceptanceLayersFromCache(runtime).contractId),
-    stale,
+    runtime.preflightDefinitionBlock,
   );
   if (action && !state.started)
     return `Preflight ${state.preflightId}; original goal: ${state.goal}. ${action.kind === "start" ? "Approved, not started. " : ""}Next actor: ${action.actor}. ${action.command ?? ""} ${action.effect} Prepare a complete read-only proposal; no business implementation, Start or result acceptance from this text. Complete material must use propose_contract and submit_preflight, not chat approval. Recorded scope: ${JSON.stringify({ planId: state.planId, proposal: state.proposal })}`;
@@ -1904,8 +1900,10 @@ function permissionContext(ctx: ExtensionContext, state: PreflightState): string
 
 function executionAgreement(state: PreflightState, ctx: ExtensionContext): string {
   const scope = currentScopeState(ctx);
-  if (scope.issue)
-    return `Same-Goal scope is held: ${scope.issue}. Main may submit a complete propose_scope_revision; user uses review-scope or exact repair-scope. Preserve original permissions and Start; do not rerun preflight/start, recreate the Goal or execute.`;
+  if (scope.issue) {
+    const flow = cachedScopeFlow(ctx);
+    return `Same-Goal scope is held: ${scope.issue}. ${flow?.stage === "revoked" ? "Revoked scope cannot be revived by a proposal, recovery or fallback. User must inspect retained obligations before deciding whether to end this Goal and plan independent work." : `Next: ${flow?.next ?? "Inspect original scope sources"}. Only exact metadata handling is allowed.`} Preserve original permissions and Start; do not rerun preflight/start, recreate the Goal or execute.`;
+  }
   if (scope.revision && scope.owner)
     return `Effective committed same-Goal scope (not a sandbox): ${JSON.stringify({ originalGoal: state.goal, originalPlanId: state.planId, originalStart: state.started, selectedPermissionIds: state.approval?.permissionIds, revisionRef: { entryId: scope.revision.entryId, digest: scope.revision.digest }, proposal: scopeEffectivePlan(scope.view, scope.owner) })}. Preserve original owner/Start/budgets; enforce these exact current constraints, not earlier scope/evidence. Commit does not resume or accept work.`;
   if (
@@ -1916,6 +1914,13 @@ function executionAgreement(state: PreflightState, ctx: ExtensionContext): strin
     return `Confirmed original Start covers only explicitly approved preparation until concrete definitions are natively bound. Do not compile, claim, advance managed tasks or run_check yet. Preserve the original Goal and Start; user reviews ${state.proposal.contractProposalId} with review-contract after preparation. Agreement: ${JSON.stringify(state.proposal)}`;
   return `Confirmed preflight execution agreement (not a sandbox): ${JSON.stringify({ goal: state.goal, phase: state.phase, planId: state.planId, planDigest: state.planDigest, proposal: state.proposal, selectedPermissionIds: state.approval?.permissionIds ?? [] })}\nMain must verify natural-language limits, prohibitions and reconfirmation conditions before every relevant action. A tool, advisor, READY or review result never grants permissions.`;
 }
+function heldPreflightNext(ctx: ExtensionContext, fault: string | undefined): string {
+  if (fault === SCOPE_REVISION_FAULT)
+    return `Next: ${cachedScopeFlow(ctx)?.next ?? "Inspect original scope sources; no recovery or replay"}.`;
+  if (fault && !currentRuntime().preflightRepair && fault !== PREFLIGHT_ASSOCIATION_FAULT)
+    return "Inspect the original journal/source; no metadata repair is inferred from an unrelated fault.";
+  return "Inspect and use /task-supervisor repair-preflight only for its confirmed pending cache; other holds remain.";
+}
 export function preflightContext(ctx: ExtensionContext): string | undefined {
   const state = currentRuntime().preflight;
   if (!state || state.sessionId !== ctx.sessionManager.getSessionId()) return undefined;
@@ -1923,13 +1928,21 @@ export function preflightContext(ctx: ExtensionContext): string | undefined {
   if (owner && !owner.preflightBinding && unboundLegacyGoal(state, owner.goal)) return undefined;
   const fault = currentRuntime().journalFault;
   if (fault || currentRuntime().preflightRepair)
-    return `Recorded preflight result is held: ${fault ?? "projection repair pending"}. Do not execute or request the same approval again. Inspect and use /task-supervisor repair-preflight only for its confirmed pending cache; other holds remain.`;
+    return `Recorded preflight result is held: ${fault ?? "projection repair pending"}. Do not execute or request the same approval again. ${heldPreflightNext(ctx, fault)}`;
   const permissions = permissionContext(ctx, state);
   if (permissions) return permissions;
   if (state.started) return executionAgreement(state, ctx);
   if (state.phase === "interrupted" || state.phase === "revoked")
     return `Preflight ${state.phase}; no execution permission. Inspect history and use an explicit human supervise command before planning again.`;
   return `Preflight ${state.preflightId}; user-recorded goal: ${state.goal}\nPrepare a read-only proposal with scope, permissions, prohibitions and validation. Submit it through submit_preflight using this exact preflightId. Do not implement or start supervision. A proposal is not user approval. Current preflight phase: ${state.phase}.`;
+}
+function preflightStatusHold(ctx: ExtensionContext): string | undefined {
+  const runtime = currentRuntime();
+  if (runtime.journalFault)
+    return `Preflight held: ${runtime.journalFault}. ${heldPreflightNext(ctx, runtime.journalFault)}`;
+  if (runtime.management && runtime.management.mode !== "supervised")
+    return "Retained preflight history only; off/task-only mode cannot revive permission or first Start.";
+  return undefined;
 }
 export function preflightStatusLines(ctx: ExtensionContext): string[] {
   const state = currentRuntime().preflight;
@@ -1943,6 +1956,8 @@ export function preflightStatusLines(ctx: ExtensionContext): string[] {
     lines.push(
       `Preflight selected: ${state.approval.permissionIds.join(", ") || "none"}; missing required: ${missingRequired(state).join(", ") || "none"}`,
     );
+  const held = preflightStatusHold(ctx);
+  if (held) return [...lines, held];
   if (currentRuntime().preflightRepair) {
     lines.push(
       "Confirmed preflight result saved; projection repair pending; execution held.",
@@ -1953,6 +1968,7 @@ export function preflightStatusLines(ctx: ExtensionContext): string[] {
   const action = approvalAction(
     state,
     Boolean(acceptanceLayersFromCache(currentRuntime()).contractId),
+    currentRuntime().preflightDefinitionBlock,
   );
   if (action && !state.started) {
     lines.push(

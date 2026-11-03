@@ -192,7 +192,7 @@ describe("ordinary supervised pause recovery", () => {
     ["continuations", 20],
     ["stagnant", 3],
   ] as const)("preserves exhausted %s after pause and resume", async (field, limit) => {
-    const { mock, run } = setup();
+    const { mock, ctx, run } = setup();
     supervisorState()![field] = limit;
     await run("pause maintenance");
     mock.sendMessage.mockClear();
@@ -200,8 +200,29 @@ describe("ordinary supervised pause recovery", () => {
     expect(supervisorState()![field]).toBe(limit);
     expect(supervisorState()?.status).toBe("paused");
     expect(mock.sendMessage).not.toHaveBeenCalled();
+    if (field !== "stagnant")
+      expect(vi.mocked(ctx.ui.notify).mock.calls.at(-1)?.[0]).not.toContain(
+        "/task-supervisor recover",
+      );
   });
 
+  it("does not recommend adopting a historical committed scope on completed work", () => {
+    const { ctx } = setup();
+    const board = getBoard();
+    board.workflowStatus = "completed";
+    const state = supervisorState()!;
+    state.status = "fault";
+    const facts = flowFacts(ctx);
+    facts.scope = {
+      issue: "Committed scope requires explicit adoption",
+      next: "/task-supervisor recover",
+      stage: "recover",
+      recoveryRequired: true,
+    };
+    const next = nextFlowStep(board, state, facts);
+    expect(next).not.toContain("/task-supervisor recover");
+    expect(next).toContain("completed");
+  });
   it("keeps status read-only and actionable even while disabled and journal-faulted", async () => {
     const { mock, ctx, run } = setup();
     setSessionScopeEnabled(false);

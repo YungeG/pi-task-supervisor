@@ -162,6 +162,35 @@ export interface NativeAnswer {
   readonly answeredAt: number;
 }
 
+export interface NativeInteractionDiagnostic {
+  readonly phase: "admission" | "presentation" | "response";
+  readonly code:
+    | "answered"
+    | "unsupported"
+    | "invalid_request"
+    | "stale"
+    | "aborted"
+    | "busy"
+    | "display_unavailable"
+    | "no_response"
+    | "user_deferred"
+    | "ui_error";
+}
+
+export interface NativeInteractionResult {
+  readonly answer?: NativeAnswer;
+  readonly diagnostic: NativeInteractionDiagnostic;
+}
+
+type InteractionTrace = {
+  phase: NativeInteractionDiagnostic["phase"];
+  code: NativeInteractionDiagnostic["code"];
+};
+
+function invalidateInteraction(trace: InteractionTrace, signal?: AbortSignal): void {
+  trace.code = signal?.aborted ? "aborted" : "stale";
+}
+
 interface AnswerMetadata {
   readonly sessionManager: object;
   readonly frame: NativeReadbackFrame;
@@ -172,25 +201,73 @@ interface AnswerMetadata {
 }
 
 const answerRegistry = new WeakMap<object, AnswerMetadata>();
-const activeQuestions = new WeakMap<object, Promise<NativeAnswer | undefined>>();
+const activeQuestions = new WeakMap<object, Promise<unknown>>();
+
+/** Shared display lifetime only; its values never enter the NativeAnswer registry. */
+export async function withNativeUiLock<T>(
+  ctx: ExtensionContext,
+  run: () => Promise<T>,
+  beforeDisplay: () => boolean = () => true,
+): Promise<
+  { status: "busy" | "display_unavailable" | "cancelled" } | { status: "done"; value: T }
+> {
+  const key = ctx.sessionManager as object;
+  if (activeQuestions.has(key)) return { status: "busy" };
+  let displayToken: ReturnType<typeof suspendTaskWidget>;
+  const work = Promise.resolve().then(async () => {
+    if (!beforeDisplay()) return { status: "cancelled" as const };
+    displayToken = suspendTaskWidget(ctx);
+    if (!displayToken) return { status: "display_unavailable" as const };
+    return { status: "done" as const, value: await run() };
+  });
+  activeQuestions.set(key, work);
+  try {
+    return await work;
+  } finally {
+    activeQuestions.delete(key);
+    displayToken?.release();
+  }
+}
 
 /** Queries the original operation lock without creating an answer or admission. */
 export function hasActiveNativeQuestion(ctx: ExtensionContext): boolean {
   return activeQuestions.has(ctx.sessionManager);
 }
 
-/**
- * Request native answer through trusted TUI.
- * Returns undefined if not trusted, cancelled, stale, or invalid.
- */
+/** Compatibility adapter: diagnostics never create or replace an opaque answer. */
 export async function requestNativeAnswer(
   ctx: ExtensionContext,
   question: NativeQuestion,
   isCurrent: () => boolean,
   signal?: AbortSignal,
 ): Promise<NativeAnswer | undefined> {
+  return (await requestNativeInteraction(ctx, question, isCurrent, signal)).answer;
+}
+
+/** Display-only cause codes contain no scope, answer or exception text. */
+export async function requestNativeInteraction(
+  ctx: ExtensionContext,
+  question: NativeQuestion,
+  isCurrent: () => boolean,
+  signal?: AbortSignal,
+): Promise<NativeInteractionResult> {
+  const trace: InteractionTrace = { phase: "admission", code: "invalid_request" };
+  const answer = await requestNativeAnswerInner(ctx, question, isCurrent, signal, trace);
+  return { ...(answer ? { answer } : {}), diagnostic: Object.freeze({ ...trace }) };
+}
+
+async function requestNativeAnswerInner(
+  ctx: ExtensionContext,
+  question: NativeQuestion,
+  isCurrent: () => boolean,
+  signal: AbortSignal | undefined,
+  trace: InteractionTrace,
+): Promise<NativeAnswer | undefined> {
   // Deny unsupported source before UI call
-  if (!isTrustedLocalTui(ctx)) return undefined;
+  if (!isTrustedLocalTui(ctx)) {
+    trace.code = "unsupported";
+    return undefined;
+  }
 
   // Check session identity and active branch before UI
   const sessionId = ctx.sessionManager.getSessionId();
@@ -204,11 +281,17 @@ export async function requestNativeAnswer(
   const signals = [ctx.signal, signal].filter((item): item is AbortSignal => item !== undefined);
   const operationSignal = signals.length ? AbortSignal.any(signals) : undefined;
   // Check isCurrent and both cancellation sources before UI.
-  if (!isCurrent() || operationSignal?.aborted) return undefined;
+  if (!isCurrent() || operationSignal?.aborted) {
+    invalidateInteraction(trace, operationSignal);
+    return undefined;
+  }
 
   // Check no outstanding question for this sessionManager
   const sessionKey = ctx.sessionManager as unknown as object;
-  if (activeQuestions.has(sessionKey)) return undefined;
+  if (activeQuestions.has(sessionKey)) {
+    trace.code = "busy";
+    return undefined;
+  }
 
   // Deep clone question before awaiting
   const clonedQuestion = cloneQuestion(question);
@@ -216,35 +299,35 @@ export async function requestNativeAnswer(
   // Create promise and register
   // Establish the original lock before closeReadOnlyView can synchronously abort
   // a reader whose cleanup reenters this seam.
-  let displayToken: ReturnType<typeof suspendTaskWidget>;
-  const answerPromise = Promise.resolve().then(() => {
-    if (
-      !interactionCurrent(ctx, sessionId, leafId, isCurrent, operationSignal) ||
-      !purposeFor(clonedQuestion) ||
-      !validDisplayMetadata(clonedQuestion)
-    )
-      return undefined;
-    displayToken = suspendTaskWidget(ctx);
-    if (!displayToken) return undefined;
-    return performNativeInteraction(
-      ctx,
-      clonedQuestion,
-      sessionId,
-      leafId,
-      isCurrent,
-      operationSignal,
-    );
-  });
-  activeQuestions.set(sessionKey, answerPromise);
-
-  try {
-    const answer = await answerPromise;
-    if (!interactionCurrent(ctx, sessionId, leafId, isCurrent, operationSignal)) return undefined;
-    return answer;
-  } finally {
-    activeQuestions.delete(sessionKey);
-    displayToken?.release();
+  const locked = await withNativeUiLock(
+    ctx,
+    () =>
+      performNativeInteraction(
+        ctx,
+        clonedQuestion,
+        sessionId,
+        leafId,
+        isCurrent,
+        operationSignal,
+        trace,
+      ),
+    () => {
+      if (!interactionCurrent(ctx, sessionId, leafId, isCurrent, operationSignal)) {
+        invalidateInteraction(trace, operationSignal);
+        return false;
+      }
+      return !!purposeFor(clonedQuestion) && validDisplayMetadata(clonedQuestion);
+    },
+  );
+  if (locked.status !== "done") {
+    if (locked.status !== "cancelled") trace.code = locked.status;
+    return undefined;
   }
+  if (!interactionCurrent(ctx, sessionId, leafId, isCurrent, operationSignal)) {
+    invalidateInteraction(trace, operationSignal);
+    return undefined;
+  }
+  return locked.value;
 }
 
 function cloneQuestion(question: NativeQuestion): NativeQuestion {
@@ -284,10 +367,13 @@ async function performNativeInteraction(
   sessionId: string,
   leafId: string,
   isCurrent: () => boolean,
-  signal?: AbortSignal,
+  signal: AbortSignal | undefined,
+  trace: InteractionTrace,
 ): Promise<NativeAnswer | undefined> {
   const current = () => interactionCurrent(ctx, sessionId, leafId, isCurrent, signal);
-  const result = await invokeUI(ctx, question, current, signal);
+  trace.phase = "presentation";
+  trace.code = "no_response";
+  const result = await invokeUI(ctx, question, current, signal, trace);
   if (result === undefined) return undefined;
 
   // Re-check session identity and active branch after UI
@@ -298,6 +384,10 @@ async function performNativeInteraction(
   // Re-check isCurrent and signal after UI
   if (!isCurrent() || signal?.aborted) return undefined;
 
+  // A response stage records an observed selection, not visual display proof.
+  trace.phase = "response";
+  trace.code =
+    result === "Defer" && question.kind === "authorization" ? "user_deferred" : "invalid_request";
   // Map result to answer
   const answer =
     question.purpose === "approval-bundle"
@@ -315,6 +405,7 @@ async function performNativeInteraction(
     branchAnchor: leafId,
   };
   answerRegistry.set(answer, metadata);
+  trace.code = "answered";
 
   return answer;
 }
@@ -508,7 +599,7 @@ async function questionView<T>(
     component?.dispose();
   }
 }
-async function reviewScope(
+export async function reviewScope(
   ctx: ExtensionContext,
   text: string,
   current: () => boolean,
@@ -571,7 +662,8 @@ async function confirmDecisionDraft(
   purpose: Purpose,
   draft: DecisionDraft,
   current: () => boolean,
-  signal?: AbortSignal,
+  signal: AbortSignal | undefined,
+  trace: InteractionTrace,
 ): Promise<string | typeof REVIEW_AGAIN | typeof RETRY_INPUT | undefined> {
   const value = decisionDraftValue(question, draft);
   if (value === undefined) return undefined;
@@ -588,6 +680,10 @@ async function confirmDecisionDraft(
   if (!current()) return undefined;
   if (index === 2) return RETRY_INPUT;
   if (index === 3) return REVIEW_AGAIN;
+  if (index === 0) {
+    trace.phase = "response";
+    trace.code = "user_deferred";
+  }
   if (index !== 1 || !validDraftInformation(question, value)) return undefined;
   return value;
 }
@@ -596,7 +692,8 @@ async function invokeDecisionCard(
   question: NativeQuestion,
   purpose: Purpose,
   current: () => boolean,
-  signal?: AbortSignal,
+  signal: AbortSignal | undefined,
+  trace: InteractionTrace,
 ): Promise<string | undefined> {
   let initial: DecisionDraft | undefined;
   let recheck = false;
@@ -606,10 +703,29 @@ async function invokeDecisionCard(
       current,
       signal,
       (env, done) =>
-        new DecisionCard(question, reviewText(question, purpose), env, done, initial, recheck),
+        new DecisionCard(
+          question,
+          reviewText(question, purpose),
+          env,
+          done,
+          initial,
+          recheck,
+          () => {
+            trace.phase = "response";
+            trace.code = "user_deferred";
+          },
+        ),
     );
     if (!current() || !isDecisionDraft(draft, question)) return undefined;
-    const result = await confirmDecisionDraft(ctx, question, purpose, draft, current, signal);
+    const result = await confirmDecisionDraft(
+      ctx,
+      question,
+      purpose,
+      draft,
+      current,
+      signal,
+      trace,
+    );
     if (!current()) return undefined;
     if (result !== REVIEW_AGAIN && result !== RETRY_INPUT) return result;
     initial = draft;
@@ -692,7 +808,8 @@ async function invokeLegacyQuestion(
   question: NativeQuestion,
   purpose: Purpose,
   current: () => boolean,
-  signal?: AbortSignal,
+  signal: AbortSignal | undefined,
+  trace: InteractionTrace,
 ): Promise<string | undefined> {
   const text = reviewText(question, purpose);
   let needsReview = true;
@@ -702,7 +819,7 @@ async function invokeLegacyQuestion(
       if (!current() || !reviewed) return undefined;
     }
     if (!current()) return undefined;
-    const result = await invokeFinalUI(ctx, question, purpose, current, signal);
+    const result = await invokeFinalUI(ctx, question, purpose, current, signal, trace);
     if (!current()) return undefined;
     if (result === REVIEW_AGAIN || result === RETRY_INPUT) needsReview = result === REVIEW_AGAIN;
     else return result;
@@ -713,7 +830,8 @@ async function invokeUI(
   ctx: ExtensionContext,
   question: NativeQuestion,
   current: () => boolean,
-  signal?: AbortSignal,
+  signal: AbortSignal | undefined,
+  trace: InteractionTrace,
 ): Promise<string | undefined> {
   try {
     const purpose = purposeFor(question);
@@ -722,10 +840,12 @@ async function invokeUI(
     if (!current()) return undefined;
     if (["approval-bundle", "contract-definition", "scope-revision"].includes(purpose))
       return await invokeApprovalReview(ctx, question, current, signal);
-    if (question.material) return await invokeDecisionCard(ctx, question, purpose, current, signal);
-    return await invokeLegacyQuestion(ctx, question, purpose, current, signal);
+    if (question.material)
+      return await invokeDecisionCard(ctx, question, purpose, current, signal, trace);
+    return await invokeLegacyQuestion(ctx, question, purpose, current, signal, trace);
   } catch {
-    // No custom fallback, summary approval, or implicit retry after UI failure.
+    // Do not echo exception text or retry with a less complete approval UI.
+    trace.code = "ui_error";
     return undefined;
   }
 }
@@ -749,9 +869,10 @@ async function invokeFinalUI(
   question: NativeQuestion,
   purpose: Purpose,
   current: () => boolean,
-  signal?: AbortSignal,
+  signal: AbortSignal | undefined,
+  trace: InteractionTrace,
 ): Promise<string | typeof REVIEW_AGAIN | typeof RETRY_INPUT | undefined> {
-  if (purpose === "information") return invokeInformation(ctx, question, current, signal);
+  if (purpose === "information") return invokeInformation(ctx, question, current, signal, trace);
   if (purpose === "authorization") {
     const index = await selectOffered(
       ctx,
@@ -773,9 +894,13 @@ async function invokeFinalUI(
     );
     if (!current()) return undefined;
     if (index === 2) return REVIEW_AGAIN;
+    if (index === 0) {
+      trace.phase = "response";
+      trace.code = "user_deferred";
+    }
     return index === 1 ? question.options?.[1] : undefined;
   }
-  return invokeBusinessChoice(ctx, question, current, signal);
+  return invokeBusinessChoice(ctx, question, current, signal, trace);
 }
 
 function choiceLabel(question: NativeQuestion, value: string, index: number): string {
@@ -789,7 +914,8 @@ async function invokeBusinessChoice(
   ctx: ExtensionContext,
   question: NativeQuestion,
   current: () => boolean,
-  signal?: AbortSignal,
+  signal: AbortSignal | undefined,
+  trace: InteractionTrace,
 ): Promise<string | typeof REVIEW_AGAIN | undefined> {
   const labels = [
     "稍后决定（不提交）",
@@ -803,6 +929,10 @@ async function invokeBusinessChoice(
     current,
     signal,
   );
+  if (current() && index === 0) {
+    trace.phase = "response";
+    trace.code = "user_deferred";
+  }
   if (!current() || index === undefined || index === 0) return undefined;
   if (index === labels.length - 1) return REVIEW_AGAIN;
   return question.options?.[index - 1];
@@ -812,7 +942,8 @@ async function invokeInformation(
   ctx: ExtensionContext,
   question: NativeQuestion,
   current: () => boolean,
-  signal?: AbortSignal,
+  signal: AbortSignal | undefined,
+  trace: InteractionTrace,
 ): Promise<string | typeof REVIEW_AGAIN | typeof RETRY_INPUT | undefined> {
   if (!current()) return undefined;
   const result = await ctx.ui.input(
@@ -840,6 +971,10 @@ async function invokeInformation(
     signal,
   );
   if (!current()) return undefined;
+  if (index === 0) {
+    trace.phase = "response";
+    trace.code = "user_deferred";
+  }
   if (index === 1) return RETRY_INPUT;
   return index === 2 ? REVIEW_AGAIN : undefined;
 }

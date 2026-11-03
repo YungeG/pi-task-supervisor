@@ -28,6 +28,7 @@ import {
   executionAcceptanceIssue,
 } from "./execution-settlement";
 import { journalDigest } from "./human-journal";
+import { inspectRestorableSession } from "./human-control";
 import { randomUUID } from "node:crypto";
 import { qualifiedEvidence } from "./qualified-evidence";
 import { currentRuntime, type TaskRuntime } from "./runtime";
@@ -160,6 +161,79 @@ function selectedRegistration(owner: GoalOwnerKey): FinalValidationRegistrationV
   return [...(currentRuntime().controlJournal?.finalValidationRegistrations ?? [])]
     .reverse()
     .find((record) => digest(record.data.owner.goal) === digest(owner));
+}
+function recordedRegistrationValidation(
+  record: FinalValidationRegistrationView,
+  owner: GoalOwnerKey,
+  state: NonNullable<TaskRuntime["supervisor"]>,
+): boolean {
+  return (
+    currentRuntime().controlJournal?.finalValidations?.some(
+      (entry) =>
+        digest(entry.data.owner.goal) === digest(owner) &&
+        entry.data.epoch === state.epoch &&
+        entry.data.validationOnly?.registrationRef.entryId === record.entryId &&
+        entry.data.validationOnly.registrationRef.digest === record.digest &&
+        supplementContextCurrent(entry.data.validationOnly, getBoardRef(), state.bindings),
+    ) ?? false
+  );
+}
+/** Cached presentation only: recorded phase, never proof that current files are unchanged. */
+export function finalValidationGuidance(ctx: ExtensionContext) {
+  const runtime = currentRuntime(),
+    state = runtime.supervisor,
+    board = getBoardRef();
+  if (
+    !state ||
+    board.workflowStatus !== "completed" ||
+    state.sessionId !== ctx.sessionManager.getSessionId()
+  )
+    return;
+  const owner = currentWorkOwner(state.sessionId);
+  if (owner?.kind !== "goal") return;
+  const record = selectedRegistration(owner.goal);
+  if (!record) return;
+  const data = record.data;
+  if (
+    runtime.journalFault ||
+    ctx.cwd !== data.cwd ||
+    data.boardDigest !== journalDigest(board) ||
+    data.bindingsDigest !== journalDigest(state.bindings)
+  )
+    return {
+      stage: "unknown" as const,
+      next: "Inspect original final-validation owner/context; no replay or business recovery",
+    };
+  if (recordedRegistrationValidation(record, owner.goal, state))
+    return {
+      stage: "observed" as const,
+      next: "/task-supervisor retry-review (new validation recorded; control rechecks current applicability, no business replay)",
+    };
+  if (state.epoch !== data.epoch)
+    return {
+      stage: "unknown" as const,
+      next: "Inspect changed validation epoch; /task-supervisor retry-review can recheck/register exact material, never replay business",
+    };
+  return {
+    stage: "registered" as const,
+    next: "Main未排队。请发送给Main：仅读取当前Goal原始final-validation-registered，按原工具、完整参数与cwd核对权限并执行该唯一验证；不得从摘要猜命令、重放任务或recover；缺来源则只报告阻塞。验证后由用户retry-review。已记录登记不证明当前文件未变化，动作时重新核验。",
+  };
+}
+/** For an explicit Main turn only; original registration and current version are requalified here. */
+export function finalValidationMainContext(ctx: ExtensionContext): string | undefined {
+  if (getBoardRef().workflowStatus !== "completed") return;
+  const guidance = finalValidationGuidance(ctx);
+  if (guidance?.stage === "registered") {
+    const owner = currentWorkOwner(ctx.sessionManager.getSessionId()),
+      record = owner?.kind === "goal" ? selectedRegistration(owner.goal) : undefined;
+    if (record) {
+      const input: unknown = JSON.parse(record.data.inputJSON);
+      if (registeredFinalValidation(ctx, record.data.toolName, input))
+        return `Explicit Main validation-only turn; no command was queued. Original registered invocation: ${JSON.stringify({ tool: record.data.toolName, input, cwd: record.data.cwd })}. Recheck unchanged permissions and semantic validation-only scope before invoking; no task/business replay, scope amendment, Start or recover. After actual new evidence, user retry-review. All real admission/source/version gates remain enforced.`;
+    }
+    return "Registered final validation is no longer qualified for this host/source/version; inspect original material via retry-review, do not execute from a stale display or recover business.";
+  }
+  return `Completed business remains closed. ${guidance?.next ?? "User: retry-review to inspect existing final review/validation; no scope proposal or task replay."}`;
 }
 function validationControlAllowed(
   ctx: ExtensionContext,
@@ -1136,7 +1210,31 @@ function existingFinalCheck(): { receipt: HostReceipt; input: Record<string, unk
     );
   return candidate;
 }
-function registerCompletedValidation(pi: ExtensionAPI, ctx: ExtensionContext): void {
+function validationSupervisorReference(
+  ctx: ExtensionContext,
+  owner: GoalOwnerKey,
+  state: NonNullable<TaskRuntime["supervisor"]>,
+) {
+  const journal = inspectRestorableSession(ctx, true);
+  const node =
+    journal &&
+    [...journal.branch].reverse().find((entry) => {
+      const proof = entry.supervisorProof;
+      return (
+        proof &&
+        proof.sessionId === owner.sessionId &&
+        proof.goalKey === owner.goalKey &&
+        (proof.lifecycleCommitId ?? null) === owner.lifecycleCommitId &&
+        proof.status === state.status &&
+        proof.epoch === state.epoch &&
+        proof.bindingsDigest === journalDigest(state.bindings)
+      );
+    });
+  if (!node)
+    throw Error("Final validation requires its actual current Supervisor checkpoint source");
+  return { entryId: node.id, digest: node.digest };
+}
+function registerCompletedValidation(pi: ExtensionAPI, ctx: ExtensionContext) {
   const state = supervisorState(),
     board = getBoardRef(),
     owner = currentWorkOwner(ctx.sessionManager.getSessionId());
@@ -1168,7 +1266,7 @@ function registerCompletedValidation(pi: ExtensionAPI, ctx: ExtensionContext): v
         journalDigest(check.input),
       ])
   )
-    return;
+    return { status: "already_registered" as const };
   holdSupervisor(
     pi,
     ctx,
@@ -1176,7 +1274,7 @@ function registerCompletedValidation(pi: ExtensionAPI, ctx: ExtensionContext): v
     "Completed work requires the registered final validation only; no task or general business write is reopened",
     "review_failed",
   );
-  const supervisorRef = leafReference(ctx),
+  const supervisorRef = validationSupervisorReference(ctx, owner.goal, state),
     lease = captureControlLease(ctx),
     view = readControlJournal(ctx);
   if (!view.latestFence?.data.features.includes("final-review-v1"))
@@ -1230,6 +1328,7 @@ function registerCompletedValidation(pi: ExtensionAPI, ctx: ExtensionContext): v
     },
     { triggerTurn: false },
   );
+  return { status: "registered" as const };
 }
 function selectedReviewAttempt(owner: GoalOwnerKey): ReviewAttemptEntry | undefined {
   return [...(currentRuntime().controlJournal?.reviewAttempts ?? [])]
@@ -1443,14 +1542,19 @@ function registerNeededValidation(
   reason: string,
   latest?: ReviewAttemptEntry,
 ): void {
-  currentRuntime().finalReview = {
+  const pending: FinalReviewStateV1 = {
     status: "needs_validation",
     owner,
     reason,
     attemptId: latest?.start.data.attemptId,
   };
+  currentRuntime().finalReview = pending;
   try {
-    registerCompletedValidation(pi, ctx);
+    const registration = registerCompletedValidation(pi, ctx);
+    currentRuntime().finalReview = {
+      ...pending,
+      reason: `${registration.status}: exact original invocation recorded; Main未排队. Explicitly request Main to read the original registration and perform only that qualified validation, then retry-review. No business replay or recovery.`,
+    };
   } catch (error) {
     if (error instanceof ReviewLoopError)
       currentRuntime().finalReview = {

@@ -102,6 +102,14 @@ export function currentRuntime(): TaskRuntime {
   return storage.getStore() ?? testRuntime;
 }
 
+/** Bind callbacks the host invokes later, outside the registration callback's async chain. */
+export function bindRuntimeCallback<TArgs extends unknown[], TResult>(
+  callback: (...args: TArgs) => TResult,
+): (...args: TArgs) => TResult {
+  const runtime = currentRuntime();
+  return (...args) => storage.run(runtime, () => callback(...args));
+}
+
 /** Every callback (and its awaits) belongs to one extension instance, never a global board. */
 export function scopedAPI(pi: ExtensionAPI, setup: (api: ExtensionAPI) => void): void {
   const runtime = createRuntime();
@@ -127,6 +135,12 @@ export function scopedAPI(pi: ExtensionAPI, setup: (api: ExtensionAPI) => void):
       pi.registerCommand(name, {
         ...command,
         handler: (...args) => storage.run(runtime, () => command.handler(...args)),
+      });
+    },
+    registerShortcut(shortcut, options) {
+      pi.registerShortcut(shortcut, {
+        ...options,
+        handler: (...args) => storage.run(runtime, () => options.handler(...args)),
       });
     },
   };

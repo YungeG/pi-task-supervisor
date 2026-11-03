@@ -1,8 +1,14 @@
 import { beforeEach, expect, it, vi } from "vitest";
 import { readFileSync, writeFileSync, rmSync } from "node:fs";
 import { dirname, join } from "node:path";
+import { createHash } from "node:crypto";
 import { goalFixture, completeGoalProposal } from "./helpers/goal";
-import { scopeRevisionContractContext } from "../acceptance-runtime";
+import {
+  scopeRevisionContractContext,
+  executeRegisteredCheck,
+  prepareScopeRevisionContract,
+  proposeAcceptanceContract,
+} from "../acceptance-runtime";
 import { preflightLifecycle, localProposal } from "./helpers/preflight";
 import { installCustomUI } from "./helpers/custom-ui";
 import { resetState, getBoard } from "../state";
@@ -11,7 +17,7 @@ import { createProposeContractTool, createProposeScopeRevisionTool } from "../ac
 import { isScopeRevisionProposalTool } from "../scope-revision-schema";
 import { createSubmitPreflightTool, createWriteTasksTool, createCompileTasksTool } from "../tools";
 import { readControlJournal, currentWorkOwner } from "../control-journal";
-import { selectedAcceptanceContract } from "../acceptance-journal";
+import { selectedAcceptanceContract, validAcceptanceFact } from "../acceptance-journal";
 import {
   proposeScopeRevision,
   reviewScopeRevision,
@@ -28,6 +34,8 @@ import {
   assertScopeRevocation,
   scopeIsRevoked,
   scopeProposalFor,
+  cachedScopeFlow,
+  scopeEffectivePlan,
 } from "../scope-revision-journal";
 import {
   qualifiedEvidence,
@@ -35,6 +43,8 @@ import {
   invocationFrameCurrent,
 } from "../qualified-evidence";
 import { recoverSupervisor } from "../supervisor";
+import { ownedCodemode } from "./helpers/owned-codemode";
+import { retainScopeV1Candidate } from "./helpers/retained-scope-proposal";
 import { goalExecutionIssue } from "../goal-scope";
 import {
   validScopeRevisionProposal,
@@ -47,13 +57,23 @@ import { inspectRestorableSession } from "../human-control";
 import type { ScopeRevisionControl, ScopeRevisionCommitted } from "../scope-revision-facts";
 import type { AcceptanceBoundFact } from "../acceptance-journal";
 import type { HostReceipt } from "../receipt-store";
-import type { PreflightState } from "../preflight";
+import { preflightContext, type PreflightState } from "../preflight";
+import { flowFacts, nextFlowStep } from "../flow";
 import type { AcceptanceProposal } from "../acceptance-proposal";
+import * as checkRunner from "../check-runner";
 
 beforeEach(resetState);
-async function fixture() {
+async function fixture(resourceLimits?: string, requirementCount = 1) {
   const h = preflightLifecycle(),
     root = dirname(h.path);
+  const plan = resourceLimits
+    ? {
+        ...localProposal,
+        permissions: localProposal.permissions.map((p, i) =>
+          i === 0 ? { ...p, limits: resourceLimits } : p,
+        ),
+      }
+    : localProposal;
   const header = JSON.parse(readFileSync(h.path, "utf8").split("\n")[0] ?? "{}");
   writeFileSync(h.path, JSON.stringify({ ...header, cwd: root }) + "\n");
   h.ctx.cwd = root;
@@ -69,19 +89,19 @@ async function fixture() {
     inputs: ["input.txt", "checker.mjs"],
     artifacts: ["result.txt"],
     environment: { profileId: "owned", values: {} },
-    requirements: [
-      {
-        requirementId: "output",
-        source: "original condition",
-        text: "produce output",
-        required: true,
-      },
-    ],
+    requirements: Array.from({ length: requirementCount }, (_, i) => ({
+      requirementId: i ? `output-${i}` : "output",
+      source: "original condition",
+      text: "produce output",
+      required: true,
+    })),
     checks: [
       {
         kind: "automatic",
         checkId: "output",
-        requirementIds: ["output"],
+        requirementIds: Array.from({ length: requirementCount }, (_, i) =>
+          i ? `output-${i}` : "output",
+        ),
         script: "checker.mjs",
         checkerFiles: ["checker.mjs"],
         configs: [],
@@ -104,7 +124,7 @@ async function fixture() {
     "plan",
     {
       preflightId: currentRuntime().preflight!.preflightId,
-      proposal: { ...localProposal, contractProposalId: proposalId },
+      proposal: { ...plan, contractProposalId: proposalId },
     },
     undefined,
     undefined,
@@ -143,15 +163,138 @@ async function fixture() {
   await h.command("pause Exact scope needs amendment");
   expect(currentRuntime().supervisor?.status).toBe("paused");
   const input = {
-    plan: { ...localProposal, acceptance: ["produce the revised exact output"] },
+    plan: { ...plan, acceptance: ["produce the revised exact output"] },
     contract: {
       ...contract,
-      requirements: [{ ...contract.requirements[0]!, text: "produce the revised exact output" }],
+      requirements: contract.requirements.map((r) => ({
+        ...r,
+        text: "produce the revised exact output",
+      })),
     },
     reason: "Precisely amend an existing condition, no new object or authority",
   };
   return { ...h, root, input };
 }
+it("refuses an unadoptable completed-board scope before collecting native approval", async () => {
+  let inspected = false;
+  const result = await ownedCodemode("normal", {
+    directCheck: true,
+    checkTool: "run_check",
+    finalAction: "hold",
+    prepare: (dir) => {
+      writeFileSync(
+        join(dir, "checker.mjs"),
+        "import assert from 'node:assert/strict';import{readFileSync}from'node:fs';assert.equal(readFileSync(new URL('./input.txt',import.meta.url),'utf8'),'owned\\n');console.log(JSON.stringify({protocol:'check-result-v1',tests:1,passed:1,failed:0,skipped:0,requiredCases:{input:'passed'},skippedIds:[]}));",
+      );
+    },
+    approvalWorkflow: {
+      proposal: () => localProposal,
+      produce: () => undefined,
+      contract: () => ({
+        version: 1,
+        scopeId: "completed-scope",
+        inputs: ["input.txt", "checker.mjs"],
+        artifacts: [],
+        environment: { profileId: "owned", values: {} },
+        requirements: [
+          {
+            requirementId: "input",
+            source: "Owned original native Goal",
+            text: "Finite input check",
+            required: true,
+          },
+        ],
+        checks: [
+          {
+            kind: "automatic",
+            checkId: "required-node",
+            requirementIds: ["input"],
+            script: "checker.mjs",
+            checkerFiles: ["checker.mjs"],
+            configs: [],
+            args: [],
+            timeoutMs: 1000,
+            expected: { minTests: 1, requiredCases: ["input"], allowedSkipped: [] },
+          },
+        ],
+      }),
+    },
+    afterSettled: async (pi, ctx) => {
+      if (getBoard().workflowStatus !== "completed" || inspected) return;
+      inspected = true;
+      expect(["paused", "fault"]).toContain(currentRuntime().supervisor?.status);
+      const questions = vi.spyOn(ctx.ui, "custom");
+      const before = readFileSync(ctx.sessionManager.getSessionFile()!, "utf8");
+      const source = scopeRevisionContractContext(ctx);
+      expect(() => proposeAcceptanceContract(pi, ctx, source.proposal)).toThrow(
+        /Completed work stays closed.*no new scope adoption/,
+      );
+      expect(() =>
+        proposeScopeRevision(pi, ctx, {
+          plan: currentRuntime().preflight!.proposal!,
+          contract: {
+            ...source.proposal,
+            requirements: source.proposal.requirements.map((r) => ({
+              ...r,
+              text: r.text + " precise amendment",
+            })),
+          },
+          reason: "Owned completed work must not commit a scope it cannot adopt",
+        }),
+      ).toThrow(/completed.*scope|scope.*completed/i);
+      expect(questions).not.toHaveBeenCalled();
+      expect(readFileSync(ctx.sessionManager.getSessionFile()!, "utf8")).toBe(before);
+      // Retained scope-v1 metadata from before completed-board admission existed;
+      // actual SDK work is already completed above, not a copied board DTO.
+      retainScopeV1Candidate(pi, ctx, {
+        plan: currentRuntime().preflight!.proposal!,
+        contract: source.proposal,
+        reason: "Historical pending metadata; never reopen completed business",
+      });
+      expect(cachedScopeFlow(ctx)?.stage).toBe("closed");
+      expect(cachedScopeFlow(ctx)?.next).not.toContain("review-scope");
+      expect(questions).not.toHaveBeenCalled();
+      questions.mockRestore();
+    },
+  });
+  expect(inspected).toBe(true);
+  expect(result.errors).toEqual([]);
+}, 20000);
+it("reviews exact business resource conditions without refilling Supervisor budgets or rewriting history", async () => {
+  const h = await fixture(
+      "Active <=120 seconds; reads <=64 MiB; RSS <=512 MiB. Old usage stays unknown.",
+    ),
+    before = structuredClone(currentRuntime().supervisor),
+    original = structuredClone(currentRuntime().preflight),
+    input = structuredClone(h.input);
+  input.plan.permissions[0]!.limits =
+    "Future active <=600 seconds; reads <=256 MiB; RSS <=1024 MiB. Old usage stays unknown, not zero.";
+  const spec = input.contract.checks[0]!;
+  if (spec.kind !== "automatic") throw Error("Expected original finite check");
+  spec.timeoutMs = 30000;
+  const p = proposeScopeRevision(h.mock.api, h.ctx, input);
+  expect(currentRuntime().supervisor).toEqual(before);
+  const ui = installCustomUI(h.ctx, (d) => {
+    d.reviewAll();
+  });
+  expect((await reviewScopeRevision(h.mock.api, h.ctx, p.proposalId)).status).toBe("committed");
+  ui.assertNoScriptErrors();
+  expect(currentRuntime().supervisor).toEqual(before);
+  expect(ui.rendered.join("\n")).toContain("历史计量");
+  const description = createProposeScopeRevisionTool(h.mock.api).description;
+  expect(description).not.toContain("budgets cannot expand/reset");
+  expect(description).toContain("business resource conditions");
+  await h.command("resume");
+  await h.command("recover");
+  expect(currentRuntime().supervisor?.reviews).toBe(before?.reviews);
+  expect(currentRuntime().supervisor?.continuations).toBe(before?.continuations);
+  expect(currentRuntime().preflight).toEqual(original);
+  const view = readControlJournal(h.ctx),
+    owner = currentWorkOwner(h.ctx.sessionManager.getSessionId())!;
+  expect(scopeEffectivePlan(view.acceptance, owner)?.permissions[0]?.limits).toBe(
+    input.plan.permissions[0]!.limits,
+  );
+});
 it("commits an exact same-Goal native revision while preserving Start, tasks, pause and accounting", async () => {
   const h = await fixture(),
     original = structuredClone(currentRuntime().preflight),
@@ -188,6 +331,14 @@ it("commits an exact same-Goal native revision while preserving Start, tasks, pa
   expect((await revokeScopeRevision(h.mock.api, h.ctx, commit.entryId)).status).toBe("revoked");
   expect(scopeRevisionIssue(readControlJournal(h.ctx).acceptance, owner)).toMatch(/revoked/);
   expect(() => proposeScopeRevision(h.mock.api, h.ctx, h.input)).toThrow(/revoked/i);
+  const context = preflightContext(h.ctx);
+  expect(context).toContain("revoked");
+  expect(context).not.toContain("Main may submit a complete propose_scope_revision");
+  expect(nextFlowStep(getBoard(), currentRuntime().supervisor, flowFacts(h.ctx))).not.toContain(
+    "recover",
+  );
+  await h.command("pause Retain revoked scope");
+  expect(vi.mocked(h.ctx.ui.notify).mock.calls.at(-1)?.[0]).not.toContain("propose_scope_revision");
 });
 it.each(["defer", "reject", "bytes", "resize"])(
   "does not grant from %s and never repeats original approval or Start",
@@ -405,10 +556,30 @@ it("will not refresh a saved approval after material changes; a genuinely new na
   await expect(reviewScopeRevision(h.mock.api, h.ctx, proposal.proposalId)).rejects.toThrow();
   ui.assertNoScriptErrors();
   h.mock.appendEntry.mockImplementation(append);
+  expect(preflightContext(h.ctx)).not.toContain("/task-supervisor repair-preflight");
   writeFileSync(join(h.root, "checker.mjs"), "// explicitly changed material needs fresh review\n");
   expect((await repairScopeRevision(h.mock.api, h.ctx, proposal.proposalId)).status).toBe(
     "needs_review",
   );
+  expect(nextFlowStep(getBoard(), currentRuntime().supervisor, flowFacts(h.ctx))).toContain(
+    `review-scope ${proposal.proposalId}`,
+  );
+  await h.nativeCommand(`repair-scope ${proposal.proposalId}`);
+  const notice = vi.mocked(h.ctx.ui.notify).mock.calls.at(-1)?.[0];
+  expect(notice).toContain(`review-scope ${proposal.proposalId}`);
+  expect(notice).toContain("changed");
+  const file = h.ctx.sessionManager.getSessionFile();
+  vi.mocked(h.ctx.sessionManager.getSessionFile).mockReturnValue("/foreign/display-source.jsonl");
+  expect(cachedScopeFlow(h.ctx)?.stage).not.toBe("needs_review");
+  vi.mocked(h.ctx.sessionManager.getSessionFile).mockReturnValue(file);
+  const physical = readFileSync(h.path, "utf8");
+  await h.fire("session_tree", {});
+  expect(cachedScopeFlow(h.ctx)?.stage).not.toBe("needs_review");
+  expect(readFileSync(h.path, "utf8")).toBe(physical);
+  expect((await repairScopeRevision(h.mock.api, h.ctx, proposal.proposalId)).status).toBe(
+    "needs_review",
+  );
+  expect(cachedScopeFlow(h.ctx)?.stage).toBe("needs_review");
   expect(readControlJournal(h.ctx).acceptance?.scopeCommits).toHaveLength(0);
   const replacement = installCustomUI(h.ctx, (d) => {
     d.reviewAll();
@@ -577,6 +748,413 @@ it.each(["missing", "version", "approval", "start", "proposal", "revoked", "stal
     expect(h.entries).toHaveLength(before);
   },
 );
+it("hands explicit paused Main turns metadata-only guidance without automatically dispatching them", async () => {
+  const h = await fixture(),
+    tool = createProposeScopeRevisionTool(h.mock.api);
+  vi.mocked(h.mock.api.getAllTools).mockReturnValue([
+    ...h.mock.api.getAllTools(),
+    {
+      ...tool,
+      exposure: "direct",
+      sourceInfo: {
+        path: "owned-test:scope",
+        source: "path",
+        scope: "temporary",
+        origin: "top-level",
+      },
+    },
+  ]);
+  await h.command("resume");
+  const denied = await tool.execute("active-scope", h.input, undefined, undefined, h.ctx);
+  expect(denied.isError).toBe(true);
+  expect(denied.details).toMatchObject({ code: "SCOPE_NOT_HELD" });
+  expect(JSON.stringify(denied)).toContain("/task-supervisor pause");
+  h.mock.sendMessage.mockClear();
+  await h.command("pause Exact scope metadata only");
+  expect(h.mock.sendMessage.mock.calls.some(([, options]) => options?.triggerTurn)).toBe(false);
+  expect(
+    vi
+      .mocked(h.ctx.ui.notify)
+      .mock.calls.map(([text]) => text)
+      .join("\n"),
+  ).toContain("Main未排队");
+  const state = structuredClone(currentRuntime().supervisor),
+    original = structuredClone(currentRuntime().preflight);
+  const context = await h.fire("before_agent_start", {
+    prompt: "Keep paused; submit metadata only",
+  });
+  expect(JSON.stringify(context)).toContain("propose_scope_revision");
+  expect(JSON.stringify(context)).toContain("reason");
+  expect(
+    await h.fire("tool_call", {
+      toolName: tool.name,
+      toolCallId: "paused-metadata",
+      input: h.input,
+    }),
+  ).toBeUndefined();
+  const proposal = await tool.execute("paused-metadata", h.input, undefined, undefined, h.ctx);
+  expect(proposal.isError).not.toBe(true);
+  expect(currentRuntime().supervisor).toEqual(state);
+  expect(currentRuntime().preflight).toEqual(original);
+  expect(readControlJournal(h.ctx).acceptance?.scopeCommits).toHaveLength(0);
+  expect(
+    await h.fire("tool_call", {
+      toolName: "write",
+      toolCallId: "forbidden-paused-write",
+      input: { path: "bad", content: "bad" },
+    }),
+  ).toMatchObject({ block: true });
+});
+it.each(["missing-file", "profile-limit", "foreign-source"])(
+  "keeps %s material unproposed and performs no dispatch or avoidable file capture",
+  async (kind) => {
+    const h = await fixture(),
+      input = structuredClone(h.input),
+      spec = input.contract.checks[0]!;
+    if (spec.kind !== "automatic") throw Error("Expected finite check");
+    if (kind === "missing-file") rmSync(join(h.root, "checker.mjs"));
+    if (kind === "profile-limit") spec.timeoutMs = 30001;
+    if (kind === "foreign-source")
+      vi.mocked(h.ctx.sessionManager.getSessionFile).mockReturnValue("/foreign/unavailable.jsonl");
+    const before = readFileSync(h.path, "utf8"),
+      calls = h.mock.sendMessage.mock.calls.length,
+      prompts = vi.mocked(h.ctx.ui.custom).mock.calls.length;
+    const capture = vi.spyOn(checkRunner, "captureCheckDefinitionVersion");
+    try {
+      const result = await createProposeScopeRevisionTool(h.mock.api).execute(
+        "unreviewable",
+        input,
+        undefined,
+        undefined,
+        h.ctx,
+      );
+      expect(result.isError).toBe(true);
+      if (kind !== "missing-file") expect(capture).not.toHaveBeenCalled();
+    } finally {
+      capture.mockRestore();
+    }
+    expect(readFileSync(h.path, "utf8")).toBe(before);
+    expect(h.mock.sendMessage).toHaveBeenCalledTimes(calls);
+    expect(vi.mocked(h.ctx.ui.custom)).toHaveBeenCalledTimes(prompts);
+  },
+);
+it("recaptures actual definition bytes at native review, not a submission-time proof or repeated-proposal cache", async () => {
+  const h = await fixture(),
+    proposal = proposeScopeRevision(h.mock.api, h.ctx, h.input),
+    before = readFileSync(h.path, "utf8");
+  const path = join(h.root, "checker.mjs"),
+    changed =
+      readFileSync(path, "utf8") + "// Newly frozen exact definition after metadata preflight\n";
+  writeFileSync(path, changed);
+  expect(proposeScopeRevision(h.mock.api, h.ctx, h.input).ref).toEqual(proposal.ref);
+  expect(readFileSync(h.path, "utf8")).toBe(before);
+  const ui = installCustomUI(h.ctx, (d) => {
+    d.reviewAll();
+  });
+  expect((await reviewScopeRevision(h.mock.api, h.ctx, proposal.proposalId)).status).toBe(
+    "committed",
+  );
+  ui.assertNoScriptErrors();
+  const view = readControlJournal(h.ctx).acceptance!,
+    bound = view.contracts.at(-1)!,
+    ref = bound.data.definitions[0]!.ref;
+  const actual = view.definitions.find((d) => d.entryId === ref.entryId && d.digest === ref.digest)!
+    .data.frozenFiles[0]!.sha256;
+  expect(actual).toBe(createHash("sha256").update(changed).digest("hex"));
+  expect(ui.rendered.join("\n")).toContain(actual);
+  expect(currentRuntime().supervisor?.status).toBe("paused");
+});
+it("rejects a structurally valid but unfreezable scope before any metadata or feature append", async () => {
+  const h = await fixture(),
+    input = structuredClone(h.input),
+    spec = input.contract.checks[0]!;
+  if (spec.kind !== "automatic") throw Error("Expected finite check");
+  spec.args = Array.from({ length: 16 }, (_, i) => `arg${i}-` + "x".repeat(890));
+  const delta = 14899 - Buffer.byteLength(JSON.stringify(input.contract)),
+    last = spec.args[15]!;
+  spec.args[15] = delta >= 0 ? last + "x".repeat(delta) : last.slice(0, last.length + delta);
+  expect(Buffer.byteLength(JSON.stringify(input.contract))).toBe(14899);
+  expect(spec.args.every((arg) => arg.length <= 1000)).toBe(true);
+  const before = readFileSync(h.path, "utf8"),
+    state = structuredClone(currentRuntime().supervisor),
+    prompts = vi.mocked(h.ctx.ui.custom).mock.calls.length;
+  for (let i = 0; i < 3; i++)
+    expect(() => proposeScopeRevision(h.mock.api, h.ctx, input)).toThrow(/16KiB|capacity/);
+  expect(readFileSync(h.path, "utf8")).toBe(before);
+  expect(currentRuntime().supervisor).toEqual(state);
+  expect(vi.mocked(h.ctx.ui.custom)).toHaveBeenCalledTimes(prompts);
+  expect(readControlJournal(h.ctx).acceptance?.scopeProposals ?? []).toHaveLength(0);
+});
+it("checks the closed-board gate before recapturing retained unreviewable metadata (deny-only stage fixture)", async () => {
+  const h = await fixture(),
+    large = structuredClone(h.input),
+    spec = large.contract.checks[0]!;
+  if (spec.kind !== "automatic") throw Error("Expected finite check");
+  spec.args = Array.from({ length: 16 }, () => "x".repeat(890));
+  const retained = retainScopeV1Candidate(h.mock.api, h.ctx, large);
+  // This cache change proves rejection precedence only, never completed-business authority.
+  currentRuntime().board.workflowStatus = "completed";
+  const before = readFileSync(h.path, "utf8"),
+    capture = vi.spyOn(checkRunner, "captureCheckDefinitionVersion");
+  try {
+    await expect(reviewScopeRevision(h.mock.api, h.ctx, retained.data.proposalId)).rejects.toThrow(
+      /Completed task board/,
+    );
+    expect(capture).not.toHaveBeenCalled();
+  } finally {
+    capture.mockRestore();
+  }
+  expect(readFileSync(h.path, "utf8")).toBe(before);
+});
+it("reports a conservative plan/ref upper bound before writing when the raw UTF-8 plan is near16000", async () => {
+  const h = await fixture(),
+    input = structuredClone(h.input);
+  input.plan.steps = Array.from({ length: 4 }, (_, i) => `${i}${"界".repeat(999)}`);
+  input.plan.steps.push(
+    "界".repeat(Math.floor((15800 - Buffer.byteLength(JSON.stringify(input.plan))) / 3)),
+  );
+  const before = readFileSync(h.path, "utf8");
+  expect(() => proposeScopeRevision(h.mock.api, h.ctx, input)).toThrow(/plan capacity upper bound/);
+  expect(readFileSync(h.path, "utf8")).toBe(before);
+});
+it("sizes UTF-8 material with long refs and actual scope authority/deterministic IDs, not a shorter generic record", async () => {
+  const h = await fixture(undefined, 4),
+    input = structuredClone(h.input),
+    prepared = prepareScopeRevisionContract(h.ctx, input.contract, "proposal");
+  const requirements = input.contract.requirements.map((r) => ({
+    ...r,
+    source: "界".repeat(300),
+    text: "",
+  }));
+  const generic = {
+    ...prepared.base,
+    header: { ...prepared.base.header, requirements },
+    authority: { kind: "recognized-host" as const, originalGoalDigest: "a".repeat(64) },
+    definitions: prepared.definitions.map((d) => ({
+      checkId: d.spec.checkId,
+      ref: { entryId: "x".repeat(200), digest: "a".repeat(64) },
+      definitionDigest: d.definitionDigest,
+    })),
+    contractDigest: "a".repeat(64),
+  };
+  const size = (target: number) => {
+    for (const r of requirements) r.text = "";
+    let remaining = target - Buffer.byteLength(JSON.stringify(generic));
+    for (let i = 0; i < requirements.length; i++) {
+      const bytes = Math.min(3600, remaining - (requirements.length - 1 - i)),
+        remainder = bytes % 3;
+      requirements[i]!.text =
+        "界".repeat(Math.floor(bytes / 3)) + (remainder === 2 ? "é" : remainder === 1 ? "x" : "");
+      remaining -= bytes;
+    }
+    expect(remaining).toBe(0);
+    expect(Buffer.byteLength(JSON.stringify(generic))).toBe(target);
+    input.contract.requirements = structuredClone(requirements);
+  };
+  size(16284);
+  expect(validAcceptanceFact(generic, h.ctx.sessionManager.getSessionId())).toBe(true);
+  const before = readFileSync(h.path, "utf8");
+  expect(() => proposeScopeRevision(h.mock.api, h.ctx, input)).toThrow(/16KiB/);
+  expect(readFileSync(h.path, "utf8")).toBe(before);
+  size(15500);
+  input.plan.steps = Array.from({ length: 4 }, (_, i) => `${i}${"界".repeat(999)}`);
+  input.plan.steps.push(
+    "界".repeat(Math.floor((15500 - Buffer.byteLength(JSON.stringify(input.plan))) / 3)),
+  );
+  const p = proposeScopeRevision(h.mock.api, h.ctx, input),
+    ui = installCustomUI(h.ctx, (d) => {
+      d.reviewAll();
+    });
+  expect((await reviewScopeRevision(h.mock.api, h.ctx, p.proposalId)).status).toBe("committed");
+  ui.assertNoScriptErrors();
+  const committedBytes = readFileSync(h.path, "utf8");
+  expect(() =>
+    proposeScopeRevision(h.mock.api, h.ctx, {
+      ...input,
+      reason: "Second large full document, do not omit historical conditions",
+    }),
+  ).toThrow(/64KB/);
+  expect(readFileSync(h.path, "utf8")).toBe(committedBytes);
+});
+it.each([false, true])(
+  "routes a retained oversized scope to Main after actual reviewability failure (cold=%s)",
+  async (cold) => {
+    const h = await fixture(),
+      large = structuredClone(h.input),
+      spec = large.contract.checks[0]!;
+    if (spec.kind !== "automatic") throw Error("Expected finite check");
+    spec.args = Array.from({ length: 16 }, (_, i) => `arg${i}-` + "x".repeat(890));
+    const saved = retainScopeV1Candidate(h.mock.api, h.ctx, large),
+      before = readFileSync(h.path, "utf8");
+    if (cold) await h.fire("session_tree", {});
+    const prompts = vi.mocked(h.ctx.ui.custom).mock.calls.length;
+    await h.nativeCommand(`review-scope ${saved.data.proposalId}`);
+    const notice = vi.mocked(h.ctx.ui.notify).mock.calls.at(-1)?.[0];
+    expect(notice).toContain("Main");
+    expect(cachedScopeFlow(h.ctx)?.stage).toBe("unreviewable");
+    const next = nextFlowStep(getBoard(), currentRuntime().supervisor, flowFacts(h.ctx));
+    expect(next).toContain("Main");
+    expect(next).not.toContain(`review-scope ${saved.data.proposalId}`);
+    expect(
+      JSON.stringify(
+        await h.fire("before_agent_start", { prompt: "Explain exact material failure only" }),
+      ),
+    ).toContain("Main");
+    const definitionCapture = vi.spyOn(checkRunner, "captureCheckDefinitionVersion"),
+      executionCapture = vi.spyOn(checkRunner, "captureCheckVersion");
+    try {
+      await h.command("status");
+      expect(definitionCapture).not.toHaveBeenCalled();
+      expect(executionCapture).not.toHaveBeenCalled();
+    } finally {
+      definitionCapture.mockRestore();
+      executionCapture.mockRestore();
+    }
+    expect(vi.mocked(h.ctx.ui.notify).mock.calls.at(-1)?.[0]).toContain("Main");
+    expect(readFileSync(h.path, "utf8")).toBe(before);
+    expect(vi.mocked(h.ctx.ui.custom)).toHaveBeenCalledTimes(prompts);
+    vi.mocked(h.ctx.sessionManager.getSessionFile).mockReturnValue("/foreign/display-source.jsonl");
+    expect(cachedScopeFlow(h.ctx)?.stage).not.toBe("unreviewable");
+    vi.mocked(h.ctx.sessionManager.getSessionFile).mockReturnValue(h.path);
+    currentRuntime().goalEpoch++;
+    expect(cachedScopeFlow(h.ctx)?.stage).not.toBe("unreviewable");
+    await h.nativeCommand(`review-scope ${saved.data.proposalId}`);
+    expect(cachedScopeFlow(h.ctx)?.stage).toBe("unreviewable");
+    const small = proposeScopeRevision(h.mock.api, h.ctx, h.input),
+      ui = installCustomUI(h.ctx, (d) => {
+        d.reviewAll();
+      });
+    expect(small.proposalId).not.toBe(saved.data.proposalId);
+    expect(cachedScopeFlow(h.ctx)?.stage).toBe("review");
+    expect((await reviewScopeRevision(h.mock.api, h.ctx, small.proposalId)).status).toBe(
+      "committed",
+    );
+    ui.assertNoScriptErrors();
+  },
+);
+it("reuses only the latest identical pending scope without consuming the eight genuine proposal slots", async () => {
+  const h = await fixture(),
+    first = proposeScopeRevision(h.mock.api, h.ctx, h.input),
+    before = readFileSync(h.path, "utf8");
+  for (let i = 0; i < 8; i++) {
+    const again = proposeScopeRevision(h.mock.api, h.ctx, {
+      ...h.input,
+      plan: { ...h.input.plan, contractProposalId: "untrusted-derived-value" },
+    });
+    expect(again.proposalId).toBe(first.proposalId);
+    expect(again.ref).toEqual(first.ref);
+  }
+  expect(readFileSync(h.path, "utf8")).toBe(before);
+  expect(readControlJournal(h.ctx).acceptance?.scopeProposals).toHaveLength(1);
+  for (let i = 1; i < 8; i++)
+    proposeScopeRevision(h.mock.api, h.ctx, { ...h.input, reason: `Distinct exact reason ${i}` });
+  const full = readFileSync(h.path, "utf8");
+  const latest = proposeScopeRevision(h.mock.api, h.ctx, {
+    ...h.input,
+    reason: "Distinct exact reason 7",
+  });
+  expect(latest.proposalId).toBe(
+    readControlJournal(h.ctx).acceptance?.scopeProposals?.at(-1)?.data.proposalId,
+  );
+  expect(readFileSync(h.path, "utf8")).toBe(full);
+  expect(() =>
+    proposeScopeRevision(h.mock.api, h.ctx, { ...h.input, reason: "Ninth genuine material" }),
+  ).toThrow(/capacity/);
+  expect(readFileSync(h.path, "utf8")).toBe(full);
+});
+it.each(["contract", "plan"])(
+  "counts distinct full %s values with the same reason, while reusing a cancelled pending candidate at capacity",
+  async (kind) => {
+    const h = await fixture();
+    const input = (i: number) => ({
+      ...h.input,
+      ...(kind === "plan"
+        ? { plan: { ...h.input.plan, steps: [`Exact step variant${i}`] } }
+        : {
+            contract: {
+              ...h.input.contract,
+              requirements: h.input.contract.requirements.map((r) => ({
+                ...r,
+                text: `Exact requirement variant${i}`,
+              })),
+            },
+          }),
+    });
+    for (let i = 0; i < 8; i++) proposeScopeRevision(h.mock.api, h.ctx, input(i));
+    const before = readFileSync(h.path, "utf8"),
+      pending = proposeScopeRevision(h.mock.api, h.ctx, input(7));
+    expect(pending.reused).toBe(true);
+    expect(readFileSync(h.path, "utf8")).toBe(before);
+    expect(() => proposeScopeRevision(h.mock.api, h.ctx, input(8))).toThrow(/capacity/);
+    const ui = installCustomUI(h.ctx, (d) => {
+      d.press("\u001b");
+    });
+    expect((await reviewScopeRevision(h.mock.api, h.ctx, pending.proposalId)).status).toBe(
+      "deferred",
+    );
+    ui.assertNoScriptErrors();
+    expect(proposeScopeRevision(h.mock.api, h.ctx, input(7)).ref).toEqual(pending.ref);
+    expect(readFileSync(h.path, "utf8")).toBe(before);
+  },
+  15000, // Eight distinct physical proposals plus exact native cancellation under V8; production counts/caps are unchanged.
+);
+it("does not revive an older pending A after B or reuse a native response as new proposal authority", async () => {
+  const h = await fixture(),
+    a = proposeScopeRevision(h.mock.api, h.ctx, h.input);
+  const b = proposeScopeRevision(h.mock.api, h.ctx, { ...h.input, reason: "B exact replacement" });
+  const againA = proposeScopeRevision(h.mock.api, h.ctx, h.input);
+  expect(againA.proposalId).not.toBe(a.proposalId);
+  expect(againA.proposalId).not.toBe(b.proposalId);
+  const ui = installCustomUI(h.ctx, (d) => {
+    d.press("r");
+  });
+  expect((await reviewScopeRevision(h.mock.api, h.ctx, againA.proposalId)).status).toBe("rejected");
+  ui.assertNoScriptErrors();
+  const before = readFileSync(h.path, "utf8");
+  expect(() => proposeScopeRevision(h.mock.api, h.ctx, h.input)).toThrow(
+    /responded|review|repair/i,
+  );
+  expect(readFileSync(h.path, "utf8")).toBe(before);
+});
+it("rejects ordinary post-compilation contract metadata before writing and points at the usable scope route", async () => {
+  const h = await fixture();
+  await h.command("resume");
+  writeFileSync(join(h.root, "checker.mjs"), "// changed definition; no process run\n");
+  await expect(executeRegisteredCheck(h.mock.api, h.ctx, "not-admitted", "output")).rejects.toThrow(
+    /propose_scope_revision|review-scope/,
+  );
+  const before = readFileSync(h.path, "utf8"),
+    prompts = vi.mocked(h.ctx.ui.custom).mock.calls.length;
+  const result = await createProposeContractTool(h.mock.api).execute(
+    "wrong-stage",
+    { proposal: h.input.contract },
+    undefined,
+    undefined,
+    h.ctx,
+  );
+  expect(result.isError).toBe(true);
+  expect(JSON.stringify(result.content)).toContain("propose_scope_revision");
+  const forged = { proposal: h.input.contract, scopeMetadata: true };
+  const copied = await createProposeContractTool(h.mock.api).execute(
+    "copied-private-flag",
+    forged,
+    undefined,
+    undefined,
+    h.ctx,
+  );
+  expect(copied.isError).toBe(true);
+  expect(readFileSync(h.path, "utf8")).toBe(before);
+  expect(vi.mocked(h.ctx.ui.custom)).toHaveBeenCalledTimes(prompts);
+  await h.command("pause Exact scope only");
+  const proposed = proposeScopeRevision(h.mock.api, h.ctx, h.input),
+    ui = installCustomUI(h.ctx, (d) => {
+      d.reviewAll();
+    });
+  expect((await reviewScopeRevision(h.mock.api, h.ctx, proposed.proposalId)).status).toBe(
+    "committed",
+  );
+  ui.assertNoScriptErrors();
+});
 it("exposes only the original proposal tool schema and never grants from its result", async () => {
   const h = await fixture(),
     tool = createProposeScopeRevisionTool(h.mock.api);
@@ -611,7 +1189,13 @@ it("exposes only the original proposal tool schema and never grants from its res
   h.mock.appendEntry.mockImplementation(() => {
     throw hostFailure;
   });
-  const failed = await tool.execute("scope-unknown", h.input, undefined, undefined, h.ctx);
+  const failed = await tool.execute(
+    "scope-unknown",
+    { ...h.input, reason: h.input.reason + " persistence failure" },
+    undefined,
+    undefined,
+    h.ctx,
+  );
   expect(failed.isError).toBe(true);
   expect(failed.content).toEqual([{ type: "text", text: "Scope proposal failed" }]);
 });
@@ -1004,6 +1588,11 @@ it("binds scope revisions to an actual lifecycle-scoped Goal and its original pe
     );
     expect(compiled.isError).not.toBe(true);
     await g.command("pause Exact same-owner amendment");
+    const context = await g.fire("before_agent_start", {
+      prompt: "Explicit metadata-only request",
+    });
+    expect(JSON.stringify(context)).toContain("propose_scope_revision");
+    expect(JSON.stringify(context)).toContain("reason");
     const source = scopeRevisionContractContext(g.ctx),
       plan = structuredClone(currentRuntime().preflight!.proposal!);
     delete plan.contractProposalId;
@@ -1160,6 +1749,43 @@ it("refuses a seventeenth native response before opening another question", asyn
   expect(readControlJournal(h.ctx).acceptance?.scopeReviews).toHaveLength(16);
   expect(readControlJournal(h.ctx).acceptance?.scopeCommits).toHaveLength(0);
 }, 60000); // Sixteen real native responses/source folds under V8 instrumentation; production caps stay16.
+it("repairs the original witnessed last-slot scope metadata without reserving a seventeenth response", async () => {
+  const h = await fixture(),
+    p = proposeScopeRevision(h.mock.api, h.ctx, h.input);
+  for (let i = 0; i < 15; i++) {
+    const ui = installCustomUI(h.ctx, (d) => {
+      d.press("r");
+    });
+    expect((await reviewScopeRevision(h.mock.api, h.ctx, p.proposalId)).status).toBe("rejected");
+    ui.assertNoScriptErrors();
+  }
+  const append = h.mock.appendEntry.getMockImplementation() as (
+    type: string,
+    data: unknown,
+  ) => void;
+  let failed = false;
+  h.mock.appendEntry.mockImplementation((type, data) => {
+    if (
+      !failed &&
+      type === "continuous-tasks:acceptance-facts" &&
+      (data as { kind?: string }).kind === "acceptance-contract-bound"
+    ) {
+      failed = true;
+      throw Error("Owned final-slot before-bound failure");
+    }
+    append(type, data);
+  });
+  const ui = installCustomUI(h.ctx, (d) => {
+    d.reviewAll();
+  });
+  await expect(reviewScopeRevision(h.mock.api, h.ctx, p.proposalId)).rejects.toThrow();
+  ui.assertNoScriptErrors();
+  h.mock.appendEntry.mockImplementation(append);
+  const count = vi.mocked(h.ctx.ui.custom).mock.calls.length;
+  expect((await repairScopeRevision(h.mock.api, h.ctx, p.proposalId)).status).toBe("committed");
+  expect(vi.mocked(h.ctx.ui.custom)).toHaveBeenCalledTimes(count);
+  expect(readControlJournal(h.ctx).acceptance?.scopeReviews).toHaveLength(16);
+}, 60000);
 it("rejects added permission, workspace and runtime objects before metadata writes", async () => {
   const h = await fixture(),
     count = h.entries.length;

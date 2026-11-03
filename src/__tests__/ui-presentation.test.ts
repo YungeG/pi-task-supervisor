@@ -1,6 +1,7 @@
 import { beforeEach, expect, it } from "vitest";
 import { createSubmitPreflightTool, createWorkflowGateTool } from "../tools";
 import { createEmptyBoard } from "../engine";
+import { boardNotice, preflightNotice } from "../human-presentation";
 import { resetState } from "../state";
 import { createMockAPI, createMockTheme } from "./helpers/mocks";
 
@@ -58,6 +59,31 @@ it.each([
     expect(output.render(120).join("\n")).toContain("详情：/task-supervisor tasks → 确认与回应");
     expect(output.render(120).join("\n")).not.toContain("machine-only");
     expect(result).toEqual(before);
+  },
+);
+
+it.each([
+  ["ui_error", "界面打开或交互失败", "warning"],
+  ["no_response", "退出原因未知", "info"],
+  ["user_deferred", "你选择了稍后", "info"],
+  ["stale", "旧交互未提交", "warning"],
+  ["aborted", "宿主已取消", "warning"],
+  ["busy", "已有原生确认", "info"],
+] as const)(
+  "shows the observed %s cause without changing deferred or its payload",
+  (code, text, level) => {
+    const interaction = { code, phase: "presentation" as const };
+    const result = { status: "deferred" as const, interaction };
+    const before = structuredClone(result);
+    expect(preflightNotice(result)).toMatchObject({
+      message: expect.stringContaining(text),
+      level,
+    });
+    expect(boardNotice(result)).toMatchObject({ message: expect.stringContaining(text), level });
+    expect(result).toEqual(before);
+    const held = preflightNotice({ ...result, projectionPending: true });
+    expect(held.message).toContain("无需重复批准");
+    expect(held.message).not.toContain(text);
   },
 );
 

@@ -1,0 +1,3207 @@
+diff --git a/packages/coding-agent/docs/extensions.md b/packages/coding-agent/docs/extensions.md
+index 5cdb83b..b37286c 100644
+--- a/packages/coding-agent/docs/extensions.md
++++ b/packages/coding-agent/docs/extensions.md
+@@ -164,7 +164,7 @@ flowchart TD
+ 
+ <a id="agent_start--agent_end--agent_before_settle--agent_settled"></a>
+ 
+-Use `agent_before_settle` when an extension must append entries or request one final continuation. Use `agent_settled` for notification-only work that should run after Pi has no automatic continuation remaining.
++Use `agent_before_settle` when an extension must append entries or request one final continuation. Use `agent_settled` for notification-only work that should run after Pi has no automatic continuation remaining. Neither handler is an event-outside idle lease: `agent_before_settle` is still busy, and later `agent_settled` handlers can submit deferred input.
+ 
+ <a id="extensionapi-methods"></a>
+ 
+@@ -331,6 +331,45 @@ These operations are command-only because calling them from lifecycle handlers c
+ 
+ Session replacement invalidates the old context. Capture only plain data before switching, then use the fresh context supplied to `withSession` for session-bound work.
+ 
++### Cancellable idle actions
++
++An AgentSession-backed context, including an extension shortcut, optionally exposes `ctx.idleActions` with `version: 1`. Request one finite interaction from an event or shortcut; do not await its result from an awaited lifecycle handler. The callback starts only after relevant handlers, native controls, input operations and pending input have finished, including idle cache-warming decisions and their awaited provider headers/payload hooks. Shortcuts are not themselves an awaited lifecycle barrier and may await the result.
++
++Blocking leased UI currently requires a qualified local TUI (`ctx.mode === "tui"` with a real UI). RPC has no dialog-close acknowledgement: leased `select`, `confirm`, `input`, `editor` and `custom` calls fail before any UI request is sent. Such a callback fails with `callback_error` unless it handles the unsupported call. Metadata-only actions remain available in other modes. Ordinary RPC dialogs and their `hasUI` behavior are unchanged; `hasUI` alone does not qualify a leased dialog.
++
++```typescript
++const actions = ctx.idleActions;
++if (!actions || actions.version !== 1 || ctx.mode !== "tui" || !ctx.hasUI) return; // No legacy-idle fallback.
++const handle = actions.request({
++  id: attemptId, // A fresh UUID, retained for duplicate calls to this one attempt.
++  binding: materialHash, // Lowercase SHA-256 of source/request/material identity.
++  isCurrent: () => sourceStillMatches(), // Synchronous, read-only, literal boolean.
++  run: async (lease) => {
++    const selected = await lease.context.ui.select("Review complete?", ["Continue", "Later"], {
++      signal: lease.signal,
++    });
++    if (selected !== "Continue" || !lease.isCurrent()) return;
++    // Save any application approval through its original validated control here.
++    await lease.dispatch(
++      { customType: "extension-next-step", content: "Continue within the approved scope", display: false },
++      () => sourceStillMatches() && originalExecutionChecksPass(),
++    );
++  },
++});
++```
++
++The application supplies `attemptId`, `materialHash`, and its source/execution checks. A lease is not an approval, authentication proof, or execution budget. Saving an approval and dispatching a model turn remain separate operations. After saving, a cancelled or unknown dispatch must retain that fact, not collect approval again or automatically retry it.
++
++`state()` returns a lifecycle `phase` (`busy`, `settling`, `idle`), `pendingInputs`, and optional `activeActionId`. The pending count includes outstanding input operations and pending sources: the real core queue is one source, not the UI's steering/follow-up mirrors. It also includes deferred settled actions (even after removal from the deferred array), next-turn/context-only messages and pending bash records. Neither the old `isIdle()` nor a zero old `hasPendingMessages()` proves action eligibility.
++
++Only one pending/active attempt is admitted per session. Duplicate id/binding returns the original handle; a changed binding conflicts, and another id while occupied is rejected as busy. Up to 4096 attempt records are retained without eviction, after which new requests fail closed with capacity. Reload does not reset this bound. Attempts are not persisted or replayed on restart.
++
++The callback must use `lease.context`, pass `lease.signal` to its interaction, and close custom UI in an abort handler before returning. Its UI has an explicit owner token; ordinary event, EventBus and shortcut contexts never inherit ownership. Competing input or ordinary UI cancels an unstarted action and joins its cleanup before proceeding. A callback that fails to close its UI keeps the slot blocked; Pi does not force-kill arbitrary extension JavaScript. A cached context or UI method cannot acquire new rights after reload, replacement, or lease invalidation.
++
++`dispatch()` snapshots the message and is one-shot. Its read-only validator may be asynchronous, but cancellation releases the dispatch immediately and a late `true` cannot revive it. Only literal `true` passes. Ordinary `pi.sendMessage()`, `pi.sendUserMessage()`, input or native control calls from the action callback/validator fail fast instead of waiting on themselves. Ordinary observers, including AgentSession subscribers and runner error listeners, execute outside this host action marker while retaining their own extension async-local state. Their original synchronous return/exception semantics are unchanged.
++
++`handle.result` distinguishes completed, cancelled, rejected, failed, unknown and started outcomes; `handle.cancel()` cancels only unstarted delivery. Completed only means the callback ended. Started contains `actionId`, `runId` and `sessionId` and acknowledges the synchronous **logical start** where the session becomes busy, before preparation or a provider request. AgentSession subscribers additionally receive `idle_action_started` with those same identities. This is distinct from RPC's prompt acknowledgement and the later kernel `agent_start`; it does not mean provider/task success. Once acknowledged, later failures cannot make the attempt replayable. If preparation fails before kernel start, `agent_settled.idleActionFailure` identifies the acknowledged delivery so the application can hold it for inspection.
++
+ <a id="state-management"></a>
+ <a id="persist-state"></a>
+ 
+diff --git a/packages/coding-agent/src/core/agent-session.ts b/packages/coding-agent/src/core/agent-session.ts
+index 3a9174c..2273d1f 100644
+--- a/packages/coding-agent/src/core/agent-session.ts
++++ b/packages/coding-agent/src/core/agent-session.ts
+@@ -13,6 +13,7 @@
+  * Modes use this class and add their own I/O layer on top.
+  */
+ 
++import { randomUUID } from "node:crypto";
+ import { readFileSync } from "node:fs";
+ import { basename, dirname } from "node:path";
+ import {
+@@ -90,6 +91,7 @@ import {
+ 	type ExtensionMode,
+ 	ExtensionRunner,
+ 	type ExtensionUIContext,
++	type IdleActionResult,
+ 	type InputSource,
+ 	type MessageEndEvent,
+ 	type MessageStartEvent,
+@@ -113,6 +115,7 @@ import {
+ 	wrapRegisteredTools,
+ } from "./extensions/index.ts";
+ import { type BeforeAgentStartTrigger, emitSessionShutdownEvent } from "./extensions/runner.ts";
++import { IdleActionController } from "./idle-actions.ts";
+ import { createToolNameMatcher, isMcpToolName } from "./mcp-servers.ts";
+ import { type BashExecutionMessage, type CustomMessage, convertToLlm } from "./messages.ts";
+ import { ModelRegistry } from "./model-registry.ts";
+@@ -200,7 +203,8 @@ export type AgentSessionEvent =
+ 			messages: AgentMessage[];
+ 			willRetry: boolean;
+ 	  }
+-	| { type: "agent_settled"; aborted: boolean }
++	| { type: "agent_settled"; aborted: boolean; idleActionFailure?: Extract<IdleActionResult, { status: "started" }> }
++	| ({ type: "idle_action_started" } & Extract<IdleActionResult, { status: "started" }>)
+ 	| {
+ 			type: "queue_update";
+ 			steering: readonly string[];
+@@ -432,6 +436,49 @@ export class AgentSession {
+ 	private _abortDuringBeforeSettle = false;
+ 	private _isEmittingAgentSettled = false;
+ 	private readonly _deferredSettledActions: Array<() => Promise<void>> = [];
++	private _deferredSettledInFlight = 0;
++	private _idleInputOperations = 0;
++	private readonly _idleActions = new IdleActionController({
++		state: () => ({
++			phase: this._isEmittingAgentSettled
++				? "settling"
++				: this.isIdle && !this.isRetrying && !this.isBashRunning && !this._idleInputOperations
++					? "idle"
++					: "busy",
++			pendingInputs:
++				this._idleInputOperations +
++				this._deferredSettledActions.length +
++				this._deferredSettledInFlight +
++				Number(this.agent.hasQueuedMessages()) +
++				this._pendingNextTurnMessages.length +
++				this._pendingCustomMessages.length +
++				this._pendingBashMessages.length,
++		}),
++		capture: () => {
++			const runner = this._extensionRunner;
++			const sessionId = this.sessionId;
++			const anchor = this.sessionManager.getLeafId();
++			return () =>
++				runner === this._extensionRunner &&
++				this.sessionId === sessionId &&
++				(!anchor || this.sessionManager.getBranch().some((entry) => entry.id === anchor));
++		},
++		context: (signal, owner, current) => this._extensionRunner.createIdleContext(signal, owner, current),
++		start: (actionId, message, acknowledge) => {
++			const runId = randomUUID();
++			void this._startRun(
++				{ messageType: "custom", message: { ...message, role: "custom", timestamp: Date.now() } },
++				undefined,
++				{ actionId, runId, acknowledge },
++			).catch((error: unknown) => {
++				this._extensionRunner.emitError({
++					extensionPath: "<runtime>",
++					event: "idle_action_run",
++					error: error instanceof Error ? error.message : String(error),
++				});
++			});
++		},
++	});
+ 
+ 	private _resourceLoader: ResourceLoader;
+ 	private _customTools: ToolDefinition[];
+@@ -1038,7 +1085,7 @@ export class AgentSession {
+ 	/** Emit an event to all listeners */
+ 	private _emit(event: AgentSessionEvent): void {
+ 		for (const l of this._eventListeners) {
+-			l(event);
++			this._idleActions.outside(() => l(event));
+ 		}
+ 	}
+ 
+@@ -1075,28 +1122,56 @@ export class AgentSession {
+ 		resolve();
+ 	}
+ 
+-	private async _emitAgentSettled(): Promise<void> {
++	private async _withIdleInput<T>(run: () => Promise<T>): Promise<T> {
++		this._idleActions.assertOutsideAction();
++		this._idleInputOperations++;
++		const cleanup = this._idleActions.invalidate("input");
++		try {
++			if (cleanup) await cleanup;
++			return await run();
++		} finally {
++			this._idleInputOperations--;
++			this._idleActions.pump();
++		}
++	}
++
++	/** Mode input barrier, including extension interception and full-result recording. */
++	withUserBashInput<T>(run: () => Promise<T>): Promise<T> {
++		return this._withIdleInput(run);
++	}
++
++	private async _emitAgentSettled(
++		idleActionFailure?: Extract<IdleActionResult, { status: "started" }>,
++	): Promise<void> {
+ 		this._cacheWarmer?.onAgentSettled();
+ 		this._isAgentRunActive = false;
+ 		this._isEmittingAgentSettled = true;
+ 		try {
+ 			const aborted = this._agentRunAbortRequested;
+-			await this._extensionRunner.emit({ type: "agent_settled", aborted });
+-			this._emit({ type: "agent_settled", aborted });
++			const event = { type: "agent_settled" as const, aborted, ...(idleActionFailure ? { idleActionFailure } : {}) };
++			await this._extensionRunner.emit(event);
++			this._emit(event);
+ 		} finally {
+ 			this._isEmittingAgentSettled = false;
+ 		}
+ 
+ 		const deferred = this._deferredSettledActions.splice(0);
+-		if (deferred.length > 0) {
+-			try {
+-				for (const action of deferred) await action();
+-			} finally {
+-				this._resolveIdleWaitIfIdle();
++		let remaining = deferred.length;
++		this._deferredSettledInFlight += remaining;
++		try {
++			for (const action of deferred) {
++				try {
++					await action();
++				} finally {
++					this._deferredSettledInFlight--;
++					remaining--;
++				}
+ 			}
+-			return;
++		} finally {
++			this._deferredSettledInFlight -= remaining;
++			this._resolveIdleWaitIfIdle();
++			this._idleActions.pump();
+ 		}
+-		this._resolveIdleWaitIfIdle();
+ 	}
+ 
+ 	/** Internal handler for agent events - shared by subscribe and reconnect */
+@@ -1410,6 +1485,7 @@ export class AgentSession {
+ 	 * Call this when completely done with the session.
+ 	 */
+ 	dispose(): void {
++		this._idleActions.dispose();
+ 		try {
+ 			this.abortRetry();
+ 			this.abortCompaction();
+@@ -1536,6 +1612,8 @@ export class AgentSession {
+ 	 * Changes take effect on the next agent turn.
+ 	 */
+ 	setActiveToolsByName(toolNames: string[]): void {
++		this._idleActions.assertOutsideAction();
++		this._idleActions.invalidate("input");
+ 		const previous = this.getActiveToolNames();
+ 		this._setActiveTools(toolNames);
+ 		// A loadout that deactivates a tool replaces the restored one, whose pending tools are dropped.
+@@ -1870,50 +1948,83 @@ export class AgentSession {
+ 	 * starting another, and an abort requested meanwhile aborts the run as soon as it exists.
+ 	 * @param onStarted Called once the run's messages are prepared, before the first request.
+ 	 */
+-	private async _startRun(trigger: BeforeAgentStartTrigger, onStarted?: () => void): Promise<void> {
++	private async _startRun(
++		trigger: BeforeAgentStartTrigger,
++		onStarted?: () => void,
++		idleDelivery?: {
++			actionId: string;
++			runId: string;
++			acknowledge: (result: Extract<IdleActionResult, { status: "started" }>) => void;
++		},
++	): Promise<void> {
+ 		this._isAgentRunActive = true;
+ 		this._agentRunAbortRequested = false;
+-		let messages: AgentMessage[];
++		const idleStarted = idleDelivery && {
++			status: "started" as const,
++			actionId: idleDelivery.actionId,
++			runId: idleDelivery.runId,
++			sessionId: this.sessionId,
++		};
++		if (idleStarted && idleDelivery) idleDelivery.acknowledge(idleStarted);
++		let idleSettled = false;
+ 		try {
+-			messages = await this._prepareRun(trigger);
+-		} catch (error) {
+-			this._isAgentRunActive = false;
++			if (idleStarted) this._emit({ type: "idle_action_started", ...idleStarted });
++			let messages: AgentMessage[];
++			try {
++				messages = await this._prepareRun(trigger);
++			} catch (error) {
++				this._isAgentRunActive = false;
++				this._flushPendingBashMessages();
++				this._flushPendingCustomMessages();
++				if (idleStarted) {
++					idleSettled = true;
++					await this._emitAgentSettled(idleStarted);
++				}
++				this._resolveIdleWaitIfIdle();
++				throw error;
++			}
++			// Messages held while the run was starting go before its starting messages, as they would
++			// have while idle. No run exists yet, so they cannot split a tool call from its result.
+ 			this._flushPendingBashMessages();
+ 			this._flushPendingCustomMessages();
+-			this._resolveIdleWaitIfIdle();
+-			throw error;
+-		}
+-		// Messages held while the run was starting go before its starting messages, as they would
+-		// have while idle. No run exists yet, so they cannot split a tool call from its result.
+-		this._flushPendingBashMessages();
+-		this._flushPendingCustomMessages();
+-		onStarted?.();
+-
+-		// Compaction before the prompt may have scheduled a retry; the new prompt replaces it.
+-		this._failedResponse = undefined;
+-		this._recordSelection();
+-		// The run records the loadout in the transcript; restored tools that did not register by now
+-		// are dropped, so a tool that never registers does not stay pending.
+-		this._pendingToolNames.clear();
+-		try {
+-			await this.agent.prompt(messages);
+-			while (!this._agentRunAbortRequested) {
+-				if (await this._handlePostAgentRun()) {
++			onStarted?.();
++
++			// Compaction before the prompt may have scheduled a retry; the new prompt replaces it.
++			this._failedResponse = undefined;
++			this._recordSelection();
++			// The run records the loadout in the transcript; restored tools that did not register by now
++			// are dropped, so a tool that never registers does not stay pending.
++			this._pendingToolNames.clear();
++			try {
++				await this.agent.prompt(messages);
++				while (!this._agentRunAbortRequested) {
++					if (await this._handlePostAgentRun()) {
++						if (this._agentRunAbortRequested) break;
++						await this.agent.continue();
++						continue;
++					}
++					if (this._agentRunAbortRequested || !(await this._runBeforeSettleBoundary())) break;
+ 					if (this._agentRunAbortRequested) break;
+ 					await this.agent.continue();
+-					continue;
+ 				}
+-				if (this._agentRunAbortRequested || !(await this._runBeforeSettleBoundary())) break;
+-				if (this._agentRunAbortRequested) break;
+-				await this.agent.continue();
++			} finally {
++				if (this._agentRunAbortRequested) this._finishCancelledRetry();
++				this._failedResponse = undefined;
++				this._runSystemPromptOptions = undefined;
++				this._flushPendingBashMessages();
++				this._flushPendingCustomMessages();
++				idleSettled = true;
++				await this._emitAgentSettled();
+ 			}
+-		} finally {
+-			if (this._agentRunAbortRequested) this._finishCancelledRetry();
+-			this._failedResponse = undefined;
+-			this._runSystemPromptOptions = undefined;
+-			this._flushPendingBashMessages();
+-			this._flushPendingCustomMessages();
+-			await this._emitAgentSettled();
++		} catch (error) {
++			// H0-only: failures between the ACK and kernel start must not strand a saved Start.
++			// A settlement already attempted is never replayed, even if an observer failed.
++			if (idleStarted && !idleSettled) {
++				this._isAgentRunActive = false;
++				this._runSystemPromptOptions = undefined;
++				await this._emitAgentSettled(idleStarted);
++			}
++			throw error;
+ 		}
+ 	}
+ 
+@@ -2090,6 +2201,10 @@ export class AgentSession {
+ 	 * @throws Error if no model selected or no API key available (when not streaming)
+ 	 */
+ 	async prompt(text: string, options?: PromptOptions): Promise<void> {
++		return this._withIdleInput(() => this._prompt(text, options));
++	}
++
++	private async _prompt(text: string, options?: PromptOptions): Promise<void> {
+ 		if (this._isEmittingAgentSettled) {
+ 			this._deferredSettledActions.push(async () => await this.prompt(text, options));
+ 			return;
+@@ -2239,6 +2354,15 @@ export class AgentSession {
+ 		images: ImageContent[] | undefined,
+ 		behavior: "steer" | "followUp",
+ 		source: InputSource,
++	): Promise<QueuedInputDisposition> {
++		return this._withIdleInput(() => this._queueUserInputInternal(text, images, behavior, source));
++	}
++
++	private async _queueUserInputInternal(
++		text: string,
++		images: ImageContent[] | undefined,
++		behavior: "steer" | "followUp",
++		source: InputSource,
+ 	): Promise<QueuedInputDisposition> {
+ 		if (text.startsWith("/")) {
+ 			this._throwIfExtensionCommand(text);
+@@ -2357,6 +2481,13 @@ export class AgentSession {
+ 	async sendCustomMessage<T = unknown>(
+ 		message: Pick<CustomMessage<T>, "customType" | "content" | "display" | "details">,
+ 		options?: { triggerTurn?: boolean; deliverAs?: "steer" | "followUp" | "nextTurn" },
++	): Promise<void> {
++		return this._withIdleInput(() => this._sendCustomMessage(message, options));
++	}
++
++	private async _sendCustomMessage<T>(
++		message: Pick<CustomMessage<T>, "customType" | "content" | "display" | "details">,
++		options?: { triggerTurn?: boolean; deliverAs?: "steer" | "followUp" | "nextTurn" },
+ 	): Promise<void> {
+ 		const appMessage = {
+ 			role: "custom" as const,
+@@ -2464,6 +2595,8 @@ export class AgentSession {
+ 	 * @returns Object with steering and followUp arrays
+ 	 */
+ 	clearQueue(): { steering: string[]; followUp: string[] } {
++		this._idleActions.assertOutsideAction();
++		this._idleActions.invalidate("input");
+ 		const steering = [...this._steeringMessages];
+ 		const followUp = [...this._followUpMessages];
+ 		this._steeringMessages = [];
+@@ -2496,6 +2629,8 @@ export class AgentSession {
+ 	 * Abort current operation and wait for agent to become idle.
+ 	 */
+ 	async abort(): Promise<void> {
++		this._idleActions.assertOutsideAction();
++		const cleanup = this._idleActions.invalidate("abort");
+ 		if (this._isAgentRunActive) {
+ 			this._agentRunAbortRequested = true;
+ 		}
+@@ -2504,6 +2639,7 @@ export class AgentSession {
+ 		this.abortBranchSummary();
+ 		if (this._isBeforeSettle) this._abortDuringBeforeSettle = true;
+ 		this.agent.abort();
++		if (cleanup) await cleanup;
+ 		await this.waitForIdle();
+ 	}
+ 
+@@ -2539,6 +2675,10 @@ export class AgentSession {
+ 	 * @throws Error if no auth is configured for the model
+ 	 */
+ 	async setModel(model: Model<any>, options: ModelMutationOptions = {}): Promise<void> {
++		return this._withIdleInput(() => this._setModel(model, options));
++	}
++
++	private async _setModel(model: Model<any>, options: ModelMutationOptions): Promise<void> {
+ 		if (!(await this._modelRuntime.checkAuth(model.provider))) {
+ 			throw new Error(`No API key for ${model.provider}/${model.id}`);
+ 		}
+@@ -2584,10 +2724,10 @@ export class AgentSession {
+ 		direction: "forward" | "backward" = "forward",
+ 		options: ModelMutationOptions = {},
+ 	): Promise<ModelCycleResult | undefined> {
+-		if (this._scopedModels.length > 0) {
+-			return this._cycleScopedModel(direction, options);
+-		}
+-		return this._cycleAvailableModel(direction, options);
++		return this._withIdleInput(async () => {
++			if (this._scopedModels.length > 0) return this._cycleScopedModel(direction, options);
++			return this._cycleAvailableModel(direction, options);
++		});
+ 	}
+ 
+ 	private async _cycleScopedModel(
+@@ -2674,6 +2814,8 @@ export class AgentSession {
+ 	 * Persists the requested level to global defaults only when options.persist is true.
+ 	 */
+ 	setThinkingLevel(level: ThinkingLevel, options: ModelMutationOptions = {}): void {
++		this._idleActions.assertOutsideAction();
++		this._idleActions.invalidate("input");
+ 		const availableLevels = this.getAvailableThinkingLevels();
+ 		const effectiveLevel = availableLevels.includes(level) ? level : this._clampThinkingLevel(level, availableLevels);
+ 
+@@ -2826,6 +2968,10 @@ export class AgentSession {
+ 	 * @param customInstructions Optional instructions for the compaction summary
+ 	 */
+ 	async compact(customInstructions?: string): Promise<CompactionResult> {
++		return this._withIdleInput(() => this._compact(customInstructions));
++	}
++
++	private async _compact(customInstructions?: string): Promise<CompactionResult> {
+ 		await this.abort();
+ 		this._compactionAbortController = new AbortController();
+ 		this._emit({ type: "compaction_start", reason: "manual" });
+@@ -2976,6 +3122,8 @@ export class AgentSession {
+ 	 * Cancel in-progress compaction (manual or auto).
+ 	 */
+ 	abortCompaction(): void {
++		this._idleActions.assertOutsideAction();
++		this._idleActions.invalidate("abort");
+ 		this._compactionAbortController?.abort();
+ 		this._autoCompactionAbortController?.abort();
+ 	}
+@@ -2984,6 +3132,8 @@ export class AgentSession {
+ 	 * Cancel in-progress branch summarization.
+ 	 */
+ 	abortBranchSummary(): void {
++		this._idleActions.assertOutsideAction();
++		this._idleActions.invalidate("abort");
+ 		this._branchSummaryAbortController?.abort();
+ 	}
+ 
+@@ -3316,6 +3466,10 @@ export class AgentSession {
+ 	}
+ 
+ 	async bindExtensions(bindings: ExtensionBindings): Promise<void> {
++		return this._withIdleInput(() => this._bindExtensions(bindings));
++	}
++
++	private async _bindExtensions(bindings: ExtensionBindings): Promise<void> {
+ 		if (bindings.uiContext !== undefined) {
+ 			this._extensionUIContext = bindings.uiContext;
+ 		}
+@@ -3446,6 +3600,7 @@ export class AgentSession {
+ 		runner.bindCore(
+ 			{
+ 				sendMessage: (message, options) => {
++					this._idleActions.assertOutsideAction();
+ 					this.sendCustomMessage(message, options).catch((err) => {
+ 						runner.emitError({
+ 							extensionPath: "<runtime>",
+@@ -3455,6 +3610,7 @@ export class AgentSession {
+ 					});
+ 				},
+ 				sendUserMessage: (content, options) => {
++					this._idleActions.assertOutsideAction();
+ 					this.sendUserMessage(content, options).catch((err) => {
+ 						runner.emitError({
+ 							extensionPath: "<runtime>",
+@@ -3494,6 +3650,10 @@ export class AgentSession {
+ 				setThinkingLevel: (level) => this.setThinkingLevel(level),
+ 			},
+ 			{
++				idleActions: this._idleActions.api,
++				invokeOutsideIdleAction: (run) => this._idleActions.outside(run),
++				idleActionActivity: (owner, kind) => this._idleActions.activity(owner, kind),
++				beforeIdleActionUI: (owner) => this._idleActions.beforeUI(owner),
+ 				getModel: () => this.model,
+ 				getScopedModels: () => this._scopedModels,
+ 				isIdle: () => this.isIdle,
+@@ -3718,6 +3878,10 @@ export class AgentSession {
+ 	}
+ 
+ 	async reload(options?: { beforeSessionStart?: () => void | Promise<void> }): Promise<void> {
++		return this._withIdleInput(() => this._reload(options));
++	}
++
++	private async _reload(options?: { beforeSessionStart?: () => void | Promise<void> }): Promise<void> {
+ 		const oldRunner = this._extensionRunner;
+ 		const previousFlagValues = oldRunner.getFlagValues();
+ 		await emitSessionShutdownEvent(oldRunner, { type: "session_shutdown", reason: "reload" });
+@@ -3865,6 +4029,8 @@ export class AgentSession {
+ 	 * Cancel in-progress retry.
+ 	 */
+ 	abortRetry(): void {
++		this._idleActions.assertOutsideAction();
++		this._idleActions.invalidate("abort");
+ 		this._retryAbortController?.abort();
+ 	}
+ 
+@@ -3902,6 +4068,14 @@ export class AgentSession {
+ 		command: string,
+ 		onChunk?: (chunk: string) => void,
+ 		options?: { excludeFromContext?: boolean; id?: string; operations?: BashOperations },
++	): Promise<BashResult> {
++		return this._withIdleInput(() => this._executeBash(command, onChunk, options));
++	}
++
++	private async _executeBash(
++		command: string,
++		onChunk?: (chunk: string) => void,
++		options?: { excludeFromContext?: boolean; id?: string; operations?: BashOperations },
+ 	): Promise<BashResult> {
+ 		const abortController = new AbortController();
+ 		this._bashAbortControllers.add(abortController);
+@@ -3937,6 +4111,8 @@ export class AgentSession {
+ 	 * Used by executeBash and by extensions that handle bash execution themselves.
+ 	 */
+ 	recordBashResult(command: string, result: BashResult, options?: { excludeFromContext?: boolean }): void {
++		this._idleActions.assertOutsideAction();
++		this._idleActions.invalidate("input");
+ 		const bashMessage: BashExecutionMessage = {
+ 			role: "bashExecution",
+ 			command,
+@@ -3963,6 +4139,8 @@ export class AgentSession {
+ 	 * Cancel running bash command.
+ 	 */
+ 	abortBash(): void {
++		this._idleActions.assertOutsideAction();
++		this._idleActions.invalidate("abort");
+ 		for (const abortController of [...this._bashAbortControllers]) {
+ 			abortController.abort();
+ 		}
+@@ -4024,6 +4202,13 @@ export class AgentSession {
+ 	async navigateTree(
+ 		targetId: string,
+ 		options: { summarize?: boolean; customInstructions?: string; replaceInstructions?: boolean; label?: string } = {},
++	): Promise<{ editorText?: string; cancelled: boolean; aborted?: boolean; summaryEntry?: BranchSummaryEntry }> {
++		return this._withIdleInput(() => this._navigateTree(targetId, options));
++	}
++
++	private async _navigateTree(
++		targetId: string,
++		options: { summarize?: boolean; customInstructions?: string; replaceInstructions?: boolean; label?: string },
+ 	): Promise<{ editorText?: string; cancelled: boolean; aborted?: boolean; summaryEntry?: BranchSummaryEntry }> {
+ 		if (this.isStreaming) {
+ 			throw new Error("Wait for the current response to finish before navigating the session tree.");
+diff --git a/packages/coding-agent/src/core/extensions/index.ts b/packages/coding-agent/src/core/extensions/index.ts
+index 1465e82..7a090dd 100644
+--- a/packages/coding-agent/src/core/extensions/index.ts
++++ b/packages/coding-agent/src/core/extensions/index.ts
+@@ -104,6 +104,13 @@ export type {
+ 	GetThinkingLevelHandler,
+ 	GrepToolCallEvent,
+ 	GrepToolResultEvent,
++	IdleActionAPI,
++	IdleActionHandle,
++	IdleActionLease,
++	IdleActionReason,
++	IdleActionRequest,
++	IdleActionResult,
++	IdleActionState,
+ 	InlineExtension,
+ 	// Events - Input
+ 	InputEvent,
+diff --git a/packages/coding-agent/src/core/extensions/loader.ts b/packages/coding-agent/src/core/extensions/loader.ts
+index cbc1100..dea04f8 100644
+--- a/packages/coding-agent/src/core/extensions/loader.ts
++++ b/packages/coding-agent/src/core/extensions/loader.ts
+@@ -192,6 +192,7 @@ export function createExtensionRuntime(): ExtensionRuntime {
+ 		mcpServers: new McpServerRegistry(),
+ 		pendingVirtualModelRegistrations: [],
+ 		createContext: notInitialized,
++		invokeOutsideIdleAction: (run) => run(),
+ 		assertActive,
+ 		invalidate: (message) => {
+ 			if (state.staleMessage) return;
+@@ -523,7 +524,12 @@ function createExtensionAPI(
+ 			},
+ 			on(channel, handler) {
+ 				assertActive();
+-				const unsubscribe = runtime.trackEventBusSubscription(eventBus.on(channel, handler));
++				const unsubscribe = runtime.trackEventBusSubscription(
++					eventBus.on(channel, (data) => {
++						assertActive();
++						return runtime.invokeOutsideIdleAction(() => handler(data));
++					}),
++				);
+ 				if (state === "loading") loadingUnsubscribers.push(unsubscribe);
+ 				return unsubscribe;
+ 			},
+diff --git a/packages/coding-agent/src/core/extensions/runner.ts b/packages/coding-agent/src/core/extensions/runner.ts
+index 77712e6..28e1793 100644
+--- a/packages/coding-agent/src/core/extensions/runner.ts
++++ b/packages/coding-agent/src/core/extensions/runner.ts
+@@ -58,6 +58,7 @@ import type {
+ 	ExtensionShortcut,
+ 	ExtensionToolContext,
+ 	ExtensionUIContext,
++	IdleActionAPI,
+ 	InputEvent,
+ 	InputEventResult,
+ 	InputSource,
+@@ -365,6 +366,10 @@ export class ExtensionRunner {
+ 	private extensions: Extension[];
+ 	private runtime: ExtensionRuntime;
+ 	private uiContext: ExtensionUIContext;
++	private rawUIContext: ExtensionUIContext = noOpUIContext;
++	private idleActions?: IdleActionAPI;
++	private idleActionActivity?: ExtensionContextActions["idleActionActivity"];
++	private beforeIdleActionUI?: ExtensionContextActions["beforeIdleActionUI"];
+ 	private mode: ExtensionMode = "print";
+ 	private cwd: string;
+ 	private sessionManager: SessionManager;
+@@ -442,6 +447,21 @@ export class ExtensionRunner {
+ 		this.runtime.getThinkingLevel = actions.getThinkingLevel;
+ 		this.runtime.setThinkingLevel = actions.setThinkingLevel;
+ 		this.runtime.createContext = () => this.createContext();
++		this.runtime.invokeOutsideIdleAction = contextActions.invokeOutsideIdleAction ?? ((run) => run());
++		const idleActions = contextActions.idleActions;
++		this.idleActions = idleActions && {
++			version: 1,
++			state: () => {
++				this.assertActive();
++				return idleActions.state();
++			},
++			request: (request) => {
++				this.assertActive();
++				return idleActions.request(request);
++			},
++		};
++		this.idleActionActivity = contextActions.idleActionActivity;
++		this.beforeIdleActionUI = contextActions.beforeIdleActionUI;
+ 
+ 		// Context actions (required)
+ 		this.getModel = contextActions.getModel;
+@@ -570,54 +590,99 @@ export class ExtensionRunner {
+ 	}
+ 
+ 	setUIContext(uiContext?: ExtensionUIContext, mode: ExtensionMode = "print"): void {
+-		this.uiContext = uiContext ? this.wrapUIPromptContext(uiContext) : noOpUIContext;
++		this.rawUIContext = uiContext ?? noOpUIContext;
++		this.uiContext = this.wrapUIPromptContext(this.rawUIContext);
+ 		this.mode = mode;
+ 	}
+ 
+-	private wrapUIPromptContext(ui: ExtensionUIContext): ExtensionUIContext {
+-		return {
++	private wrapUIPromptContext(ui: ExtensionUIContext, owner?: symbol, current?: () => boolean): ExtensionUIContext {
++		const context: ExtensionUIContext = {
+ 			...ui,
+-			select: (title, options, opts) => this.withUIPrompt("select", title, () => ui.select(title, options, opts)),
+-			confirm: (title, message, opts) => this.withUIPrompt("confirm", title, () => ui.confirm(title, message, opts)),
++			select: (title, options, opts) =>
++				this.withUIPrompt("select", title, () => ui.select(title, options, opts), owner),
++			confirm: (title, message, opts) =>
++				this.withUIPrompt("confirm", title, () => ui.confirm(title, message, opts), owner),
+ 			input: (title, placeholder, opts) =>
+-				this.withUIPrompt("input", title, () => ui.input(title, placeholder, opts)),
+-			editor: (title, prefill) => this.withUIPrompt("editor", title, () => ui.editor(title, prefill)),
+-			custom: (factory, options) => this.withUIPrompt("custom", undefined, () => ui.custom(factory, options)),
++				this.withUIPrompt("input", title, () => ui.input(title, placeholder, opts), owner),
++			editor: (title, prefill) => this.withUIPrompt("editor", title, () => ui.editor(title, prefill), owner),
++			custom: (factory, options) => this.withUIPrompt("custom", undefined, () => ui.custom(factory, options), owner),
++		};
++		const assertCurrent = () => {
++			this.assertActive();
++			if (current && !current()) throw new Error("This idle action UI is stale");
+ 		};
++		return new Proxy(context, {
++			get(target, key) {
++				assertCurrent();
++				const value: unknown = Reflect.get(target, key);
++				return typeof value === "function"
++					? (...args: unknown[]) => {
++							assertCurrent();
++							return Reflect.apply(value, target, args);
++						}
++					: value;
++			},
++		});
+ 	}
+ 
+-	private withUIPrompt<T>(kind: UIPromptKind, title: string | undefined, run: () => Promise<T>): Promise<T> {
+-		const outerPrompt = this.uiPromptDepth++ === 0;
+-		if (outerPrompt) {
+-			this.activeUIPrompt = { kind, title };
+-			this.emitUIPromptEvent({ type: "ui_prompt_start", reason: "ui_prompt", kind, ...(title ? { title } : {}) });
++	private withUIPrompt<T>(
++		kind: UIPromptKind,
++		title: string | undefined,
++		run: () => Promise<T>,
++		owner?: symbol,
++	): Promise<T> {
++		if (owner !== undefined && (this.mode !== "tui" || !this.hasUI())) {
++			throw new Error(
++				"Idle action blocking UI requires a qualified local TUI; RPC has no dialog-close acknowledgement",
++			);
+ 		}
+-
++		const finishActivity = this.idleActionActivity?.(owner, "ui");
++		let opened = false;
++		const start = () => {
++			this.assertActive();
++			opened = true;
++			if (this.uiPromptDepth++ === 0) {
++				this.activeUIPrompt = { kind, title };
++				this.emitUIPromptEvent(
++					{ type: "ui_prompt_start", reason: "ui_prompt", kind, ...(title ? { title } : {}) },
++					owner,
++				);
++			}
++			return run();
++		};
+ 		const finish = () => {
+-			if (--this.uiPromptDepth > 0) return;
+-			this.uiPromptDepth = 0;
+-
+-			const prompt = this.activeUIPrompt ?? { kind, title };
+-			this.activeUIPrompt = undefined;
+-			this.emitUIPromptEvent({
+-				type: "ui_prompt_end",
+-				reason: "ui_prompt",
+-				kind: prompt.kind,
+-				...(prompt.title ? { title: prompt.title } : {}),
+-			});
++			if (opened && --this.uiPromptDepth === 0) {
++				const prompt = this.activeUIPrompt ?? { kind, title };
++				this.activeUIPrompt = undefined;
++				this.emitUIPromptEvent(
++					{
++						type: "ui_prompt_end",
++						reason: "ui_prompt",
++						kind: prompt.kind,
++						...(prompt.title ? { title: prompt.title } : {}),
++					},
++					owner,
++				);
++			}
++			finishActivity?.();
+ 		};
+-
+ 		try {
+-			return run().finally(finish);
+-		} catch (err) {
++			const cleanup = this.beforeIdleActionUI?.(owner);
++			return (cleanup ? cleanup.then(start) : start()).finally(finish);
++		} catch (error) {
+ 			finish();
+-			throw err;
++			throw error;
+ 		}
+ 	}
+ 
+-	private emitUIPromptEvent(event: Extract<RunnerEmitEvent, { type: "ui_prompt_start" | "ui_prompt_end" }>): void {
++	private emitUIPromptEvent(
++		event: Extract<RunnerEmitEvent, { type: "ui_prompt_start" | "ui_prompt_end" }>,
++		owner?: symbol,
++	): void {
++		// Count even the interval before the existing microtask enters emit().
++		const finish = this.idleActionActivity?.(owner);
+ 		queueMicrotask(() => {
+-			void this.emit(event);
++			void this.emit(event, owner).finally(() => finish?.());
+ 		});
+ 	}
+ 
+@@ -626,7 +691,7 @@ export class ExtensionRunner {
+ 	}
+ 
+ 	hasUI(): boolean {
+-		return this.uiContext !== noOpUIContext;
++		return this.rawUIContext !== noOpUIContext;
+ 	}
+ 
+ 	getExtensionPaths(): string[] {
+@@ -748,7 +813,7 @@ export class ExtensionRunner {
+ 
+ 	emitError(error: ExtensionError): void {
+ 		for (const listener of this.errorListeners) {
+-			listener(error);
++			this.runtime.invokeOutsideIdleAction(() => listener(error));
+ 		}
+ 	}
+ 
+@@ -886,6 +951,10 @@ export class ExtensionRunner {
+ 		const getModel = this.getModel;
+ 		const getScopedModels = this.getScopedModels;
+ 		return {
++			get idleActions() {
++				runner.assertActive();
++				return runner.idleActions;
++			},
+ 			get ui() {
+ 				runner.assertActive();
+ 				return runner.uiContext;
+@@ -961,6 +1030,46 @@ export class ExtensionRunner {
+ 		};
+ 	}
+ 
++	/** Internal leased context: ordinary guarded identity, explicit UI owner, own cancellation. */
++	createIdleContext(signal: AbortSignal, owner: symbol, current: () => boolean): ExtensionContext {
++		const ui = this.wrapUIPromptContext(this.rawUIContext, owner, current);
++		return Object.defineProperties(
++			{},
++			{
++				...Object.getOwnPropertyDescriptors(this.createContext()),
++				ui: {
++					get: () => {
++						this.assertActive();
++						if (!current()) throw new Error("This idle action UI is stale");
++						return ui;
++					},
++				},
++				signal: {
++					get: () => {
++						this.assertActive();
++						return signal;
++					},
++				},
++			},
++		) as ExtensionContext;
++	}
++
++	invokeOutsideIdleAction<T>(run: () => T): T {
++		this.assertActive();
++		return this.runtime.invokeOutsideIdleAction(run);
++	}
++
++	private snapshotHandlers(event: ExtensionEvent["type"]) {
++		return snapshotEventHandlers(this.extensions, event).map(({ ext, handlers }) => ({
++			ext,
++			handlers: handlers.map(
++				(handler) =>
++					(...args: unknown[]) =>
++						this.invokeOutsideIdleAction(() => handler(...args)),
++			),
++		}));
++	}
++
+ 	/**
+ 	 * Create the context for executing the tool call `toolCallId`: the extension context plus
+ 	 * `tools` and `executeTool()`. `signal` is the default signal of nested calls.
+@@ -1043,7 +1152,7 @@ export class ExtensionRunner {
+ 		let context = await buildContext(entries);
+ 		let valid = true;
+ 
+-		for (const { ext, handlers } of snapshotEventHandlers(this.extensions, baseEvent.type)) {
++		for (const { ext, handlers } of this.snapshotHandlers(baseEvent.type)) {
+ 			for (const handler of handlers) {
+ 				const event = {
+ 					...baseEvent,
+@@ -1093,11 +1202,24 @@ export class ExtensionRunner {
+ 		);
+ 	}
+ 
+-	async emit<TEvent extends RunnerEmitEvent>(event: TEvent): Promise<RunnerEmitResult<TEvent>> {
++	private async withIdleActionActivity<T>(run: () => Promise<T>, owner?: symbol): Promise<T> {
++		const finish = this.idleActionActivity?.(owner);
++		try {
++			return await run();
++		} finally {
++			finish?.();
++		}
++	}
++
++	async emit<TEvent extends RunnerEmitEvent>(event: TEvent, owner?: symbol): Promise<RunnerEmitResult<TEvent>> {
++		return this.withIdleActionActivity(() => this.emitEvent(event), owner);
++	}
++
++	private async emitEvent<TEvent extends RunnerEmitEvent>(event: TEvent): Promise<RunnerEmitResult<TEvent>> {
+ 		const ctx = this.createContext();
+ 		let result: SessionBeforeEventResult | undefined;
+ 
+-		for (const { ext, handlers } of snapshotEventHandlers(this.extensions, event.type)) {
++		for (const { ext, handlers } of this.snapshotHandlers(event.type)) {
+ 			for (const handler of handlers) {
+ 				try {
+ 					const handlerResult = await handler(event, ctx);
+@@ -1126,10 +1248,14 @@ export class ExtensionRunner {
+ 
+ 	/** Returns the event's own action unless a handler overrides it; the last override wins. */
+ 	async emitCacheWarmingDecision(event: CacheWarmingDecisionEvent): Promise<CacheWarmingAction> {
++		return this.withIdleActionActivity(() => this.emitCacheWarmingDecisionEvent(event));
++	}
++
++	private async emitCacheWarmingDecisionEvent(event: CacheWarmingDecisionEvent): Promise<CacheWarmingAction> {
+ 		const ctx = this.createContext();
+ 		let action = event.action;
+ 
+-		for (const { ext, handlers } of snapshotEventHandlers(this.extensions, event.type)) {
++		for (const { ext, handlers } of this.snapshotHandlers(event.type)) {
+ 			for (const handler of handlers) {
+ 				try {
+ 					const result = (await handler(event, ctx)) as CacheWarmingDecisionEventResult | undefined;
+@@ -1153,7 +1279,7 @@ export class ExtensionRunner {
+ 		let currentMessage = event.message;
+ 		let modified = false;
+ 
+-		for (const { ext, handlers } of snapshotEventHandlers(this.extensions, "message_end")) {
++		for (const { ext, handlers } of this.snapshotHandlers("message_end")) {
+ 			for (const handler of handlers) {
+ 				try {
+ 					const currentEvent: MessageEndEvent = { ...event, message: currentMessage };
+@@ -1192,7 +1318,7 @@ export class ExtensionRunner {
+ 		const currentEvent: ToolResultEvent = { ...event };
+ 		let modified = false;
+ 
+-		for (const { ext, handlers } of snapshotEventHandlers(this.extensions, "tool_result")) {
++		for (const { ext, handlers } of this.snapshotHandlers("tool_result")) {
+ 			for (const handler of handlers) {
+ 				try {
+ 					const handlerResult = (await handler(currentEvent, ctx)) as ToolResultEventResult | undefined;
+@@ -1250,7 +1376,7 @@ export class ExtensionRunner {
+ 		const ctx = this.createContext();
+ 		let result: ToolCallEventResult | undefined;
+ 
+-		for (const { handlers } of snapshotEventHandlers(this.extensions, "tool_call")) {
++		for (const { handlers } of this.snapshotHandlers("tool_call")) {
+ 			for (const handler of handlers) {
+ 				const handlerResult = await handler(event, ctx);
+ 
+@@ -1269,7 +1395,7 @@ export class ExtensionRunner {
+ 	async emitUserBash(event: UserBashEvent): Promise<UserBashEventResult | undefined> {
+ 		const ctx = this.createContext();
+ 
+-		for (const { ext, handlers } of snapshotEventHandlers(this.extensions, "user_bash")) {
++		for (const { ext, handlers } of this.snapshotHandlers("user_bash")) {
+ 			for (const handler of handlers) {
+ 				try {
+ 					const handlerResult = await handler(event, ctx);
+@@ -1306,7 +1432,7 @@ export class ExtensionRunner {
+ 		const ctx = this.createContext();
+ 		let currentMessages = structuredClone(messages);
+ 
+-		for (const { ext, handlers } of snapshotEventHandlers(this.extensions, "context")) {
++		for (const { ext, handlers } of this.snapshotHandlers("context")) {
+ 			for (const handler of handlers) {
+ 				try {
+ 					const visibleMessages = currentMessages.filter((message) => message.role !== "system");
+@@ -1333,7 +1459,7 @@ export class ExtensionRunner {
+ 			}
+ 		}
+ 
+-		for (const { ext, handlers } of snapshotEventHandlers(this.extensions, "context_with_system")) {
++		for (const { ext, handlers } of this.snapshotHandlers("context_with_system")) {
+ 			for (const handler of handlers) {
+ 				try {
+ 					const hadLeadingSystemMessage = currentMessages[0]?.role === "system";
+@@ -1366,10 +1492,14 @@ export class ExtensionRunner {
+ 	}
+ 
+ 	async emitBeforeProviderRequest(payload: unknown): Promise<unknown> {
++		return this.withIdleActionActivity(() => this.emitBeforeProviderRequestEvent(payload));
++	}
++
++	private async emitBeforeProviderRequestEvent(payload: unknown): Promise<unknown> {
+ 		const ctx = this.createContext();
+ 		let currentPayload = payload;
+ 
+-		for (const { ext, handlers } of snapshotEventHandlers(this.extensions, "before_provider_request")) {
++		for (const { ext, handlers } of this.snapshotHandlers("before_provider_request")) {
+ 			for (const handler of handlers) {
+ 				try {
+ 					const event: BeforeProviderRequestEvent = {
+@@ -1397,9 +1527,13 @@ export class ExtensionRunner {
+ 	}
+ 
+ 	async emitBeforeProviderHeaders(headers: ProviderHeaders): Promise<ProviderHeaders> {
++		return this.withIdleActionActivity(() => this.emitBeforeProviderHeadersEvent(headers));
++	}
++
++	private async emitBeforeProviderHeadersEvent(headers: ProviderHeaders): Promise<ProviderHeaders> {
+ 		const ctx = this.createContext();
+ 
+-		for (const { ext, handlers } of snapshotEventHandlers(this.extensions, "before_provider_headers")) {
++		for (const { ext, handlers } of this.snapshotHandlers("before_provider_headers")) {
+ 			for (const handler of handlers) {
+ 				try {
+ 					// Handlers mutate `headers` in place; the return value is ignored.
+@@ -1440,7 +1574,7 @@ export class ExtensionRunner {
+ 		};
+ 		const messages: NonNullable<BeforeAgentStartEventResult["message"]>[] = [];
+ 
+-		for (const { ext, handlers } of snapshotEventHandlers(this.extensions, "before_agent_start")) {
++		for (const { ext, handlers } of this.snapshotHandlers("before_agent_start")) {
+ 			for (const handler of handlers) {
+ 				try {
+ 					const event: BeforeAgentStartEvent = {
+@@ -1489,7 +1623,7 @@ export class ExtensionRunner {
+ 		const promptPaths: Array<{ path: string; extensionPath: string }> = [];
+ 		const themePaths: Array<{ path: string; extensionPath: string }> = [];
+ 
+-		for (const { ext, handlers } of snapshotEventHandlers(this.extensions, "resources_discover")) {
++		for (const { ext, handlers } of this.snapshotHandlers("resources_discover")) {
+ 			for (const handler of handlers) {
+ 				try {
+ 					const event: ResourcesDiscoverEvent = { type: "resources_discover", cwd, reason };
+@@ -1532,7 +1666,7 @@ export class ExtensionRunner {
+ 		let currentText = text;
+ 		let currentImages = images;
+ 
+-		for (const { ext, handlers } of snapshotEventHandlers(this.extensions, "input")) {
++		for (const { ext, handlers } of this.snapshotHandlers("input")) {
+ 			for (const handler of handlers) {
+ 				try {
+ 					const event: InputEvent = {
+diff --git a/packages/coding-agent/src/core/extensions/types.ts b/packages/coding-agent/src/core/extensions/types.ts
+index 60388c0..36f1a92 100644
+--- a/packages/coding-agent/src/core/extensions/types.ts
++++ b/packages/coding-agent/src/core/extensions/types.ts
+@@ -322,7 +322,71 @@ export interface CompactOptions {
+  */
+ export type ExtensionMode = "tui" | "rpc" | "json" | "print";
+ 
++export interface IdleActionState {
++	phase: "busy" | "settling" | "idle";
++	/** Outstanding input operations and pending input sources, not UI mirror messages. */
++	pendingInputs: number;
++	activeActionId?: string;
++}
++
++export type IdleActionReason =
++	| "invalid_request"
++	| "conflict"
++	| "busy"
++	| "capacity"
++	| "input"
++	| "abort"
++	| "stale"
++	| "validation"
++	| "callback_error"
++	| "dispatch_unknown"
++	| "unavailable";
++
++export type IdleActionResult =
++	| {
++			status: "completed" | "cancelled" | "rejected" | "failed" | "unknown";
++			actionId: string;
++			reason?: IdleActionReason;
++	  }
++	| { status: "started"; actionId: string; runId: string; sessionId: string };
++
++export interface IdleActionHandle {
++	readonly id: string;
++	readonly signal: AbortSignal;
++	readonly result: Promise<IdleActionResult>;
++	cancel(): void;
++}
++
++export interface IdleActionLease {
++	readonly id: string;
++	/** Blocking leased UI requires a qualified local TUI, even when ordinary RPC hasUI is true. */
++	readonly context: ExtensionContext;
++	readonly signal: AbortSignal;
++	isCurrent(): boolean;
++	dispatch(
++		message: Pick<CustomMessage, "customType" | "content" | "display" | "details">,
++		validate: () => boolean | Promise<boolean>,
++	): Promise<IdleActionResult>;
++}
++
++export interface IdleActionRequest {
++	/** A fresh UUID for one UI attempt; never persisted or replayed. */
++	id: string;
++	/** SHA-256 of the caller's source/request/material binding, not approval data. */
++	binding: string;
++	isCurrent: () => boolean;
++	run: (lease: IdleActionLease) => Promise<void>;
++}
++
++export interface IdleActionAPI {
++	readonly version: 1;
++	state(): IdleActionState;
++	request(request: IdleActionRequest): IdleActionHandle;
++}
++
+ export interface ExtensionContext {
++	/** Optional qualified, cancellable action outside all awaited lifecycle handlers. */
++	readonly idleActions?: IdleActionAPI;
+ 	/** UI methods for user interaction */
+ 	ui: ExtensionUIContext;
+ 	/** Current run mode. Use "tui" to guard terminal-only UI such as custom components. */
+@@ -1034,6 +1098,8 @@ export interface AgentSettledEvent {
+ 	type: "agent_settled";
+ 	/** Whether the run ended because it was aborted, for example with Escape. */
+ 	aborted: boolean;
++	/** H0 logical start succeeded but preparation failed before kernel agent_start. Never retry the delivery. */
++	idleActionFailure?: Extract<IdleActionResult, { status: "started" }>;
+ }
+ 
+ export type UIPromptKind = "select" | "confirm" | "input" | "editor" | "custom";
+@@ -2161,6 +2227,8 @@ export interface ExtensionRuntimeState {
+ 	pendingVirtualModelRegistrations: Array<{ definition: VirtualModelDefinition; extensionPath: string }>;
+ 	/** Create an extension context. Throws before the runner binds. */
+ 	createContext: () => ExtensionContext;
++	/** Internal callback isolation; identity until a session binds. Preserves other ALS stores. */
++	invokeOutsideIdleAction: <T>(run: () => T) => T;
+ 	/** Throws when this extension instance is stale after runtime replacement. */
+ 	assertActive: () => void;
+ 	/** Marks this extension instance as stale after runtime replacement or reload. */
+@@ -2209,6 +2277,10 @@ export interface ExtensionActions {
+  * Required by all modes.
+  */
+ export interface ExtensionContextActions {
++	idleActions?: IdleActionAPI;
++	invokeOutsideIdleAction?: <T>(run: () => T) => T;
++	idleActionActivity?: (owner?: symbol, kind?: "event" | "ui") => () => void;
++	beforeIdleActionUI?: (owner?: symbol) => Promise<void> | undefined;
+ 	getModel: () => Model<any> | undefined;
+ 	getScopedModels: () => readonly ScopedModel[];
+ 	isIdle: () => boolean;
+diff --git a/packages/coding-agent/src/core/idle-actions.ts b/packages/coding-agent/src/core/idle-actions.ts
+new file mode 100644
+index 0000000..02dad0e
+--- /dev/null
++++ b/packages/coding-agent/src/core/idle-actions.ts
+@@ -0,0 +1,386 @@
++import { AsyncLocalStorage } from "node:async_hooks";
++import type {
++	ExtensionContext,
++	IdleActionAPI,
++	IdleActionHandle,
++	IdleActionLease,
++	IdleActionReason,
++	IdleActionRequest,
++	IdleActionResult,
++	IdleActionState,
++} from "./extensions/types.ts";
++import type { CustomMessage } from "./messages.ts";
++
++type Delivery = Pick<CustomMessage, "customType" | "content" | "display" | "details">;
++type Started = Extract<IdleActionResult, { status: "started" }>;
++
++interface IdleActionHost {
++	state(): IdleActionState;
++	capture(): () => boolean;
++	context(signal: AbortSignal, owner: symbol, isCurrent: () => boolean): ExtensionContext;
++	start(actionId: string, message: Delivery, acknowledge: (result: Started) => void): void;
++}
++
++interface Attempt {
++	id: string;
++	request?: IdleActionRequest;
++	controller: AbortController;
++	owner: symbol;
++	epoch: number;
++	current: () => boolean;
++	handle: IdleActionHandle;
++	resolve: (result: IdleActionResult) => void;
++	phase: "pending" | "running" | "started";
++	reason?: IdleActionReason;
++	dispatched: boolean;
++	started?: Started;
++	delivery?: IdleActionResult;
++	cleanup?: Promise<void>;
++}
++
++/** One session-local, nonpersistent slot. It does not hold business approvals or replay intents. */
++export class IdleActionController {
++	private readonly host: IdleActionHost;
++	private readonly scope = new AsyncLocalStorage<Attempt>();
++	private readonly attempts = new Map<string, { binding: string; handle: IdleActionHandle }>();
++	private readonly activities = new Map<symbol | undefined, number>();
++	private readonly uiActivities = new Map<symbol | undefined, number>();
++	private readonly activityWaiters = new Set<() => void>();
++	private slot?: Attempt;
++	private epoch = 0;
++	private closed = false;
++	readonly api: IdleActionAPI;
++
++	constructor(host: IdleActionHost) {
++		this.host = host;
++		this.api = {
++			version: 1,
++			state: () => this.state(),
++			request: (request) => this.request(request),
++		};
++	}
++
++	state(): IdleActionState {
++		const state = this.host.state();
++		if (state.phase === "idle" && (this.closed || this.activities.size > 0)) state.phase = "busy";
++		if (this.slot) state.activeActionId = this.slot.id;
++		return state;
++	}
++
++	/** Exit only this controller's ALS; an extension's own ALS stores are untouched. */
++	outside<T>(run: () => T): T {
++		return this.scope.exit(run);
++	}
++
++	assertOutsideAction(): void {
++		const attempt = this.scope.getStore();
++		if (!attempt) return;
++		if (this.slot === attempt) this.cancel(attempt, "callback_error");
++		throw new Error("Idle action callbacks must use lease.dispatch(), not ordinary input/control APIs");
++	}
++
++	/** Called synchronously before an input or native control changes state. */
++	invalidate(reason: IdleActionReason): Promise<void> | undefined {
++		this.epoch++;
++		const attempt = this.slot;
++		if (!attempt || attempt.phase === "started") return;
++		this.cancel(attempt, reason);
++		return attempt.cleanup;
++	}
++
++	dispose(): void {
++		this.closed = true;
++		this.invalidate("stale");
++	}
++
++	activity(owner?: symbol, kind: "event" | "ui" = "event"): () => void {
++		this.activities.set(owner, (this.activities.get(owner) ?? 0) + 1);
++		if (kind === "ui") this.uiActivities.set(owner, (this.uiActivities.get(owner) ?? 0) + 1);
++		const attempt = this.slot;
++		if (attempt?.phase === "running" && owner !== attempt.owner) this.invalidate("input");
++		let finished = false;
++		return () => {
++			if (finished) return;
++			finished = true;
++			for (const counts of kind === "ui" ? [this.activities, this.uiActivities] : [this.activities]) {
++				const count = (counts.get(owner) ?? 1) - 1;
++				if (count === 0) counts.delete(owner);
++				else counts.set(owner, count);
++			}
++			for (const wake of [...this.activityWaiters]) wake();
++			this.pump();
++		};
++	}
++
++	beforeUI(owner?: symbol): Promise<void> | undefined {
++		const attempt = this.slot;
++		if (owner !== undefined) {
++			if (!attempt || owner !== attempt.owner || !this.isCurrent(attempt)) {
++				throw new Error("This idle action UI is stale");
++			}
++			return;
++		}
++		this.assertOutsideAction();
++		if (attempt?.phase === "running") {
++			this.cancel(attempt, "input");
++			return attempt.cleanup;
++		}
++	}
++
++	private rejected(id: string, reason: IdleActionReason): IdleActionHandle {
++		const controller = new AbortController();
++		controller.abort();
++		return {
++			id,
++			signal: controller.signal,
++			result: Promise.resolve({ status: "rejected", actionId: id, reason }),
++			cancel: () => {},
++		};
++	}
++
++	private request(request: IdleActionRequest): IdleActionHandle {
++		const id = typeof request?.id === "string" ? request.id : "";
++		if (
++			!/^[\da-f]{8}-[\da-f]{4}-[1-8][\da-f]{3}-[89ab][\da-f]{3}-[\da-f]{12}$/i.test(id) ||
++			typeof request.binding !== "string" ||
++			!/^[\da-f]{64}$/.test(request.binding) ||
++			typeof request.isCurrent !== "function" ||
++			typeof request.run !== "function"
++		)
++			return this.rejected(id.slice(0, 128), "invalid_request");
++		const previous = this.attempts.get(id);
++		if (previous) {
++			return previous.binding === request.binding ? previous.handle : this.rejected(id, "conflict");
++		}
++		if (this.attempts.size >= 4096) return this.rejected(id, "capacity");
++		if (this.closed || this.slot) {
++			const handle = this.rejected(id, this.closed ? "unavailable" : "busy");
++			this.attempts.set(id, { binding: request.binding, handle });
++			return handle;
++		}
++		const controller = new AbortController();
++		let resolve!: (result: IdleActionResult) => void;
++		const result = new Promise<IdleActionResult>((done) => {
++			resolve = done;
++		});
++		const handle: IdleActionHandle = {
++			id,
++			signal: controller.signal,
++			result,
++			cancel: () => {
++				if (this.slot?.id === id) this.cancel(this.slot, "abort");
++			},
++		};
++		this.attempts.set(id, { binding: request.binding, handle });
++		this.slot = {
++			id,
++			request: { ...request },
++			controller,
++			owner: Symbol(id),
++			epoch: this.epoch,
++			current: this.host.capture(),
++			handle,
++			resolve,
++			phase: "pending",
++			dispatched: false,
++		};
++		this.pump();
++		return handle;
++	}
++
++	private outcome(attempt: Attempt): IdleActionResult {
++		return (
++			attempt.started ?? {
++				status: attempt.reason === "callback_error" ? "failed" : "cancelled",
++				actionId: attempt.id,
++				reason: attempt.reason ?? "stale",
++			}
++		);
++	}
++
++	private cancel(attempt: Attempt, reason: IdleActionReason): void {
++		if (attempt.phase === "started" || attempt.reason) return;
++		attempt.reason = reason;
++		attempt.controller.abort();
++		if (attempt.phase === "pending") {
++			attempt.resolve(this.outcome(attempt));
++			attempt.request = undefined;
++			if (this.slot === attempt) this.slot = undefined;
++		}
++	}
++
++	private isCurrent(attempt: Attempt): boolean {
++		if (this.closed || this.slot !== attempt || attempt.phase === "started" || attempt.controller.signal.aborted)
++			return false;
++		if (attempt.epoch !== this.epoch) return false;
++		try {
++			const valid =
++				attempt.current() && !!attempt.request && this.scope.run(attempt, attempt.request.isCurrent) === true;
++			// Even a read-only predicate can reenter cancellation. Never accept its late true.
++			return (
++				valid &&
++				!this.closed &&
++				this.slot === attempt &&
++				!attempt.controller.signal.aborted &&
++				attempt.epoch === this.epoch
++			);
++		} catch {
++			return false;
++		}
++	}
++
++	private qualified(attempt: Attempt): boolean {
++		if (!this.isCurrent(attempt)) return false;
++		const state = this.host.state();
++		return (
++			state.phase === "idle" &&
++			state.pendingInputs === 0 &&
++			[...this.activities.keys()].every((owner) => owner === attempt.owner)
++		);
++	}
++
++	/** Invoked by explicit lifecycle/activity/input exits, never by idle polling. */
++	pump(): void {
++		const attempt = this.slot;
++		if (!attempt || attempt.phase !== "pending") return;
++		if (!this.isCurrent(attempt)) {
++			this.cancel(attempt, "stale");
++			return;
++		}
++		if (!this.qualified(attempt)) return;
++		attempt.phase = "running";
++		let finish!: () => void;
++		attempt.cleanup = new Promise<void>((resolve) => {
++			finish = resolve;
++		});
++		void this.scope.run(attempt, async () => {
++			let outcome: IdleActionResult;
++			try {
++				const lease: IdleActionLease = {
++					id: attempt.id,
++					signal: attempt.controller.signal,
++					context: this.host.context(attempt.controller.signal, attempt.owner, () => this.qualified(attempt)),
++					isCurrent: () => this.qualified(attempt),
++					dispatch: async (message, validate) => {
++						const first = !attempt.dispatched;
++						const result = await this.dispatch(attempt, message, validate);
++						if (first) attempt.delivery = result;
++						return result;
++					},
++				};
++				await attempt.request?.run(lease);
++				outcome =
++					attempt.started ??
++					(attempt.reason
++						? this.outcome(attempt)
++						: (attempt.delivery ?? {
++								status: attempt.dispatched ? "failed" : "completed",
++								actionId: attempt.id,
++								...(attempt.dispatched ? { reason: "callback_error" as const } : {}),
++							}));
++			} catch {
++				outcome =
++					attempt.started ??
++					(attempt.reason
++						? this.outcome(attempt)
++						: (attempt.delivery ?? {
++								status: "failed",
++								actionId: attempt.id,
++								reason: "callback_error",
++							}));
++			} finally {
++				attempt.request = undefined;
++				attempt.controller.abort();
++				// A callback returning is not proof that its fire-and-forget dialog has closed.
++				// Do not join foreign activity here: it may itself be waiting for this cleanup.
++				if (this.uiActivities.has(attempt.owner))
++					await new Promise<void>((resolve) => {
++						const closed = () => {
++							if (!this.uiActivities.has(attempt.owner)) {
++								this.activityWaiters.delete(closed);
++								resolve();
++							}
++						};
++						this.activityWaiters.add(closed);
++						closed();
++					});
++				if (this.slot === attempt) this.slot = undefined;
++				finish();
++				this.pump();
++			}
++			attempt.resolve(attempt.started ?? (attempt.reason ? this.outcome(attempt) : outcome));
++		});
++	}
++
++	private async dispatch(
++		attempt: Attempt,
++		message: Delivery,
++		validate: () => boolean | Promise<boolean>,
++	): Promise<IdleActionResult> {
++		if (attempt.dispatched) return { status: "rejected", actionId: attempt.id, reason: "conflict" };
++		attempt.dispatched = true;
++		if (!this.qualified(attempt)) return this.outcome(attempt);
++		if (this.uiActivities.size > 0) return { status: "rejected", actionId: attempt.id, reason: "busy" };
++		let payload: Delivery;
++		try {
++			payload = structuredClone(message);
++		} catch {
++			return { status: "rejected", actionId: attempt.id, reason: "invalid_request" };
++		}
++		let delivering = false;
++		try {
++			// A UI's queued end observers must finish too, after its actual dialog has closed.
++			if (this.activities.size > 0) {
++				await this.cancellable(
++					attempt,
++					new Promise<void>((resolve) => {
++						const wake = () => {
++							if (this.activities.size === 0 || attempt.controller.signal.aborted) {
++								this.activityWaiters.delete(wake);
++								resolve();
++							}
++						};
++						this.activityWaiters.add(wake);
++						attempt.controller.signal.addEventListener("abort", wake, { once: true });
++						wake();
++					}),
++				);
++			}
++			if (!this.qualified(attempt)) return this.outcome(attempt);
++			const valid = await this.cancellable(attempt, Promise.resolve(this.scope.run(attempt, validate)));
++			if (!this.qualified(attempt)) return this.outcome(attempt);
++			if (valid !== true) return { status: "rejected", actionId: attempt.id, reason: "validation" };
++			// No await between this final qualification and the host's synchronous busy/ACK write.
++			delivering = true;
++			this.outside(() =>
++				this.host.start(attempt.id, payload, (result) => {
++					attempt.phase = "started";
++					attempt.started = result;
++					attempt.resolve(result);
++				}),
++			);
++			return attempt.started ?? { status: "unknown", actionId: attempt.id, reason: "dispatch_unknown" };
++		} catch {
++			return (
++				attempt.started ??
++				(attempt.reason
++					? this.outcome(attempt)
++					: delivering
++						? { status: "unknown", actionId: attempt.id, reason: "dispatch_unknown" }
++						: { status: "failed", actionId: attempt.id, reason: "callback_error" })
++			);
++		}
++	}
++
++	private cancellable<T>(attempt: Attempt, promise: Promise<T>): Promise<T | undefined> {
++		const signal = attempt.controller.signal;
++		return new Promise((resolve, reject) => {
++			const abort = () => {
++				resolve(undefined);
++			};
++			signal.addEventListener("abort", abort, { once: true });
++			if (signal.aborted) abort();
++			promise.then(resolve, reject).finally(() => signal.removeEventListener("abort", abort));
++		});
++	}
++}
+diff --git a/packages/coding-agent/src/index.ts b/packages/coding-agent/src/index.ts
+index 0b8fb1d..73da7e3 100644
+--- a/packages/coding-agent/src/index.ts
++++ b/packages/coding-agent/src/index.ts
+@@ -114,6 +114,13 @@ export type {
+ 	ExtensionWidgetOptions,
+ 	FindToolCallEvent,
+ 	GrepToolCallEvent,
++	IdleActionAPI,
++	IdleActionHandle,
++	IdleActionLease,
++	IdleActionReason,
++	IdleActionRequest,
++	IdleActionResult,
++	IdleActionState,
+ 	InlineExtension,
+ 	InputEvent,
+ 	InputEventResult,
+diff --git a/packages/coding-agent/src/modes/interactive/interactive-mode.ts b/packages/coding-agent/src/modes/interactive/interactive-mode.ts
+index e24d150..0bf197f 100644
+--- a/packages/coding-agent/src/modes/interactive/interactive-mode.ts
++++ b/packages/coding-agent/src/modes/interactive/interactive-mode.ts
+@@ -82,7 +82,6 @@ import type {
+ 	AutocompleteProviderFactory,
+ 	EditorFactory,
+ 	ExtensionCommandContext,
+-	ExtensionContext,
+ 	ExtensionRunner,
+ 	ExtensionUIContext,
+ 	ExtensionUIDialogOptions,
+@@ -2244,49 +2243,17 @@ export class InteractiveMode {
+ 		const shortcuts = extensionRunner.getShortcuts(this.keybindings.getEffectiveConfig());
+ 		if (shortcuts.size === 0) return;
+ 
+-		// Create a context for shortcut handlers
+-		const createContext = (): ExtensionContext => ({
+-			ui: this.createExtensionUIContext(),
+-			mode: "tui",
+-			hasUI: true,
+-			cwd: this.sessionManager.getCwd(),
+-			sessionManager: this.sessionManager,
+-			modelRegistry: extensionRunner.getModelRegistry(),
+-			model: this.session.model,
+-			scopedModels: this.session.scopedModels,
+-			thinkingLevel: this.session.thinkingLevel,
+-			isIdle: () => this.session.isIdle,
+-			isProjectTrusted: () => this.settingsManager.isProjectTrusted(),
+-			signal: this.session.agent.signal,
+-			abort: () => {
+-				this.restoreQueuedMessagesToEditor({ abort: true });
+-			},
+-			hasPendingMessages: () => this.session.pendingMessageCount > 0,
+-			shutdown: () => {
+-				this.shutdownRequested = true;
+-			},
+-			getContextUsage: () => this.session.getContextUsage(),
+-			compact: (options) => {
+-				void (async () => {
+-					try {
+-						const result = await this.session.compact(options?.customInstructions);
+-						options?.onComplete?.(result);
+-					} catch (error) {
+-						const err = error instanceof Error ? error : new Error(String(error));
+-						options?.onError?.(err);
+-					}
+-				})();
+-			},
+-			getSystemPrompt: () => this.session.systemPrompt,
+-		});
+-
+ 		// Set up the extension shortcut handler on the default editor
+ 		this.defaultEditor.onExtensionShortcut = (data: string) => {
+ 			for (const [shortcutStr, shortcut] of shortcuts) {
+ 				// Cast to KeyId - extension shortcuts use the same format
+ 				if (matchesKey(data, shortcutStr as KeyId)) {
+ 					// Run handler async, don't block input
+-					Promise.resolve(shortcut.handler(createContext())).catch((err) => {
++					void (async () => {
++						await extensionRunner.invokeOutsideIdleAction(() =>
++							shortcut.handler(extensionRunner.createContext()),
++						);
++					})().catch((err) => {
+ 						this.showError(`Shortcut handler error: ${err instanceof Error ? err.message : String(err)}`);
+ 					});
+ 					return true;
+@@ -6958,96 +6925,99 @@ export class InteractiveMode {
+ 	}
+ 
+ 	private async handleBashCommand(command: string, excludeFromContext = false): Promise<void> {
+-		const extensionRunner = this.session.extensionRunner;
+-
+-		// Emit user_bash event to let extensions intercept
+-		let eventResult: UserBashEventResult | undefined;
+-		try {
+-			eventResult = await extensionRunner.emitUserBash({
+-				type: "user_bash",
+-				command,
+-				excludeFromContext,
+-				cwd: this.sessionManager.getCwd(),
+-			});
+-		} catch {
+-			// The extension runner already reported the error. Do not fall back to local execution.
+-			return;
+-		}
+-
+-		// If extension returned a full result, use it directly
+-		if (eventResult?.result) {
+-			const result = eventResult.result;
+-
+-			// Create UI component for display
+-			this.bashComponent = new BashExecutionComponent(command, this.ui, excludeFromContext, this.outputPad);
+-			if (this.session.isStreaming) {
+-				this.pendingMessagesContainer.addChild(this.bashComponent);
+-				this.pendingBashComponents.push(this.bashComponent);
+-			} else {
+-				this.chatContainer.addChild(this.bashComponent);
+-			}
++		const session = this.session;
++		return session.withUserBashInput(async () => {
++			const extensionRunner = session.extensionRunner;
+ 
+-			// Show output and complete
+-			if (result.output) {
+-				this.bashComponent.appendOutput(result.output);
++			// Emit user_bash event to let extensions intercept
++			let eventResult: UserBashEventResult | undefined;
++			try {
++				eventResult = await extensionRunner.emitUserBash({
++					type: "user_bash",
++					command,
++					excludeFromContext,
++					cwd: session.sessionManager.getCwd(),
++				});
++			} catch {
++				// The extension runner already reported the error. Do not fall back to local execution.
++				return;
+ 			}
+-			this.bashComponent.setComplete(
+-				result.exitCode,
+-				result.cancelled,
+-				result.truncated ? ({ truncated: true, content: result.output } as TruncationResult) : undefined,
+-				result.fullOutputPath,
+-			);
+-
+-			// Record the result in session
+-			this.session.recordBashResult(command, result, { excludeFromContext });
+-			this.bashComponent = undefined;
+-			this.ui.requestRender();
+-			return;
+-		}
+ 
+-		// Normal execution path (possibly with custom operations)
+-		const isDeferred = this.session.isStreaming;
+-		this.bashComponent = new BashExecutionComponent(command, this.ui, excludeFromContext, this.outputPad);
++			// If extension returned a full result, use it directly
++			if (eventResult?.result) {
++				const result = eventResult.result;
+ 
+-		if (isDeferred) {
+-			// Show in pending area when agent is streaming
+-			this.pendingMessagesContainer.addChild(this.bashComponent);
+-			this.pendingBashComponents.push(this.bashComponent);
+-		} else {
+-			// Show in chat immediately when agent is idle
+-			this.chatContainer.addChild(this.bashComponent);
+-		}
+-		this.ui.requestRender();
+-
+-		try {
+-			const result = await this.session.executeBash(
+-				command,
+-				(chunk) => {
+-					if (this.bashComponent) {
+-						this.bashComponent.appendOutput(chunk);
+-						this.ui.requestRender();
+-					}
+-				},
+-				{ excludeFromContext, operations: eventResult?.operations },
+-			);
++				// Create UI component for display
++				this.bashComponent = new BashExecutionComponent(command, this.ui, excludeFromContext, this.outputPad);
++				if (session.isStreaming) {
++					this.pendingMessagesContainer.addChild(this.bashComponent);
++					this.pendingBashComponents.push(this.bashComponent);
++				} else {
++					this.chatContainer.addChild(this.bashComponent);
++				}
+ 
+-			if (this.bashComponent) {
++				// Show output and complete
++				if (result.output) {
++					this.bashComponent.appendOutput(result.output);
++				}
+ 				this.bashComponent.setComplete(
+ 					result.exitCode,
+ 					result.cancelled,
+ 					result.truncated ? ({ truncated: true, content: result.output } as TruncationResult) : undefined,
+ 					result.fullOutputPath,
+ 				);
++
++				// Record the result in session
++				session.recordBashResult(command, result, { excludeFromContext });
++				this.bashComponent = undefined;
++				this.ui.requestRender();
++				return;
+ 			}
+-		} catch (error) {
+-			if (this.bashComponent) {
+-				this.bashComponent.setComplete(undefined, false);
++
++			// Normal execution path (possibly with custom operations)
++			const isDeferred = session.isStreaming;
++			this.bashComponent = new BashExecutionComponent(command, this.ui, excludeFromContext, this.outputPad);
++
++			if (isDeferred) {
++				// Show in pending area when agent is streaming
++				this.pendingMessagesContainer.addChild(this.bashComponent);
++				this.pendingBashComponents.push(this.bashComponent);
++			} else {
++				// Show in chat immediately when agent is idle
++				this.chatContainer.addChild(this.bashComponent);
+ 			}
+-			this.showError(`Bash command failed: ${error instanceof Error ? error.message : "Unknown error"}`);
+-		}
++			this.ui.requestRender();
+ 
+-		this.bashComponent = undefined;
+-		this.ui.requestRender();
++			try {
++				const result = await session.executeBash(
++					command,
++					(chunk) => {
++						if (this.bashComponent) {
++							this.bashComponent.appendOutput(chunk);
++							this.ui.requestRender();
++						}
++					},
++					{ excludeFromContext, operations: eventResult?.operations },
++				);
++
++				if (this.bashComponent) {
++					this.bashComponent.setComplete(
++						result.exitCode,
++						result.cancelled,
++						result.truncated ? ({ truncated: true, content: result.output } as TruncationResult) : undefined,
++						result.fullOutputPath,
++					);
++				}
++			} catch (error) {
++				if (this.bashComponent) {
++					this.bashComponent.setComplete(undefined, false);
++				}
++				this.showError(`Bash command failed: ${error instanceof Error ? error.message : "Unknown error"}`);
++			}
++
++			this.bashComponent = undefined;
++			this.ui.requestRender();
++		});
+ 	}
+ 
+ 	private async handleCompactCommand(customInstructions?: string): Promise<void> {
+diff --git a/packages/coding-agent/src/modes/rpc/rpc-mode.ts b/packages/coding-agent/src/modes/rpc/rpc-mode.ts
+index 1c0995d..418d0c9 100644
+--- a/packages/coding-agent/src/modes/rpc/rpc-mode.ts
++++ b/packages/coding-agent/src/modes/rpc/rpc-mode.ts
+@@ -559,26 +559,29 @@ export async function runRpcMode(runtimeHost: AgentSessionRuntime): Promise<neve
+ 			// =================================================================
+ 
+ 			case "bash": {
+-				const eventResult = await session.extensionRunner.emitUserBash({
+-					type: "user_bash",
+-					command: command.command,
+-					excludeFromContext: command.excludeFromContext ?? false,
+-					cwd: session.sessionManager.getCwd(),
+-				});
++				const origin = session;
++				return origin.withUserBashInput(async () => {
++					const eventResult = await origin.extensionRunner.emitUserBash({
++						type: "user_bash",
++						command: command.command,
++						excludeFromContext: command.excludeFromContext ?? false,
++						cwd: origin.sessionManager.getCwd(),
++					});
++
++					if (eventResult?.result) {
++						origin.recordBashResult(command.command, eventResult.result, {
++							excludeFromContext: command.excludeFromContext,
++						});
++						return success(id, "bash", eventResult.result);
++					}
+ 
+-				if (eventResult?.result) {
+-					session.recordBashResult(command.command, eventResult.result, {
++					const result = await origin.executeBash(command.command, undefined, {
+ 						excludeFromContext: command.excludeFromContext,
++						id,
++						operations: eventResult?.operations,
+ 					});
+-					return success(id, "bash", eventResult.result);
+-				}
+-
+-				const result = await session.executeBash(command.command, undefined, {
+-					excludeFromContext: command.excludeFromContext,
+-					id,
+-					operations: eventResult?.operations,
++					return success(id, "bash", result);
+ 				});
+-				return success(id, "bash", result);
+ 			}
+ 
+ 			case "abort_bash": {
+diff --git a/packages/coding-agent/test/interactive-mode-idle-actions.test.ts b/packages/coding-agent/test/interactive-mode-idle-actions.test.ts
+new file mode 100644
+index 0000000..c6b28a3
+--- /dev/null
++++ b/packages/coding-agent/test/interactive-mode-idle-actions.test.ts
+@@ -0,0 +1,210 @@
++import { createHash, randomUUID } from "node:crypto";
++import { afterEach, describe, expect, it, vi } from "vitest";
++import type { ExtensionContext, ExtensionRunner, IdleActionResult } from "../src/core/extensions/index.ts";
++import type { BashOperations } from "../src/core/tools/bash.ts";
++import { InteractiveMode } from "../src/modes/interactive/interactive-mode.ts";
++import { createHarness, createTestUiContext, type Harness } from "./suite/harness.ts";
++
++vi.mock("../src/modes/interactive/components/bash-execution.js", () => ({
++	BashExecutionComponent: class {
++		appendOutput(): void {}
++		setComplete(): void {}
++	},
++}));
++
++function gate() {
++	let resolve!: () => void;
++	const promise = new Promise<void>((done) => {
++		resolve = done;
++	});
++	return { promise, resolve };
++}
++const binding = createHash("sha256").update("mode-idle-test").digest("hex");
++
++interface ModeInput {
++	defaultEditor: {
++		onSubmit?: (text: string) => Promise<void> | void;
++		onExtensionShortcut?: (data: string) => boolean;
++	};
++	setupEditorSubmitHandler(): void;
++	setupExtensionShortcuts(runner: ExtensionRunner): void;
++}
++
++function modeInput(harness: Harness): ModeInput {
++	const context = {
++		defaultEditor: {},
++		editor: { addToHistory: vi.fn() },
++		session: harness.session,
++		sessionManager: harness.sessionManager,
++		settingsManager: harness.settingsManager,
++		keybindings: { getEffectiveConfig: () => ({}) },
++		ui: { requestRender: vi.fn() },
++		chatContainer: { addChild: vi.fn() },
++		pendingMessagesContainer: { addChild: vi.fn() },
++		pendingBashComponents: [],
++		isBashMode: true,
++		showError: vi.fn(),
++		updateEditorBorderColor: vi.fn(),
++	};
++	return new Proxy(context, {
++		get(target, key, receiver) {
++			if (key in target) return Reflect.get(target, key, receiver);
++			const value: unknown = Reflect.get(InteractiveMode.prototype, key, receiver);
++			return typeof value === "function" ? value.bind(receiver) : value;
++		},
++	}) as unknown as ModeInput;
++}
++
++describe("InteractiveMode idle action entry wiring", () => {
++	const harnesses: Harness[] = [];
++	afterEach(() => {
++		for (const harness of harnesses.splice(0)) harness.cleanup();
++	});
++
++	it("gives a real extension shortcut a guarded action context without blocking its awaited result", async () => {
++		const finished = gate();
++		let saved: ExtensionContext | undefined;
++		let outcome: IdleActionResult | undefined;
++		const harness = await createHarness({
++			extensionFactories: [
++				(pi) => {
++					pi.registerShortcut("ctrl+shift+y", {
++						handler: async (ctx) => {
++							saved = ctx;
++							outcome = await ctx.idleActions?.request({
++								id: randomUUID(),
++								binding,
++								isCurrent: () => true,
++								run: async () => {},
++							}).result;
++							finished.resolve();
++						},
++					});
++				},
++			],
++		});
++		harnesses.push(harness);
++		await harness.session.bindExtensions({ mode: "tui", uiContext: createTestUiContext() });
++		const mode = modeInput(harness);
++		mode.setupExtensionShortcuts(harness.session.extensionRunner);
++		expect(mode.defaultEditor.onExtensionShortcut?.("\x1b[121;6u")).toBe(true);
++		await finished.promise;
++		expect(saved?.idleActions?.version).toBe(1);
++		expect(outcome).toMatchObject({ status: "completed" });
++		const select = saved!.ui.select;
++		await harness.session.reload();
++		expect(() => saved!.idleActions).toThrow(/stale/);
++		expect(() => select("old context", ["Later"])).toThrow(/stale/);
++	});
++
++	it("cancels and joins an owned action before a delayed real shortcut opens ordinary UI", async () => {
++		const shortcutWaiting = gate();
++		const releaseShortcut = gate();
++		const shortcutDone = gate();
++		const ownedOpen = gate();
++		const ownedClose = gate();
++		const titles: string[] = [];
++		const harness = await createHarness({
++			extensionFactories: [
++				(pi) => {
++					pi.registerShortcut("ctrl+shift+y", {
++						handler: async (ctx) => {
++							shortcutWaiting.resolve();
++							await releaseShortcut.promise;
++							await ctx.ui.select("foreign shortcut", ["Later"]);
++							shortcutDone.resolve();
++						},
++					});
++				},
++			],
++		});
++		harnesses.push(harness);
++		await harness.session.bindExtensions({
++			mode: "tui",
++			uiContext: createTestUiContext({
++				select: async (title, _options, opts) => {
++					titles.push(title);
++					if (title === "owned") {
++						ownedOpen.resolve();
++						await new Promise<void>((resolve) =>
++							opts?.signal?.addEventListener("abort", () => resolve(), { once: true }),
++						);
++						await ownedClose.promise;
++					}
++					return undefined;
++				},
++			}),
++		});
++		const mode = modeInput(harness);
++		mode.setupExtensionShortcuts(harness.session.extensionRunner);
++		mode.defaultEditor.onExtensionShortcut!("\x1b[121;6u");
++		await shortcutWaiting.promise;
++		const handle = harness.session.extensionRunner.createContext().idleActions!.request({
++			id: randomUUID(),
++			binding,
++			isCurrent: () => true,
++			run: async (lease) => {
++				await lease.context.ui.select("owned", ["Later"], { signal: lease.signal });
++			},
++		});
++		await ownedOpen.promise;
++		releaseShortcut.resolve();
++		await new Promise<void>((resolve) => handle.signal.addEventListener("abort", () => resolve(), { once: true }));
++		expect(titles).toEqual(["owned"]);
++		ownedClose.resolve();
++		await shortcutDone.promise;
++		expect(await handle.result).toMatchObject({ status: "cancelled", reason: "input" });
++		expect(titles).toEqual(["owned", "foreign shortcut"]);
++	});
++
++	it.each(["result", "operations"] as const)(
++		"keeps the whole %s bash input ahead of a pending action",
++		async (kind) => {
++			const intercepted = gate();
++			const release = gate();
++			const operations: BashOperations = { exec: async () => ({ exitCode: 0 }) };
++			const result = { output: "intercepted", exitCode: 0, cancelled: false, truncated: false };
++			const harness = await createHarness({
++				extensionFactories: [
++					(pi) => {
++						pi.on("user_bash", async () => {
++							intercepted.resolve();
++							await release.promise;
++							return kind === "result" ? { result } : { operations };
++						});
++					},
++				],
++			});
++			harnesses.push(harness);
++			const mode = modeInput(harness);
++			mode.setupEditorSubmitHandler();
++			const bash = mode.defaultEditor.onSubmit?.("!pwd");
++			await intercepted.promise;
++			const replacement = await createHarness();
++			harnesses.push(replacement);
++			let entered = false;
++			const api = harness.session.extensionRunner.createContext().idleActions!;
++			const handle = api.request({
++				id: randomUUID(),
++				binding,
++				isCurrent: () => true,
++				run: async () => {
++					entered = true;
++				},
++			});
++			try {
++				expect(entered).toBe(false);
++				expect(api.state().pendingInputs).toBeGreaterThan(0);
++			} finally {
++				// A mode rebind during interception cannot move this input barrier or its result.
++				Object.assign(mode, { session: replacement.session, sessionManager: replacement.sessionManager });
++				release.resolve();
++				await bash;
++				await handle.result;
++			}
++			expect(entered).toBe(false);
++			expect(harness.session.messages.filter((message) => message.role === "bashExecution")).toHaveLength(1);
++			expect(replacement.session.messages.filter((message) => message.role === "bashExecution")).toHaveLength(0);
++		},
++	);
++});
+diff --git a/packages/coding-agent/test/rpc-idle-actions.test.ts b/packages/coding-agent/test/rpc-idle-actions.test.ts
+new file mode 100644
+index 0000000..5cbfec0
+--- /dev/null
++++ b/packages/coding-agent/test/rpc-idle-actions.test.ts
+@@ -0,0 +1,183 @@
++import { createHash, randomUUID } from "node:crypto";
++import { afterEach, describe, expect, it, vi } from "vitest";
++import type { AgentSessionRuntime } from "../src/core/agent-session-runtime.ts";
++import type { BashOperations } from "../src/core/tools/bash.ts";
++import { runRpcMode } from "../src/modes/rpc/rpc-mode.ts";
++import { createHarness, type Harness } from "./suite/harness.ts";
++
++const rpcIo = vi.hoisted(() => ({
++	lines: [] as string[],
++	send: undefined as ((line: string) => void) | undefined,
++}));
++vi.mock("../src/core/output-guard.js", () => ({
++	flushRawStdout: vi.fn(async () => {}),
++	takeOverStdout: vi.fn(),
++	waitForRawStdoutBackpressure: vi.fn(async () => {}),
++	writeRawStdout: (line: string) => {
++		rpcIo.lines.push(line);
++	},
++}));
++vi.mock("../src/modes/rpc/jsonl.js", () => ({
++	attachJsonlLineReader: (_stream: unknown, onLine: (line: string) => void) => {
++		rpcIo.send = onLine;
++		return () => {
++			rpcIo.send = undefined;
++		};
++	},
++	serializeJsonLine: (value: unknown) => `${JSON.stringify(value)}\n`,
++}));
++
++function gate() {
++	let resolve!: () => void;
++	const promise = new Promise<void>((done) => {
++		resolve = done;
++	});
++	return { promise, resolve };
++}
++const binding = createHash("sha256").update("rpc-idle-test").digest("hex");
++
++describe("RPC idle action input wiring", () => {
++	const harnesses: Harness[] = [];
++	const signals: NodeJS.Signals[] = process.platform === "win32" ? ["SIGTERM"] : ["SIGTERM", "SIGHUP"];
++	const originalEnd = process.stdin.listeners("end");
++	const originalSignals = new Map(signals.map((signal) => [signal, process.listeners(signal)]));
++	afterEach(() => {
++		for (const harness of harnesses.splice(0)) harness.cleanup();
++		for (const listener of process.stdin.listeners("end") as Array<Parameters<typeof process.on>[1]>) {
++			if (!originalEnd.includes(listener)) process.stdin.off("end", listener);
++		}
++		for (const signal of signals) {
++			for (const listener of process.listeners(signal) as Array<Parameters<typeof process.on>[1]>) {
++				if (!originalSignals.get(signal)!.includes(listener)) process.off(signal, listener);
++			}
++		}
++		rpcIo.lines = [];
++		rpcIo.send = undefined;
++	});
++
++	it.each(["select", "confirm", "input", "editor", "custom"] as const)(
++		"fails closed for leased %s UI without changing ordinary RPC dialogs",
++		async (method) => {
++			const harness = await createHarness();
++			harnesses.push(harness);
++			void runRpcMode({ session: harness.session, setRebindSession: () => {} } as unknown as AgentSessionRuntime);
++			await vi.waitFor(() => expect(rpcIo.send).toBeDefined());
++			const ordinary = harness.session.extensionRunner.createContext();
++			const handle = ordinary.idleActions!.request({
++				id: randomUUID(),
++				binding,
++				isCurrent: () => true,
++				run: async (lease) => {
++					const ui = lease.context.ui;
++					switch (method) {
++						case "select":
++							await ui.select("leased", ["Later"], { signal: lease.signal });
++							break;
++						case "confirm":
++							await ui.confirm("leased", "No RPC close acknowledgement", { signal: lease.signal });
++							break;
++						case "input":
++							await ui.input("leased", "text", { signal: lease.signal });
++							break;
++						case "editor":
++							await ui.editor("leased", "text");
++							break;
++						case "custom":
++							await ui.custom(() => ({ render: () => [], invalidate: () => {} }));
++							break;
++					}
++				},
++			});
++			const uiRequests = () =>
++				rpcIo.lines
++					.map((line) => JSON.parse(line) as { type: string; method?: string; id: string })
++					.filter((message) => message.type === "extension_ui_request");
++			try {
++				expect(uiRequests()).toEqual([]);
++				await handle.result;
++			} finally {
++				// Release the pre-fix RPC editor too; it does not support an abort signal.
++				for (const message of uiRequests())
++					rpcIo.send!(JSON.stringify({ type: "extension_ui_response", id: message.id, cancelled: true }));
++				handle.cancel();
++				await handle.result;
++			}
++			expect(await handle.result).toMatchObject({ status: "failed", reason: "callback_error" });
++			expect(ordinary.hasUI).toBe(true);
++			const dialog = ordinary.ui.select("ordinary", ["Later"]);
++			const request = uiRequests().findLast((message) => message.method === "select")!;
++			rpcIo.send!(JSON.stringify({ type: "extension_ui_response", id: request.id, value: "Later" }));
++			expect(await dialog).toBe("Later");
++		},
++	);
++
++	it.each(["result", "operations"] as const)(
++		"keeps the whole %s interception and recording before an action",
++		async (kind) => {
++			const intercepted = gate();
++			const release = gate();
++			const operations: BashOperations = { exec: async () => ({ exitCode: 0 }) };
++			const result = { output: "rpc intercepted", exitCode: 0, cancelled: false, truncated: false };
++			const harness = await createHarness({
++				extensionFactories: [
++					(pi) => {
++						pi.on("user_bash", async () => {
++							intercepted.resolve();
++							await release.promise;
++							return kind === "result" ? { result } : { operations };
++						});
++					},
++				],
++			});
++			harnesses.push(harness);
++			const replacement = await createHarness();
++			harnesses.push(replacement);
++			const host = {
++				session: harness.session,
++				setRebindSession: () => {},
++				newSession: async () => {
++					host.session = replacement.session;
++					return { cancelled: false };
++				},
++			};
++			void runRpcMode(host as unknown as AgentSessionRuntime);
++			await vi.waitFor(() => expect(rpcIo.send).toBeDefined());
++			rpcIo.send!(JSON.stringify({ id: "bash", type: "bash", command: "pwd" }));
++			await intercepted.promise;
++			let entered = false;
++			const api = harness.session.extensionRunner.createContext().idleActions!;
++			const handle = api.request({
++				id: randomUUID(),
++				binding,
++				isCurrent: () => true,
++				run: async () => {
++					entered = true;
++				},
++			});
++			try {
++				expect(entered).toBe(false);
++				expect(api.state().pendingInputs).toBeGreaterThan(0);
++			} finally {
++				rpcIo.send!(JSON.stringify({ id: "replacement", type: "new_session" }));
++				await vi.waitFor(() =>
++					expect(rpcIo.lines.some((line) => (JSON.parse(line) as { id?: string }).id === "replacement")).toBe(
++						true,
++					),
++				);
++				release.resolve();
++				await vi.waitFor(() =>
++					expect(
++						rpcIo.lines.some((line) => {
++							const message = JSON.parse(line) as { type: string; command?: string; success?: boolean };
++							return message.type === "response" && message.command === "bash" && message.success;
++						}),
++					).toBe(true),
++				);
++				await handle.result;
++			}
++			expect(entered).toBe(false);
++			expect(harness.session.messages.filter((message) => message.role === "bashExecution")).toHaveLength(1);
++			expect(replacement.session.messages.filter((message) => message.role === "bashExecution")).toHaveLength(0);
++		},
++	);
++});
+diff --git a/packages/coding-agent/test/suite/agent-session-idle-actions.test.ts b/packages/coding-agent/test/suite/agent-session-idle-actions.test.ts
+new file mode 100644
+index 0000000..8a1b8d4
+--- /dev/null
++++ b/packages/coding-agent/test/suite/agent-session-idle-actions.test.ts
+@@ -0,0 +1,933 @@
++import { AsyncLocalStorage } from "node:async_hooks";
++import { createHash, randomUUID } from "node:crypto";
++import { fauxAssistantMessage } from "@earendil-works/pi-ai";
++import { afterEach, describe, expect, it } from "vitest";
++import { createEventBus } from "../../src/core/event-bus.ts";
++import type {
++	ExtensionAPI,
++	ExtensionContext,
++	IdleActionAPI,
++	IdleActionHandle,
++	IdleActionResult,
++} from "../../src/core/extensions/index.ts";
++import { createExtensionRuntime, loadExtensionFromFactory } from "../../src/core/extensions/loader.ts";
++import { createHarness, createTestUiContext, type Harness } from "./harness.ts";
++
++function gate() {
++	let resolve!: () => void;
++	const promise = new Promise<void>((done) => {
++		resolve = done;
++	});
++	return { promise, resolve };
++}
++
++const binding = createHash("sha256").update("idle-action-sentinel").digest("hex");
++
++describe("AgentSession idle actions", () => {
++	const harnesses: Harness[] = [];
++	afterEach(() => {
++		for (const harness of harnesses.splice(0)) harness.cleanup();
++	});
++
++	it("keeps hasUI false for absent UI, including explicit reset after a real UI", async () => {
++		const harness = await createHarness();
++		harnesses.push(harness);
++		const runner = harness.session.extensionRunner;
++		expect(runner.createContext().hasUI).toBe(false);
++		runner.setUIContext(undefined);
++		expect(runner.createContext().hasUI).toBe(false);
++		for (const mode of ["tui", "rpc"] as const) {
++			runner.setUIContext(createTestUiContext(), mode);
++			expect(runner.createContext().hasUI).toBe(true);
++			runner.setUIContext(undefined, "print");
++			expect(runner.createContext().hasUI).toBe(false);
++		}
++	});
++
++	it.each(["session", "error"] as const)(
++		"keeps competing input from a %s observer outside the action marker",
++		async (kind) => {
++			let pi!: ExtensionAPI;
++			const own = new AsyncLocalStorage<string>();
++			const stores: Array<string | undefined> = [];
++			const input = gate();
++			const settled = gate();
++			const release = gate();
++			let cleanup = false;
++			let observerError: unknown;
++			const harness = await createHarness({
++				extensionFactories: [
++					(api) => {
++						pi = api;
++						api.on("input", (event) => {
++							if (event.text === "observer input") {
++								stores.push(own.getStore());
++								input.resolve();
++							}
++						});
++					},
++				],
++			});
++			harnesses.push(harness);
++			harness.setResponses([fauxAssistantMessage("observer input done")]);
++			harness.session.subscribe((event) => {
++				if (event.type === "agent_settled") settled.resolve();
++			});
++			const observe = () => {
++				stores.push(own.getStore());
++				try {
++					pi.sendUserMessage("observer input");
++				} catch (error) {
++					observerError = error;
++				}
++			};
++			if (kind === "session")
++				harness.session.subscribe((event) => {
++					if (
++						event.type === "entry_appended" &&
++						event.entry.type === "custom" &&
++						event.entry.customType === "h0-observed"
++					)
++						observe();
++				});
++			else harness.session.extensionRunner.onError(observe);
++			const handle = own.run("extension", () =>
++				harness.session.extensionRunner.createContext().idleActions!.request({
++					id: randomUUID(),
++					binding,
++					isCurrent: () => true,
++					run: async () => {
++						if (kind === "session") pi.appendEntry("h0-observed", {});
++						else
++							harness.session.extensionRunner.emitError({
++								extensionPath: "<test>",
++								event: "metadata",
++								error: "synthetic",
++							});
++						await release.promise;
++						cleanup = true;
++					},
++				}),
++			);
++			try {
++				expect(observerError).toBeUndefined();
++				expect(handle.signal.aborted).toBe(true);
++				expect(harness.eventsOfType("agent_start")).toHaveLength(0);
++			} finally {
++				release.resolve();
++				await handle.result;
++			}
++			expect(await handle.result).toMatchObject({ status: "cancelled", reason: "input" });
++			await input.promise;
++			await settled.promise;
++			await harness.session.waitForIdle();
++			expect(cleanup).toBe(true);
++			expect(stores).toEqual(["extension", "extension"]);
++			expect(harness.session.messages.filter((message) => message.role === "user")).toHaveLength(1);
++		},
++	);
++
++	it.each(["decision", "headers", "payload"] as const)(
++		"keeps the entire idle %s dispatch outside an action",
++		async (kind) => {
++			const later = gate();
++			const release = gate();
++			let handle: IdleActionHandle | undefined;
++			let entered = false;
++			const first = (ctx: ExtensionContext) => {
++				handle = ctx.idleActions!.request({
++					id: randomUUID(),
++					binding,
++					isCurrent: () => true,
++					run: async () => {
++						entered = true;
++					},
++				});
++			};
++			const second = async () => {
++				later.resolve();
++				await release.promise;
++			};
++			const harness = await createHarness({
++				extensionFactories: [
++					(pi) => {
++						if (kind === "decision") {
++							pi.on("cache_warming_decision", (_event, ctx) => first(ctx));
++							pi.on("cache_warming_decision", second);
++						} else if (kind === "headers") {
++							pi.on("before_provider_headers", (_event, ctx) => first(ctx));
++							pi.on("before_provider_headers", second);
++						} else {
++							pi.on("before_provider_request", (_event, ctx) => first(ctx));
++							pi.on("before_provider_request", second);
++						}
++					},
++				],
++			});
++			harnesses.push(harness);
++			const runner = harness.session.extensionRunner;
++			const dispatch =
++				kind === "decision"
++					? runner.emitCacheWarmingDecision({
++							type: "cache_warming_decision",
++							warmCost: 0,
++							missCost: 0,
++							continuationProbability: 0,
++							action: "stop",
++						})
++					: kind === "headers"
++						? runner.emitBeforeProviderHeaders({})
++						: runner.emitBeforeProviderRequest({});
++			await later.promise;
++			try {
++				expect(entered).toBe(false);
++			} finally {
++				release.resolve();
++				await dispatch;
++				await handle?.result;
++			}
++			expect(entered).toBe(true);
++			expect(await handle?.result).toMatchObject({ status: "completed" });
++		},
++	);
++
++	it.each(["decision", "headers", "payload"] as const)(
++		"cancels an active action on an idle %s dispatch without self-wait",
++		async (kind) => {
++			const harness = await createHarness();
++			harnesses.push(harness);
++			const runner = harness.session.extensionRunner;
++			const handle = runner.createContext().idleActions!.request({
++				id: randomUUID(),
++				binding,
++				isCurrent: () => true,
++				run: async (lease) => {
++					await new Promise<void>((resolve) =>
++						lease.signal.addEventListener("abort", () => resolve(), { once: true }),
++					);
++				},
++			});
++			const dispatch =
++				kind === "decision"
++					? runner.emitCacheWarmingDecision({
++							type: "cache_warming_decision",
++							warmCost: 0,
++							missCost: 0,
++							continuationProbability: 0,
++							action: "stop",
++						})
++					: kind === "headers"
++						? runner.emitBeforeProviderHeaders({})
++						: runner.emitBeforeProviderRequest({});
++			try {
++				expect(handle.signal.aborted).toBe(true);
++			} finally {
++				handle.cancel();
++				await dispatch;
++				await handle.result;
++			}
++			expect(await handle.result).toMatchObject({ status: "cancelled", reason: "input" });
++		},
++	);
++
++	it("does not enter an action before later settled handlers and their earlier input finish", async () => {
++		const laterEntered = gate();
++		const releaseLater = gate();
++		let api: IdleActionAPI | undefined;
++		let handle: IdleActionHandle | undefined;
++		let first = true;
++		const entered: string[] = [];
++		const harness = await createHarness({
++			extensionFactories: [
++				(pi) => {
++					pi.on("agent_settled", (_event, ctx) => {
++						if (!first) return;
++						api = ctx.idleActions;
++						handle = api?.request({
++							id: randomUUID(),
++							binding,
++							isCurrent: () => true,
++							run: async () => {
++								entered.push("action");
++							},
++						});
++					});
++					pi.on("agent_settled", async () => {
++						if (!first) return;
++						first = false;
++						laterEntered.resolve();
++						await releaseLater.promise;
++						await harness.session.prompt("earlier input");
++					});
++				},
++			],
++		});
++		harnesses.push(harness);
++		harness.setResponses([fauxAssistantMessage("first done"), fauxAssistantMessage("earlier input done")]);
++		const prompt = harness.session.prompt("first");
++		await laterEntered.promise;
++		try {
++			expect(api, "AgentSession must expose the qualified idle action API").toBeDefined();
++			expect(entered).toEqual([]);
++			expect(api?.state().phase).toBe("settling");
++		} finally {
++			releaseLater.resolve();
++			await prompt;
++		}
++		expect(await handle?.result).toMatchObject({ status: "cancelled", reason: "input" });
++		expect(entered).toEqual([]);
++	});
++
++	it("cannot revive cancellation reentered from the final source predicate", async () => {
++		const harness = await createHarness();
++		harnesses.push(harness);
++		harness.setResponses([fauxAssistantMessage("must not start")]);
++		let final = false;
++		let handle!: IdleActionHandle;
++		handle = harness.session.extensionRunner.createContext().idleActions!.request({
++			id: randomUUID(),
++			binding,
++			isCurrent: () => {
++				if (final) handle.cancel();
++				return true;
++			},
++			run: async (lease) => {
++				await lease.dispatch({ customType: "test", content: "reentrant cancellation", display: false }, () => {
++					final = true;
++					return true;
++				});
++			},
++		});
++		expect(await handle.result).toMatchObject({ status: "cancelled", reason: "abort" });
++		expect(harness.eventsOfType("idle_action_started")).toHaveLength(0);
++	});
++
++	it("requires literal true from both the source predicate and delivery validator", async () => {
++		const harness = await createHarness();
++		harnesses.push(harness);
++		harness.setResponses([fauxAssistantMessage("must not run")]);
++		const api = harness.session.extensionRunner.createContext().idleActions!;
++		let entered = false;
++		const stale = api.request({
++			id: randomUUID(),
++			binding,
++			isCurrent: () => "yes" as unknown as boolean,
++			run: async () => {
++				entered = true;
++			},
++		});
++		expect(await stale.result).toMatchObject({ status: "cancelled", reason: "stale" });
++		expect(entered).toBe(false);
++		const invalid = api.request({
++			id: randomUUID(),
++			binding,
++			isCurrent: () => true,
++			run: async (lease) => {
++				await lease.dispatch(
++					{ customType: "test", content: "no", display: false },
++					() => "yes" as unknown as boolean,
++				);
++			},
++		});
++		expect(await invalid.result).toMatchObject({ status: "rejected", reason: "validation" });
++		expect(harness.eventsOfType("idle_action_started")).toHaveLength(0);
++	});
++
++	it.each(["hook", "observer"])(
++		"preserves a started receipt and notifies settlement on a failed preparation %s",
++		async (failure) => {
++			const harness = await createHarness({
++				extensionFactories: [
++					(pi) => {
++						pi.on("before_agent_start", (event) => {
++							// Fault injection through the public preparation hook, before kernel agent_start.
++							if (failure === "hook") event.systemPromptOptions.selectedTools = null as unknown as string[];
++						});
++					},
++				],
++			});
++			harnesses.push(harness);
++			harness.setResponses([fauxAssistantMessage("unused")]);
++			harness.session.subscribe((event) => {
++				if (failure === "observer" && event.type === "idle_action_started")
++					throw new Error("failed logical-start observer");
++			});
++			const settled = gate();
++			harness.session.subscribe((event) => {
++				if (event.type === "agent_settled") settled.resolve();
++			});
++			const handle = harness.session.extensionRunner.createContext().idleActions!.request({
++				id: randomUUID(),
++				binding,
++				isCurrent: () => true,
++				run: async (lease) => {
++					await lease.dispatch({ customType: "test", content: "preparation failure", display: false }, () => true);
++					throw new Error("A post-start callback failure cannot undo delivery");
++				},
++			});
++			const receipt = await handle.result;
++			expect(receipt).toMatchObject({ status: "started" });
++			if (failure === "observer") expect(harness.session.isIdle).toBe(true);
++			await settled.promise;
++			expect(await handle.result).toEqual(receipt);
++			expect(harness.eventsOfType("agent_settled")).toMatchObject([{ idleActionFailure: receipt }]);
++			expect(harness.eventsOfType("agent_start")).toHaveLength(0);
++			expect(harness.session.isIdle).toBe(true);
++			expect(harness.getPendingResponseCount()).toBe(1);
++		},
++	);
++
++	it.each([
++		"clear",
++		"thinking",
++		"tools",
++		"model",
++		"reload",
++		"tree",
++		"bash-result",
++		"abort-bash",
++		"abort-compaction",
++		"abort-summary",
++		"abort-retry",
++	])("invalidates validation before the %s native control changes state", async (control) => {
++		const harness = await createHarness();
++		harnesses.push(harness);
++		const anchor = harness.sessionManager.appendCustomEntry("anchor", {});
++		harness.sessionManager.appendCustomEntry("later", {});
++		const validating = gate();
++		const release = gate();
++		const handle = harness.session.extensionRunner.createContext().idleActions!.request({
++			id: randomUUID(),
++			binding,
++			isCurrent: () => true,
++			run: async (lease) => {
++				await lease.dispatch({ customType: "test", content: "stale", display: false }, async () => {
++					validating.resolve();
++					await release.promise;
++					return true;
++				});
++			},
++		});
++		await validating.promise;
++		const apply = () => {
++			switch (control) {
++				case "clear":
++					return harness.session.clearQueue();
++				case "thinking":
++					return harness.session.setThinkingLevel("off");
++				case "tools":
++					return harness.session.setActiveToolsByName([]);
++				case "model":
++					return harness.session.setModel(harness.getModel());
++				case "reload":
++					return harness.session.reload();
++				case "tree":
++					return harness.session.navigateTree(anchor);
++				case "bash-result":
++					return harness.session.recordBashResult("test", {
++						output: "",
++						exitCode: 0,
++						cancelled: false,
++						truncated: false,
++					});
++				case "abort-bash":
++					return harness.session.abortBash();
++				case "abort-compaction":
++					return harness.session.abortCompaction();
++				case "abort-summary":
++					return harness.session.abortBranchSummary();
++				case "abort-retry":
++					return harness.session.abortRetry();
++			}
++		};
++		const operation = apply();
++		try {
++			expect(handle.signal.aborted).toBe(true);
++		} finally {
++			release.resolve();
++			await operation;
++			await handle.result;
++			await harness.session.waitForIdle();
++		}
++		expect(await handle.result).toMatchObject({ status: "cancelled" });
++		expect(harness.eventsOfType("idle_action_started")).toHaveLength(0);
++	});
++
++	it("deduplicates attempts, rejects conflicts/busy, and fails closed at the bounded capacity", async () => {
++		const harness = await createHarness();
++		harnesses.push(harness);
++		const api = harness.session.extensionRunner.createContext().idleActions!;
++		const request = { id: randomUUID(), binding, isCurrent: () => true, run: async () => {} };
++		const first = api.request(request);
++		await first.result;
++		expect(api.request(request)).toBe(first);
++		expect(await api.request({ ...request, binding: "a".repeat(64) }).result).toMatchObject({
++			status: "rejected",
++			reason: "conflict",
++		});
++		const release = gate();
++		const occupied = api.request({
++			...request,
++			id: randomUUID(),
++			run: async () => {
++				await release.promise;
++			},
++		});
++		expect(api.request({ ...request, id: occupied.id })).toBe(occupied);
++		expect(await api.request({ ...request, id: randomUUID() }).result).toMatchObject({
++			status: "rejected",
++			reason: "busy",
++		});
++		release.resolve();
++		await occupied.result;
++		// Three remembered attempts above, including the busy rejection; no eviction/replay.
++		for (let i = 3; i < 4096; i++) await api.request({ ...request, id: randomUUID() }).result;
++		expect(await api.request({ ...request, id: randomUUID() }).result).toMatchObject({
++			status: "rejected",
++			reason: "capacity",
++		});
++		expect(api.request(request)).toBe(first);
++	});
++
++	it("keeps EventBus identity before binding, preserves extension ALS, and cleans subscriptions", async () => {
++		const bus = createEventBus();
++		const runtime = createExtensionRuntime();
++		const own = new AsyncLocalStorage<string>();
++		const host = new AsyncLocalStorage<string>();
++		const observed: Array<[string | undefined, string | undefined]> = [];
++		let unsubscribe!: () => void;
++		await loadExtensionFromFactory(
++			(pi) => {
++				unsubscribe = pi.events.on("observe", () => {
++					observed.push([own.getStore(), host.getStore()]);
++				});
++			},
++			process.cwd(),
++			bus,
++			runtime,
++		);
++		const value = {};
++		expect(runtime.invokeOutsideIdleAction(() => value)).toBe(value);
++		own.run("extension", () => host.run("before-bind", () => bus.emit("observe", {})));
++		runtime.invokeOutsideIdleAction = (run) => host.exit(run);
++		own.run("extension", () => host.run("action", () => bus.emit("observe", {})));
++		expect(observed).toEqual([
++			["extension", "before-bind"],
++			["extension", undefined],
++		]);
++		unsubscribe();
++		unsubscribe();
++		bus.emit("observe", {});
++		expect(observed).toHaveLength(2);
++		await loadExtensionFromFactory(
++			(pi) => {
++				pi.events.on("observe", () => {
++					observed.push([undefined, "stale"]);
++				});
++			},
++			process.cwd(),
++			bus,
++			runtime,
++		);
++		runtime.invalidate();
++		bus.emit("observe", {});
++		expect(observed).toHaveLength(2);
++		const failedRuntime = createExtensionRuntime();
++		await expect(
++			loadExtensionFromFactory(
++				(pi) => {
++					pi.events.on("observe", () => {
++						observed.push([undefined, "failed-load"]);
++					});
++					throw new Error("failed factory");
++				},
++				process.cwd(),
++				bus,
++				failedRuntime,
++			),
++		).rejects.toThrow("failed factory");
++		bus.emit("observe", {});
++		expect(observed).toHaveLength(2);
++	});
++
++	it("allows owned review and final UI but waits for all queued UI observers before delivery", async () => {
++		const questionsDone = gate();
++		const observers = gate();
++		const titles: string[] = [];
++		const harness = await createHarness({
++			extensionFactories: [
++				(pi) => {
++					pi.on("ui_prompt_end", async () => {
++						await observers.promise;
++					});
++				},
++			],
++		});
++		harnesses.push(harness);
++		harness.setResponses([fauxAssistantMessage("one owned delivery")]);
++		await harness.session.bindExtensions({
++			mode: "tui",
++			uiContext: createTestUiContext({
++				select: async (title) => {
++					titles.push(title);
++					return "continue";
++				},
++			}),
++		});
++		const handle = harness.session.extensionRunner.createContext().idleActions!.request({
++			id: randomUUID(),
++			binding,
++			isCurrent: () => true,
++			run: async (lease) => {
++				await lease.context.ui.select("review", ["continue"], { signal: lease.signal });
++				await lease.context.ui.select("final", ["continue"], { signal: lease.signal });
++				questionsDone.resolve();
++				await lease.dispatch({ customType: "test", content: "owned delivery", display: false }, () => true);
++			},
++		});
++		await questionsDone.promise;
++		expect(titles).toEqual(["review", "final"]);
++		expect(handle.signal.aborted).toBe(false);
++		expect(harness.eventsOfType("idle_action_started")).toHaveLength(0);
++		observers.resolve();
++		expect(await handle.result).toMatchObject({ status: "started" });
++		await harness.session.waitForIdle();
++		expect(harness.eventsOfType("agent_start")).toHaveLength(1);
++	});
++
++	it("keeps next-turn context and a real core queue visible without counting UI mirrors", async () => {
++		const harness = await createHarness();
++		harnesses.push(harness);
++		const api = harness.session.extensionRunner.createContext().idleActions!;
++		await harness.session.sendCustomMessage(
++			{ customType: "aside", content: "pending next input", display: false },
++			{ deliverAs: "nextTurn" },
++		);
++		harness.session.agent.followUp({
++			role: "user",
++			content: [{ type: "text", text: "queued core input" }],
++			timestamp: Date.now(),
++		});
++		expect(api.state().pendingInputs).toBe(2);
++		let entered = false;
++		const handle = api.request({
++			id: randomUUID(),
++			binding,
++			isCurrent: () => true,
++			run: async () => {
++				entered = true;
++			},
++		});
++		expect(entered).toBe(false);
++		handle.cancel();
++		expect(await handle.result).toMatchObject({ status: "cancelled", reason: "abort" });
++	});
++
++	it("keeps spliced deferred work visible while a deferred run settles", async () => {
++		let stage = 0;
++		let pending = 0;
++		const harness = await createHarness({
++			extensionFactories: [
++				(pi) => {
++					pi.on("agent_settled", (_event, ctx) => {
++						if (stage === 0) {
++							stage = 1;
++							pi.sendUserMessage("deferred one");
++							pi.sendUserMessage("deferred two");
++						} else if (stage === 1) {
++							stage = 2;
++							pending = ctx.idleActions!.state().pendingInputs;
++						}
++					});
++				},
++			],
++		});
++		harnesses.push(harness);
++		harness.setResponses([fauxAssistantMessage("initial"), fauxAssistantMessage("one"), fauxAssistantMessage("two")]);
++		await harness.session.prompt("start");
++		// Original + deferred prompt operations, plus two spliced deferred sources.
++		expect(pending).toBe(4);
++		expect(harness.eventsOfType("agent_start")).toHaveLength(3);
++	});
++
++	it("invalidates captured leased UI methods and old APIs on disposal", async () => {
++		const harness = await createHarness();
++		harnesses.push(harness);
++		const release = gate();
++		let select!: ExtensionContext["ui"]["select"];
++		const ordinary = harness.session.extensionRunner.createContext();
++		const api = ordinary.idleActions!;
++		const handle = api.request({
++			id: randomUUID(),
++			binding,
++			isCurrent: () => true,
++			run: async (lease) => {
++				select = lease.context.ui.select;
++				await release.promise;
++			},
++		});
++		harness.session.dispose();
++		expect(handle.signal.aborted).toBe(true);
++		expect(() => select("old lease", ["Later"])).toThrow(/stale/);
++		expect(() => api.request({ id: randomUUID(), binding, isCurrent: () => true, run: async () => {} })).toThrow(
++			/stale/,
++		);
++		release.resolve();
++		expect(await handle.result).toMatchObject({ status: "cancelled", reason: "stale" });
++	});
++
++	it("runs metadata-only callbacks outside lifecycle dispatch without a provider turn", async () => {
++		const harness = await createHarness();
++		harnesses.push(harness);
++		const api = harness.session.extensionRunner.createContext().idleActions!;
++		let current = false;
++		const handle = api.request({
++			id: randomUUID(),
++			binding,
++			isCurrent: () => true,
++			run: async (lease) => {
++				current = lease.isCurrent();
++				expect(lease.context.sessionManager).toBe(harness.sessionManager);
++				expect(lease.context.signal).toBe(lease.signal);
++			},
++		});
++		expect(await handle.result).toEqual({ status: "completed", actionId: handle.id });
++		expect(current).toBe(true);
++		expect(harness.eventsOfType("agent_start")).toHaveLength(0);
++	});
++
++	it("cancels validation immediately on abort and ignores its late true result", async () => {
++		const harness = await createHarness();
++		harnesses.push(harness);
++		harness.setResponses([fauxAssistantMessage("must not run")]);
++		const api = harness.session.extensionRunner.createContext().idleActions!;
++		const validating = gate();
++		const releaseValidation = gate();
++		const handle = api.request({
++			id: randomUUID(),
++			binding,
++			isCurrent: () => true,
++			run: async (lease) => {
++				await lease.dispatch({ customType: "test", content: "cancelled", display: false }, async () => {
++					validating.resolve();
++					await releaseValidation.promise;
++					return true;
++				});
++			},
++		});
++		await validating.promise;
++		const abort = harness.session.abort();
++		try {
++			expect(handle.signal.aborted).toBe(true);
++			expect(await handle.result).toMatchObject({ status: "cancelled", reason: "abort" });
++		} finally {
++			releaseValidation.resolve();
++			await abort;
++			await handle.result;
++		}
++		expect(harness.eventsOfType("idle_action_started")).toHaveLength(0);
++		expect(harness.getPendingResponseCount()).toBe(1);
++	});
++
++	it("reports a rejected dispatch as the attempt outcome rather than completed", async () => {
++		const harness = await createHarness();
++		harnesses.push(harness);
++		const api = harness.session.extensionRunner.createContext().idleActions!;
++		const handle = api.request({
++			id: randomUUID(),
++			binding,
++			isCurrent: () => true,
++			run: async (lease) => {
++				expect(
++					await lease.dispatch({ customType: "test", content: "no", display: false }, () => false),
++				).toMatchObject({ status: "rejected", reason: "validation" });
++			},
++		});
++		expect(await handle.result).toMatchObject({ status: "rejected", reason: "validation" });
++		expect(harness.eventsOfType("idle_action_started")).toHaveLength(0);
++	});
++
++	it("acknowledges logical start before preparation and never starts a lease twice", async () => {
++		const prepare = gate();
++		const receipts = gate();
++		const cleanup = gate();
++		let second: IdleActionResult | undefined;
++		const harness = await createHarness({
++			extensionFactories: [
++				(pi) => {
++					pi.on("before_agent_start", async () => {
++						await prepare.promise;
++					});
++				},
++			],
++		});
++		harnesses.push(harness);
++		harness.setResponses([fauxAssistantMessage("one delivery")]);
++		const api = harness.session.extensionRunner.createContext().idleActions!;
++		const message = { customType: "delivery", content: "frozen", display: false };
++		const handle = api.request({
++			id: randomUUID(),
++			binding,
++			isCurrent: () => true,
++			run: async (lease) => {
++				await lease.dispatch(message, () => true);
++				second = await lease.dispatch(message, () => true);
++				receipts.resolve();
++				await cleanup.promise;
++			},
++		});
++		message.content = "mutated";
++		try {
++			const result = await handle.result;
++			expect(result).toMatchObject({ status: "started", actionId: handle.id, sessionId: harness.session.sessionId });
++			expect(harness.session.isStreaming).toBe(true);
++			expect(harness.eventsOfType("agent_start")).toHaveLength(0);
++			expect(harness.eventsOfType("idle_action_started")).toEqual([{ type: "idle_action_started", ...result }]);
++			await receipts.promise;
++			expect(second).toMatchObject({ status: "rejected", reason: "conflict" });
++			// An input after logical start must not join the callback's still-blocked cleanup.
++			await harness.session.sendCustomMessage(
++				{ customType: "aside", content: "new input", display: false },
++				{ triggerTurn: false },
++			);
++		} finally {
++			cleanup.resolve();
++			prepare.resolve();
++			await harness.session.waitForIdle();
++		}
++		expect(harness.eventsOfType("idle_action_started")).toHaveLength(1);
++		expect(harness.session.messages.filter((m) => m.role === "custom" && m.customType === "delivery")).toMatchObject([
++			{ content: "frozen" },
++		]);
++	});
++
++	it("waits for owned UI cleanup before opening a competing ordinary UI", async () => {
++		const opened = gate();
++		const closeOwned = gate();
++		const titles: string[] = [];
++		const harness = await createHarness();
++		harnesses.push(harness);
++		await harness.session.bindExtensions({
++			mode: "tui",
++			uiContext: createTestUiContext({
++				select: async (title, _choices, opts) => {
++					titles.push(title);
++					if (title === "owned") {
++						opened.resolve();
++						await new Promise<void>((resolve) =>
++							opts?.signal?.addEventListener("abort", () => resolve(), { once: true }),
++						);
++						await closeOwned.promise;
++					}
++					return undefined;
++				},
++			}),
++		});
++		const ordinary = harness.session.extensionRunner.createContext();
++		const handle = ordinary.idleActions!.request({
++			id: randomUUID(),
++			binding,
++			isCurrent: () => true,
++			run: async (lease) => {
++				await lease.context.ui.select("owned", ["Later"], { signal: lease.signal });
++			},
++		});
++		await opened.promise;
++		const foreign = ordinary.ui.select("foreign", ["Later"]);
++		expect(handle.signal.aborted).toBe(true);
++		expect(titles).toEqual(["owned"]);
++		closeOwned.resolve();
++		await foreign;
++		expect(await handle.result).toMatchObject({ status: "cancelled", reason: "input" });
++		expect(titles).toEqual(["owned", "foreign"]);
++	});
++
++	it("does not release a callback's slot until its actual owned UI closes", async () => {
++		const aborted = gate();
++		const close = gate();
++		const harness = await createHarness();
++		harnesses.push(harness);
++		await harness.session.bindExtensions({
++			mode: "tui",
++			uiContext: createTestUiContext({
++				select: async (_title, _choices, opts) => {
++					await new Promise<void>((resolve) =>
++						opts?.signal?.addEventListener(
++							"abort",
++							() => {
++								aborted.resolve();
++								resolve();
++							},
++							{ once: true },
++						),
++					);
++					await close.promise;
++					return undefined;
++				},
++			}),
++		});
++		let ui: Promise<string | undefined> | undefined;
++		const handle = harness.session.extensionRunner.createContext().idleActions!.request({
++			id: randomUUID(),
++			binding,
++			isCurrent: () => true,
++			run: async (lease) => {
++				ui = lease.context.ui.select("owned", ["Later"], { signal: lease.signal });
++			},
++		});
++		let settled = false;
++		void handle.result.then(() => {
++			settled = true;
++		});
++		await aborted.promise;
++		try {
++			expect(settled).toBe(false);
++		} finally {
++			close.resolve();
++			await handle.result;
++			await ui;
++		}
++	});
++
++	it("treats an EventBus subscriber's input as external but rejects a direct callback input", async () => {
++		let pi!: ExtensionAPI;
++		const input = gate();
++		const harness = await createHarness({
++			extensionFactories: [
++				(extension) => {
++					pi = extension;
++					extension.events.on("compete", () => {
++						extension.sendUserMessage("event input");
++					});
++					extension.on("input", (event) => {
++						if (event.text === "event input") input.resolve();
++					});
++				},
++			],
++		});
++		harnesses.push(harness);
++		harness.setResponses([fauxAssistantMessage("external input")]);
++		const api = harness.session.extensionRunner.createContext().idleActions!;
++		const handle = api.request({
++			id: randomUUID(),
++			binding,
++			isCurrent: () => true,
++			run: async (lease) => {
++				pi.events.emit("compete", {});
++				expect(lease.signal.aborted).toBe(true);
++			},
++		});
++		expect(await handle.result).toMatchObject({ status: "cancelled", reason: "input" });
++		await input.promise;
++		await harness.session.waitForIdle();
++		const direct = api.request({
++			id: randomUUID(),
++			binding,
++			isCurrent: () => true,
++			run: async () => {
++				pi.sendUserMessage("must fail fast");
++			},
++		});
++		expect(await direct.result).toMatchObject({ status: "failed", reason: "callback_error" });
++	});
++});

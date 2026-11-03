@@ -5,7 +5,7 @@ import type {
 } from "@earendil-works/pi-coding-agent";
 import { beforeEach, describe, expect, it, vi } from "vitest";
 import { registerSupervisorComponents } from "../index";
-import { scopedAPI } from "../runtime";
+import { scopedAPI, bindRuntimeCallback, currentRuntime } from "../runtime";
 import { startSupervisor } from "../supervisor";
 import { resetState } from "../state";
 import { activeBoard, ACTIVATION, BOUNDARY, deferred } from "./helpers/lifecycle";
@@ -49,6 +49,46 @@ function instance(id: string) {
 describe("extension instance isolation", () => {
   beforeEach(() => {
     resetState();
+  });
+
+  it("binds delayed host predicates, async validators and result reactions to their original runtime", async () => {
+    const outside = currentRuntime();
+    function capture(label: string) {
+      let callbacks!: {
+        predicate(): boolean;
+        run(nested: () => Promise<void>): Promise<void>;
+        reaction(value: string): string;
+      };
+      scopedAPI(createMockAPI().api, () => {
+        const owner = currentRuntime();
+        callbacks = {
+          predicate: bindRuntimeCallback(() => currentRuntime() === owner),
+          run: bindRuntimeCallback(async (nested) => {
+            expect(currentRuntime()).toBe(owner);
+            await nested();
+            await Promise.resolve();
+            expect(currentRuntime()).toBe(owner);
+          }),
+          reaction: bindRuntimeCallback((value) => {
+            expect(currentRuntime()).toBe(owner);
+            return label + value;
+          }),
+        };
+      });
+      return callbacks;
+    }
+    const a = capture("A"),
+      b = capture("B");
+    expect(a.predicate()).toBe(true);
+    expect(b.predicate()).toBe(true);
+    await a.run(() =>
+      b.run(async () => {
+        expect(a.predicate()).toBe(true);
+      }),
+    );
+    expect(await Promise.resolve(" result").then(a.reaction)).toBe("A result");
+    expect(await Promise.resolve(" result").then(b.reaction)).toBe("B result");
+    expect(currentRuntime()).toBe(outside);
   });
 
   it("keeps goals and boards independent across simultaneous sessions", async () => {

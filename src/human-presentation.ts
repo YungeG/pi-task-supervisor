@@ -4,6 +4,7 @@ import type { PreflightState, PreflightProposal } from "./preflight";
 import { stripTerminalSequences } from "@earendil-works/pi-tui";
 import type { PreflightHumanResult } from "./preflight-human";
 import type { BoardHumanResult } from "./board-human";
+import type { NativeInteractionDiagnostic } from "./human-ui";
 import type { DecisionRecord } from "./types";
 import type { HumanMaterial } from "./human-material-view";
 import type { AcceptanceProposal } from "./acceptance-proposal";
@@ -20,6 +21,25 @@ export interface HumanNotice {
   level: "info" | "warning" | "error";
 }
 
+function interactionNotice(diagnostic: NativeInteractionDiagnostic): HumanNotice {
+  const messages: Record<NativeInteractionDiagnostic["code"], string> = {
+    answered: "原生回答已取得，但未被当前控制接受；请检查原问题，未新增许可。",
+    unsupported: "当前环境不支持提交原生回应，请使用可信本机 Pi 交互终端。",
+    invalid_request: "本次问题或回答无效，未提交；请检查原请求。",
+    stale: "本次请求、材料或会话已变化，旧交互未提交；请重新检查当前状态。",
+    aborted: "宿主已取消本次交互，未提交回应；既有状态保持。",
+    busy: "当前已有原生确认在处理；本次没有打开另一个问题或提交回应。",
+    display_unavailable: "本次未能进入交互界面，未提交回应；请检查当前界面状态。",
+    no_response: "本次界面未返回有效答复，退出原因未知；不能推断你选择了稍后。",
+    user_deferred: "你选择了稍后，本次未提交回应；既有授权及执行状态未改变。",
+    ui_error: "本次界面打开或交互失败，未提交回应；不是已确认的用户取消，请检查后显式重开。",
+  };
+  return {
+    message: messages[diagnostic.code],
+    level: ["user_deferred", "no_response", "busy"].includes(diagnostic.code) ? "info" : "warning",
+  };
+}
+
 export function preflightNotice(result: Partial<PreflightHumanResult>): HumanNotice {
   if (result.startupPending === "startup")
     return {
@@ -33,6 +53,8 @@ export function preflightNotice(result: Partial<PreflightHumanResult>): HumanNot
       level: "warning",
     };
   if (!result.status) return { message: "正在等待方案确认结果。", level: "info" };
+  if (result.status === "deferred" && result.interaction)
+    return interactionNotice(result.interaction);
   const retained = result.state?.started ? "既有启动记录保留，未自动恢复或重启。" : "尚未启动。";
   const messages = {
     approved: `权限已确认。${retained}${result.state?.started ? "" : "\n下一步：/task-supervisor start（独立确认）"}`,
@@ -63,6 +85,8 @@ export function boardNotice(result: BoardHumanResult): HumanNotice {
         "回应已保存，但状态记录尚未同步；无需重复确认。\n下一步：/task-supervisor repair-decision（其他门槛仍有效）",
       level: "warning",
     };
+  if (result.status === "deferred" && result.interaction)
+    return interactionNotice(result.interaction);
   const messages = {
     approved: "本次范围已确认。未改变任务证据、预算或其他权限门槛。",
     answered: "答案已保存，未新增业务权限。其他门槛仍有效。",
@@ -466,7 +490,8 @@ export function readableScopeRevision(subject: ReturnType<typeof scopeRevisionRe
   return {
     title: "同一 Goal 范围修订 · 不启动或恢复",
     body: [
-      "本次仅修改既有权限对象内的约束和验收定义。原 Goal、首次 Start、任务身份、暂停及已用预算保留。提交后仍需显式 recover 与新证据；原成功不会自动适用。",
+      "本次仅修改既有固定权限对象内的精确业务资源条件和验收定义，不新增工作区或能力。原 Goal、首次 Start、任务身份、暂停、Supervisor硬限制及已用计数保留。提交后仍需显式 recover 与新证据；原成功不会自动适用。",
+      "历史计量与旧失败不是可修改额度：未知仍是未知，不能记零；新条件批准不证明过去满足原累计限制。请核对所有相关limits、步骤、验收要求、适用起止点及停止条件一致。文字额度不是OS配额；单次检查仍受profile技术上限约束。",
       `修订原因：${subject.reason}`,
       exactDetail("原方案全文", subject.previousPlan),
       exactDetail("拟生效方案全文（含每项权限的限制、风险、替代和重确认条件）", subject.plan),

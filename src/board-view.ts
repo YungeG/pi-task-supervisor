@@ -211,6 +211,8 @@ function confirmationText(view: UiBoardView): string {
   return [
     "原请求/历史回应，不代表当前授权",
     "只读材料；此处不批准、不启动、不恢复。退出后由用户显式发起既有命令。",
+    "完整自动控制尚缺宿主 H0；当前快捷入口只展示待办，不产生任何控制效果。",
+    `当前下一步：${view.summary.next.text}`,
     documentText(view, "current-board-request", "当前请求"),
     documentText(view, "latest-board-response", "最近已保存回应"),
     documentText(view, "preflight", "当前权限方案与原回应"),
@@ -326,12 +328,19 @@ class ReadOnlyBoard implements Component {
     private view: UiBoardView,
     private env: UiViewEnvironment,
     private done: () => void,
+    initialView: "list" | "confirmation" = "list",
   ) {
     const current =
       view.board.phases.find((phase) => phase.status === "active")?.phase ??
       this.tasks().find((task) => task.status !== "done" && task.status !== "abandoned")?.phase ??
       this.phaseIds()[0];
     this.collapsed = new Set(this.phaseIds().filter((phase) => phase !== current));
+    if (initialView === "confirmation") {
+      this.selected = "confirmation";
+      this.mode = "detail";
+      this.detailTitle = "确认与回应";
+      this.detail = confirmationText(view);
+    }
   }
 
   private phaseIds(): number[] {
@@ -720,6 +729,7 @@ export function createReadOnlyBoard(
   view: UiBoardView,
   env: UiViewEnvironment,
   done: () => void,
+  initialView: "list" | "confirmation" = "list",
 ): Component & { dispose(): void } {
-  return new ReadOnlyBoard(view, env, done);
+  return new ReadOnlyBoard(view, env, done, initialView);
 }

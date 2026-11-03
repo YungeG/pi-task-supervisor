@@ -2,7 +2,6 @@ import type { ExtensionContext } from "@earendil-works/pi-coding-agent";
 import type { RestoreJournalRead } from "./restore-journal";
 import { stripTerminalSequences } from "@earendil-works/pi-tui";
 import { currentRuntime, type TaskRuntime } from "./runtime";
-import type { PreflightState } from "./preflight";
 import { acceptanceLayersFromCache } from "./acceptance-contract";
 import { advisorBudgetAssessment, type AdvisorUsage } from "./advisor-calls";
 import {
@@ -13,9 +12,10 @@ import {
 export { SUPERVISOR_LIMITS } from "./supervisor-budget";
 import type { ManagementState } from "./management-policy";
 import { cachedScopeFlow } from "./scope-revision-journal";
+import { SCOPE_METADATA_HANDOFF } from "./scope-guidance";
 import { SCOPE_REVISION_FAULT } from "./scope-revision-facts";
 import { cachedProgressSummary } from "./progress-facts";
-import type { FinalReviewStateV1 } from "./final-review";
+import { finalValidationGuidance, type FinalReviewStateV1 } from "./final-review";
 import { goalControlIssue } from "./goal-scope";
 import { preflightTaskIssue } from "./preflight";
 import {
@@ -49,6 +49,7 @@ export interface FlowFacts {
   advisorUsage?: AdvisorUsage;
   budget?: Readonly<SupervisorBudgetAssessment>;
   finalReview?: Readonly<FinalReviewStateV1>;
+  finalValidation?: ReturnType<typeof finalValidationGuidance>;
   progress?: ReturnType<typeof cachedProgressSummary>;
   acceptance?: Readonly<AcceptanceLayers>;
   management?: Readonly<{
@@ -143,51 +144,15 @@ function currentApprovalState(runtime: TaskRuntime, sessionId: string) {
     return;
   return state;
 }
-function matchingDefinitionBlock(
-  state: PreflightState,
-  block: TaskRuntime["preflightDefinitionBlock"],
-) {
-  if (state.version !== 2 || !block) return;
-  return block.preflightId === state.preflightId &&
-    block.planDigest === state.planDigest &&
-    block.controlEntryId === state.definitionApproval?.controlEntryId
-    ? block
-    : undefined;
-}
 export function cachedApprovalAction(sessionId: string): ApprovalAction | undefined {
   const runtime = currentRuntime(),
     state = currentApprovalState(runtime, sessionId);
   if (!state) return;
-  const block = matchingDefinitionBlock(state, runtime.preflightDefinitionBlock);
-  const action = approvalAction(
+  return approvalAction(
     state,
     Boolean(acceptanceLayersFromCache(runtime).contractId),
-    block !== undefined,
+    runtime.preflightDefinitionBlock,
   );
-  if (!action || !block) return action;
-  if (block.kind === "capability")
-    return {
-      kind: "materials",
-      actor: "Main",
-      proposalId: state.proposal?.contractProposalId,
-      effect: `上次实际宿主检测没有合格证据通道；Main先核对工具模式与正式检查入口，不重批权限或Start。${block.reason}`,
-    };
-  if (block.kind === "materials")
-    return {
-      kind: "materials",
-      actor: "Main",
-      proposalId: state.proposal?.contractProposalId,
-      effect: `真实输入/能力材料暂不可用；Main 先核对并补齐，不请求 Start，也不因此重批业务权限。${block.reason}`,
-    };
-  if (block.kind === "scope")
-    return {
-      kind: "permissions",
-      actor: "user",
-      proposalId: state.proposal?.contractProposalId,
-      command: `/task-supervisor approve ${state.planId} ${state.approval?.permissionIds.join(",") || "none"}`,
-      effect: "工作区身份已改变；仅定义审核不能延展旧业务许可，需要明确的新范围确认，仍不启动。",
-    };
-  return action;
 }
 function cachedBudgetFacts(managedGoal: boolean): FlowFacts["budget"] {
   const state = currentRuntime().supervisor;
@@ -202,11 +167,12 @@ export function flowFacts(ctx: ExtensionContext, restoration?: RestoreJournalRea
     goalIssue: goalControlIssue(ctx),
     goal: currentGoalFacts(),
     finalReview: cachedFinalReview(ctx),
+    finalValidation: finalValidationGuidance(ctx),
     management: managementFacts(),
     budget: cachedBudgetFacts(managedGoal),
     progress: cachedProgressSummary(),
     acceptance: acceptanceLayersFromCache(runtime),
-    scope: cachedScopeFlow(),
+    scope: cachedScopeFlow(ctx),
     approval: cachedApprovalAction(ctx.sessionManager.getSessionId()),
     activityIssue: managedGoal
       ? executionActivityIssue(ctx.sessionManager.getSessionId())
@@ -298,7 +264,7 @@ function heldNextStep(
   if (board.workflowStatus === "completed" || board.tasks.length > SUPERVISOR_LIMITS.tasks)
     return "inspect and stop/re-plan; recover cannot reopen this board";
   if (state.status === "stopped") return "prepare a valid board and a new supervise <goal>";
-  return "inspect existing work, then /task-supervisor recover (preserves spent review/continuation budget)";
+  return `Inspect existing work. Only if the original scope/conditions remain valid and actual holds are resolved: /task-supervisor recover (preserves spent review/continuation budget). If scope needs amendment, keep paused/fault and submit metadata first. ${SCOPE_METADATA_HANDOFF}`;
 }
 
 function preflightControlBlocker(facts: FlowFacts): string | undefined {
@@ -366,8 +332,12 @@ function inactiveManagementNext(facts: FlowFacts): string | undefined {
     ? undefined
     : "/task-supervisor tasks-only (task board only), then recheck status";
 }
-function scopeNext(facts: FlowFacts): string | undefined {
-  return facts.scope ? (facts.activityIssue ?? facts.receiptIssue ?? facts.scope.next) : undefined;
+function scopeNext(board: Readonly<TaskBoardSnapshot>, facts: FlowFacts): string | undefined {
+  if (!facts.scope) return;
+  if (facts.activityIssue || facts.receiptIssue) return facts.activityIssue ?? facts.receiptIssue;
+  if (facts.scope.recoveryRequired && board.workflowStatus === "completed")
+    return "Historical scope on completed work cannot be adopted by recovery; inspect original metadata and let the user decide whether to end this Goal and plan independent work. No task or review replay is inferred";
+  return facts.scope.next;
 }
 function flowBlocker(
   board: Readonly<TaskBoardSnapshot>,
@@ -383,7 +353,7 @@ function flowBlocker(
   const inactive = inactiveManagementNext(facts);
   if (inactive) return inactive;
   if (state && state.sessionId !== facts.sessionId) return "inspect foreign supervisor identity";
-  const approval = scopeNext(facts) ?? approvalNext(board, state, facts);
+  const approval = scopeNext(board, facts) ?? approvalNext(board, state, facts);
   if (approval) return approval;
   const preflight = preflightControlBlocker(facts);
   if (preflight) return preflight;
@@ -499,6 +469,7 @@ function finalReviewNext(
   if (state.status === "paused" && state.holdCause === "user_pause")
     return "/task-supervisor resume (lift the review-only human pause; business and spent limits remain closed), then retry-review";
   if (!["active", "fault"].includes(state.status)) return undefined;
+  if (facts.finalValidation) return facts.finalValidation.next;
   if (review.status === "needs_validation")
     return "inspect applicable final-check registration via /task-supervisor retry-review; new validation only, no task/business replay";
   if (["retryable_error", "pending", "blocked"].includes(review.status))

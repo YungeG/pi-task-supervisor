@@ -1,4 +1,9 @@
 import { scopeExecutionIssue } from "./scope-revision-journal";
+import {
+  ScopeProposalError,
+  ScopeReviewabilityError,
+  SCOPE_METADATA_HANDOFF,
+} from "./scope-guidance";
 import type { RestoreJournalRead } from "./restore-journal";
 import type {
   ExtensionAPI,
@@ -119,9 +124,16 @@ import {
   type AcceptanceBoundFact,
 } from "./acceptance-journal";
 
-function canProposeGoalContract(scopeMetadata: boolean): boolean {
+function assertGoalContractProposal(owner: WorkOwnerKey, scopeMetadata: boolean): void {
+  if (!scopeMetadata && getBoardRef().finalAcceptanceTaskId) {
+    requireScopeQuiescence(owner);
+    throw Error(
+      `Ordinary contract proposals stop before first board compilation. ${definitionReviewRoute()}`,
+    );
+  }
   const status = currentRuntime().supervisor?.status;
-  return status === "active" || (scopeMetadata && ["paused", "fault"].includes(status ?? ""));
+  if (status === "active" || (scopeMetadata && ["paused", "fault"].includes(status ?? ""))) return;
+  throw Error("Contract proposals require the actual current planning or active Goal context");
 }
 export function proposeAcceptanceContract(
   pi: ExtensionAPI,
@@ -150,10 +162,11 @@ export function proposeAcceptanceContract(
     target = { kind: "preflight", preflightId: pref.preflightId };
     sourceRef = { entryId: node.id, digest: node.digest };
   } else {
-    if (!owner || owner.kind !== "goal" || !canProposeGoalContract(scopeMetadata))
+    if (!owner || owner.kind !== "goal")
       throw Error("Contract proposals require the actual current planning or active Goal context");
     target = { kind: "goal", owner };
     sourceRef = ownedGoalSource(journal, owner);
+    assertGoalContractProposal(owner, scopeMetadata);
   }
   const data: ContractProposalRecord = {
     version: 1,
@@ -398,10 +411,11 @@ function makeDefinition(
 function assertPayload(
   value: AcceptanceDefinitionFact | AcceptanceBoundFact,
   sessionId: string,
+  capacityLabel = "Acceptance contract record",
 ): void {
   if (!validAcceptanceFact(value, sessionId))
-    throw Error(
-      "Acceptance contract record exceeds its native 16KiB/schema capacity; no condition is dropped",
+    throw new ScopeReviewabilityError(
+      `${capacityLabel} exceeds its native 16KiB/schema capacity; no condition is dropped`,
     );
 }
 function preCompileOwner(
@@ -580,25 +594,33 @@ function prepareContractBinding(
     scopeDigest: capture.version.scopeDigest,
     ...(inventory ? { checkerScopes: inventory.checkerScopes } : {}),
   };
+  if (!scopeRevision) assertOrdinaryBindingCapacity(base, definitions, goal, journal.sessionId);
+  return { base, definitions, scope, capture, goal };
+}
+function assertOrdinaryBindingCapacity(
+  base: Omit<AcceptanceBoundFact, "definitions" | "authority" | "contractDigest">,
+  definitions: AcceptanceDefinitionFact[],
+  goal: string,
+  sessionId: string,
+): void {
+  for (const definition of definitions) assertPayload(definition, sessionId);
   const placeholders = definitions.map((item) => ({
     checkId: item.spec.checkId,
     ref: { entryId: "x".repeat(200), digest: "a".repeat(64) },
     definitionDigest: item.definitionDigest,
   }));
-  for (const definition of definitions) assertPayload(definition, journal.sessionId);
   assertPayload(
     {
       ...base,
       authority: {
         kind: "recognized-host",
-        originalGoalDigest: acceptanceGoalDigest(owner, sourceRef, goal),
+        originalGoalDigest: acceptanceGoalDigest(base.owner, base.sourceRef, goal),
       },
       definitions: placeholders,
       contractDigest: "a".repeat(64),
     },
-    journal.sessionId,
+    sessionId,
   );
-  return { base, definitions, scope, capture, goal };
 }
 function commitContractBinding(
   pi: ExtensionAPI,
@@ -651,7 +673,11 @@ function requireScopeQuiescence(owner: WorkOwnerKey): void {
     runtime.invocation?.attention ||
     pendingScopeCompletion(owner)
   )
-    throw Error("Scope metadata cannot replace an unknown capture or unsettled invocation/writer");
+    throw new ScopeProposalError(
+      "SCOPE_UNSETTLED",
+      "Scope metadata cannot replace an unknown capture or unsettled invocation/writer",
+      "Inspect original capture/invocation/writer facts; do not replay or recover merely to submit metadata",
+    );
 }
 function heldScopeOwner(ctx: ExtensionContext, mode: "review" | "proposal") {
   const runtime = currentRuntime(),
@@ -661,20 +687,42 @@ function heldScopeOwner(ctx: ExtensionContext, mode: "review" | "proposal") {
     runtime.journalFault ||
     !owner ||
     owner.kind !== "goal" ||
-    state?.sessionId !== ctx.sessionManager.getSessionId() ||
-    !["paused", "fault"].includes(state.status) ||
-    state.pending
+    state?.sessionId !== ctx.sessionManager.getSessionId()
   )
-    throw Error("Scope metadata requires the actual held Goal and a known journal source");
+    throw new ScopeProposalError(
+      "SCOPE_SOURCE_UNKNOWN",
+      "Scope metadata requires the actual held Goal and a known journal source",
+      "Inspect original owner/session/journal; no replacement owner or approval",
+    );
+  if (!["paused", "fault"].includes(state.status))
+    throw new ScopeProposalError(
+      "SCOPE_NOT_HELD",
+      "Scope metadata requires a paused/fault Goal; current Supervisor is not held",
+      `/task-supervisor pause; ${SCOPE_METADATA_HANDOFF}`,
+    );
+  if (state.pending)
+    throw new ScopeProposalError(
+      "SCOPE_PENDING",
+      "Scope metadata requires no pending Supervisor work",
+      "Inspect pending work and wait for actual settlement; no replay",
+    );
   if (
     (mode === "review" && !ctx.isIdle()) ||
     ctx.hasPendingMessages() ||
     executionActivityIssue(ctx.sessionManager.getSessionId())
   )
-    throw Error("Scope review requires closed host executions and actual idle");
+    throw new ScopeProposalError(
+      "SCOPE_UNSETTLED",
+      "Scope review requires closed host executions and actual idle",
+      "Wait for actual host/queue settlement; inspect original execution state",
+    );
   requireScopeQuiescence(owner);
   if (!getBoardRef().finalAcceptanceTaskId)
-    throw Error("Before compilation use the original definition review, not scope revision");
+    throw new ScopeProposalError(
+      "SCOPE_NOT_COMPILED",
+      "Before compilation use the original definition review, not scope revision",
+      "Inspect the existing review-contract proposal; preserve original permission and Start",
+    );
   return owner;
 }
 export function scopeRevisionContractContext(
@@ -703,9 +751,91 @@ export function scopeRevisionContractContext(
     goal = acceptanceGoalSource(journal, owner, sourceRef, journal.branch.length);
   return { owner, view, journal, bound, proposal, sourceRef, goal };
 }
-export function prepareScopeRevisionContract(ctx: ExtensionContext, proposal: AcceptanceProposal) {
-  const source = scopeRevisionContractContext(ctx);
-  return prepareContractBinding(ctx, source.owner, source.sourceRef, source.goal, proposal, true);
+export function scopeBindingRecordId(controlRef: AcceptanceReference, checkId?: string): string {
+  return checkId === undefined
+    ? `scope-bound-${journalDigest(controlRef)}`
+    : `scope-def-${journalDigest([controlRef, checkId])}`;
+}
+function scopeBindingShape(
+  prepared: ReturnType<typeof prepareContractBinding>,
+  controlRef: AcceptanceReference,
+) {
+  return {
+    ...prepared,
+    base: { ...prepared.base, recordId: scopeBindingRecordId(controlRef) },
+    definitions: prepared.definitions.map((definition) => ({
+      ...definition,
+      recordId: scopeBindingRecordId(controlRef, definition.spec.checkId),
+    })),
+  };
+}
+function scopeBindingAuthority(
+  prepared: ReturnType<typeof prepareContractBinding>,
+  controlRef: AcceptanceReference,
+) {
+  return {
+    kind: "scope-revision-reviewed" as const,
+    originalGoalDigest: acceptanceGoalDigest(
+      prepared.base.owner,
+      prepared.base.sourceRef,
+      prepared.goal,
+    ),
+    controlRef,
+  };
+}
+function assertScopeBindingCapacity(
+  prepared: ReturnType<typeof prepareContractBinding>,
+  controlRef: AcceptanceReference,
+  sessionId: string,
+  existing?: AcceptanceJournalView,
+): void {
+  const shaped = scopeBindingShape(prepared, controlRef);
+  for (const definition of shaped.definitions)
+    assertPayload(definition, sessionId, "Scope record capacity upper bound");
+  assertPayload(
+    {
+      ...shaped.base,
+      authority: scopeBindingAuthority(shaped, controlRef),
+      definitions: shaped.definitions.map((definition) => {
+        const known = existing?.definitions.find((d) => d.data.recordId === definition.recordId);
+        return {
+          checkId: definition.spec.checkId,
+          ref: known
+            ? { entryId: known.entryId, digest: known.digest }
+            : { entryId: "x".repeat(200), digest: "a".repeat(64) },
+          definitionDigest: definition.definitionDigest,
+        };
+      }),
+      contractDigest: "a".repeat(64),
+    },
+    sessionId,
+    "Scope record capacity upper bound",
+  );
+}
+export function prepareScopeRevisionContract(
+  ctx: ExtensionContext,
+  proposal: AcceptanceProposal,
+  mode: "proposal" | "review" = "review",
+  originalControl?: AcceptanceReference,
+) {
+  const source = scopeRevisionContractContext(ctx, mode);
+  const validated = validateAcceptanceProposal(proposal);
+  const prepared = prepareContractBinding(
+    ctx,
+    source.owner,
+    source.sourceRef,
+    source.goal,
+    validated,
+    true,
+  );
+  // Future native control/definition entry refs use their schema maximum length only for sizing.
+  assertScopeBindingCapacity(
+    prepared,
+    originalControl ?? { entryId: "x".repeat(200), digest: "a".repeat(64) },
+    source.journal.sessionId,
+    originalControl ? source.view.acceptance : undefined,
+  );
+  return prepared;
 }
 export function commitScopeRevisionContract(
   pi: ExtensionAPI,
@@ -713,15 +843,14 @@ export function commitScopeRevisionContract(
   prepared: ReturnType<typeof prepareScopeRevisionContract>,
   controlRef: AcceptanceReference,
 ): AcceptanceReference {
-  return commitContractBinding(pi, ctx, prepared, {
-    kind: "scope-revision-reviewed",
-    originalGoalDigest: acceptanceGoalDigest(
-      prepared.base.owner,
-      prepared.base.sourceRef,
-      prepared.goal,
-    ),
+  const shaped = scopeBindingShape(prepared, controlRef);
+  assertScopeBindingCapacity(
+    shaped,
     controlRef,
-  });
+    ctx.sessionManager.getSessionId(),
+    readControlJournal(ctx).acceptance,
+  );
+  return commitContractBinding(pi, ctx, shaped, scopeBindingAuthority(shaped, controlRef));
 }
 function appendOrReuseDefinition(
   pi: ExtensionAPI,
@@ -929,6 +1058,15 @@ export async function reviewAcceptanceContract(
 ) {
   if (!isTrustedLocalTui(ctx)) return { status: "unsupported" as const };
   await ctx.waitForIdle();
+  return reviewAcceptanceContractNow(pi, ctx, proposalId);
+}
+
+export async function reviewAcceptanceContractNow(
+  pi: ExtensionAPI,
+  ctx: ExtensionContext,
+  proposalId: string,
+) {
+  if (!isTrustedLocalTui(ctx)) return { status: "unsupported" as const };
   if (
     !ctx.isIdle() ||
     ctx.hasPendingMessages() ||
@@ -1587,6 +1725,14 @@ function publishManualResponse(
   liveCheckFrames().set(requestId, carrier);
   return { status: "confirmed" as const, checkId, value: admitted.value };
 }
+function definitionReviewRoute(): string {
+  const board = getBoardRef();
+  if (board.workflowStatus === "completed")
+    return "Completed work stays closed: inspect existing /task-supervisor retry-review or explicitly end this Goal and plan independent work; no new scope adoption.";
+  if (board.finalAcceptanceTaskId)
+    return "For this compiled Goal, preserve original sources; user pauses if active, then Main uses propose_scope_revision and user review-scope. Source/unknown-execution holds still apply; no repeated preflight or Start.";
+  return "Before compilation, propose_contract and native /task-supervisor review-contract apply; existing permissions and Start stay separate.";
+}
 function selectRegisteredCheck(ctx: ExtensionContext, checkId: string) {
   const scope = managedAcceptanceIssue(ctx);
   if (scope) throw Error(scope);
@@ -1619,14 +1765,16 @@ function beginRegisteredCheck(
 ) {
   const { owner, view, bound, selected, definition } = selection;
   if (resolve(ctx.cwd) !== bound.data.workspace.root)
-    throw Error("Registered check host workspace changed; native review is required");
+    throw Error(
+      "Registered check host workspace changed; restore the original workspace or explicitly plan independent work. Same-Goal scope review cannot replace workspace identity",
+    );
   const scope = boundAcceptanceScope(bound.data),
     environment = bound.data.header.environment.values,
     capture =
       (assertCheckerPermissions(ctx, [definition.spec]), captureCheckVersion(scope, environment));
   if (capture.status !== "known" || !definitionCurrent(bound.data, [definition], capture.version))
     throw Error(
-      "Registered check inputs/definition are changed or unknown; native review is required",
+      `Registered check inputs/definition are changed or unknown; inspect original material, then native review is required. ${definitionReviewRoute()}`,
     );
   if (view.runs.some((run) => !run.observed?.data.closed))
     throw Error("A declared check is already active/unknown; never replay it");

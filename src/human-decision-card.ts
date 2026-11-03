@@ -73,6 +73,7 @@ export class DecisionCard implements Component, Focusable {
     private readonly done: (draft: DecisionDraft | undefined) => void,
     initial?: DecisionDraft,
     recheck = false,
+    private readonly onDefer?: () => void,
   ) {
     this.question = {
       ...owner,
@@ -223,6 +224,7 @@ export class DecisionCard implements Component, Focusable {
     } else {
       const index = Number(this.select.getSelectedItem()?.value ?? "0");
       if (index === 0) {
+        this.onDefer?.();
         this.finish(undefined);
         return;
       }

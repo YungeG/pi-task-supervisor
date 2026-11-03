@@ -20,10 +20,12 @@ import {
   inspectRestorableSession,
 } from "./human-control";
 import {
-  requestNativeAnswer,
+  requestNativeInteraction,
   isTrustedLocalTui,
   type NativeAnswer,
   type NativeQuestion,
+  type NativeInteractionDiagnostic,
+  type NativeInteractionResult,
 } from "./human-ui";
 import {
   inspectSessionJournal,
@@ -43,6 +45,7 @@ export interface BoardHumanResult {
   status: "approved" | "answered" | "rejected" | "deferred" | "legacy" | "unsupported";
   confirmed?: SavedBoardAnswer;
   projectionPending?: boolean;
+  interaction?: NativeInteractionDiagnostic;
 }
 export function decisionScope(decision: DecisionRecord): unknown {
   return goalLogicalScope({
@@ -133,7 +136,7 @@ async function presentDecision(
   question: NativeQuestion,
   base: TaskBoardSnapshot,
   signal?: AbortSignal,
-): Promise<NativeAnswer | undefined> {
+): Promise<NativeInteractionResult> {
   const runtime = currentRuntime();
   const epoch = runtime.humanEpoch;
   const current = () =>
@@ -146,7 +149,7 @@ async function presentDecision(
   runtime.humanAbort = controller;
   const combined = signal ? AbortSignal.any([signal, controller.signal]) : controller.signal;
   try {
-    return await requestNativeAnswer(ctx, question, current, combined);
+    return await requestNativeInteraction(ctx, question, current, combined);
   } finally {
     if (runtime.humanAbort === controller) runtime.humanAbort = undefined;
   }
@@ -175,8 +178,9 @@ export async function answerBoardDecision(
   if (decision.response === "rejected") return { status: "rejected" };
   if (!isTrustedLocalTui(ctx)) return { status: "unsupported" };
   const frame = captureReadbackFrame(ctx, "board", decision.id, decisionScope(decision), base);
-  const answer = await presentDecision(ctx, questionFor(decision, frame), base, signal);
-  if (!answer) return { status: "deferred" };
+  const interaction = await presentDecision(ctx, questionFor(decision, frame), base, signal);
+  const answer = interaction.answer;
+  if (!answer) return { status: "deferred", interaction: interaction.diagnostic };
   const control = {
     type: "resolve_decision",
     id: decision.id,

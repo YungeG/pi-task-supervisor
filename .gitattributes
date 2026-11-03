@@ -1,0 +1,4 @@
+# Preserve verbatim source patches and reviewed evidence, including diff context.
+docs/host-patches/*.patch -whitespace
+# Markdown's two-space hard line breaks are intentional in archived reviews.
+docs/*review*.md whitespace=-blank-at-eol

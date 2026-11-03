@@ -117,6 +117,7 @@ export function createMockAPI(): {
   on: ReturnType<typeof vi.fn>;
   registerMessageRenderer: ReturnType<typeof vi.fn>;
   registerCommand: ReturnType<typeof vi.fn>;
+  registerShortcut: ReturnType<typeof vi.fn>;
   getActiveTools: ReturnType<typeof vi.fn>;
   setActiveTools: ReturnType<typeof vi.fn>;
   appendEntry: ReturnType<typeof vi.fn>;
@@ -127,6 +128,7 @@ export function createMockAPI(): {
   const on = vi.fn();
   const registerMessageRenderer = vi.fn();
   const registerCommand = vi.fn();
+  const registerShortcut = vi.fn();
   const getActiveTools = vi.fn(() => ["read", "write_tasks"]);
   const setActiveTools = vi.fn();
   const appendEntry = vi.fn();
@@ -139,6 +141,7 @@ export function createMockAPI(): {
       on,
       registerMessageRenderer,
       registerCommand,
+      registerShortcut,
       getActiveTools,
       setActiveTools,
       appendEntry,
@@ -165,6 +168,7 @@ export function createMockAPI(): {
     on,
     registerMessageRenderer,
     registerCommand,
+    registerShortcut,
     getActiveTools,
     setActiveTools,
     appendEntry,

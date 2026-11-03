@@ -85,6 +85,26 @@ it.each([
   if (kind === "node-tests") delete check.runtime;
   expect(() => validateAcceptanceProposal(input)).toThrow();
 });
+it.each([
+  ["node", 30000, true],
+  ["node", 30001, false],
+  ["python", 120000, true],
+  ["python", 120001, false],
+] as const)(
+  "keeps the %s timeout profile boundary at %s independently of business quota text",
+  (runtime, timeout, valid) => {
+    const input = proposal(),
+      check = input.checks[0]!;
+    if (check.kind !== "automatic") throw Error("Expected automatic fixture");
+    check.timeoutMs = timeout;
+    if (runtime === "node") {
+      delete check.runtime;
+      delete check.tests;
+    }
+    if (valid) expect(validateAcceptanceProposal(input)).toEqual(input);
+    else expect(() => validateAcceptanceProposal(input)).toThrow();
+  },
+);
 it("sorts actual role declarations and never subtracts an external checker's same-named product input", () => {
   const base = proposal().checks[0];
   if (!base || base.kind !== "automatic") throw Error("No fixture check");

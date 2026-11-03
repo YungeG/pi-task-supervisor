@@ -1,4 +1,5 @@
 import { Type } from "typebox";
+import { ScopeProposalError } from "./scope-guidance";
 import { Check } from "typebox/value";
 import { isDeepStrictEqual } from "node:util";
 import {
@@ -100,13 +101,18 @@ export function assertScopePlanObjects(
   original: PreflightProposal,
   replacement: PreflightProposal,
 ): void {
-  if (
-    !isDeepStrictEqual(permissionObjects(original), permissionObjects(replacement)) ||
-    !isDeepStrictEqual(original.prohibitions, replacement.prohibitions) ||
-    !isDeepStrictEqual(original.preparation, replacement.preparation)
-  )
-    throw Error(
-      "Scope revision cannot add/change permission objects, prohibitions or preparation capabilities",
+  const changed = !isDeepStrictEqual(permissionObjects(original), permissionObjects(replacement))
+    ? "permission objects' fixed identity fields (id/action/target/environment/required)"
+    : !isDeepStrictEqual(original.prohibitions, replacement.prohibitions)
+      ? "prohibitions"
+      : !isDeepStrictEqual(original.preparation, replacement.preparation)
+        ? "preparation capabilities"
+        : undefined;
+  if (changed)
+    throw new ScopeProposalError(
+      "SCOPE_PLAN_OBJECTS",
+      `Scope revision cannot add/change ${changed}`,
+      "Main: preserve original fixed identity fields, prohibitions and preparation. Exact business limits/acceptance conditions may be proposed with full native review; Supervisor hard counters and historical unknown usage stay intact. Do not silently remove limits or request old permissions again",
     );
 }
 function assertGoalScope(

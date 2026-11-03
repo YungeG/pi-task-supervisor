@@ -11,8 +11,10 @@ import { BOUNDARY, deferred } from "./helpers/lifecycle";
 import { createAdvanceTasksTool } from "../tools";
 import { currentRuntime } from "../runtime";
 import { getBoard, getBoardRef } from "../state";
+import { flowFacts, nextFlowStep } from "../flow";
+import { finalValidationGuidance, finalValidationMainContext } from "../final-review";
 import { advisorUsageFor } from "../advisor-calls";
-import { saveSupervisor } from "../supervisor";
+import { saveSupervisor, holdSupervisor } from "../supervisor";
 
 it("does not create a concurrent review attempt when native retry-review is requested during a live attempt", async () => {
   const f = await completedFixture(),
@@ -536,6 +538,94 @@ it("requires new validation when actual workspace inputs change during final rev
     f.close();
   }
 });
+it("keeps completed-review pause handoffs separate from scope preparation and business resume", async () => {
+  const f = await completedFixture();
+  try {
+    holdSupervisor(f.api, f.ctx, "fault", "Owned final-review hold", "review_failed");
+    const board = getBoard();
+    f.sendMessage.mockClear();
+    await f.command("pause Review only");
+    const notice = vi.mocked(f.ctx.ui.notify).mock.calls.at(-1)?.[0];
+    expect(notice).toContain("Main未排队");
+    expect(notice).not.toContain("propose_scope_revision");
+    await f.command("resume");
+    expect(currentRuntime().supervisor?.status).toBe("fault");
+    expect(getBoard()).toEqual(board);
+    expect(f.sendMessage.mock.calls.some(([, options]) => options?.triggerTurn)).toBe(false);
+  } finally {
+    f.close();
+  }
+});
+it("registers final validation from its actual Supervisor checkpoint even when a persisted notice follows it", async () => {
+  const f = await completedFixture();
+  try {
+    writeFileSync(join(f.dir, "review-input.txt"), "Owned changed validation input\n");
+    f.sendMessage.mockImplementation(() => {
+      f.api.appendEntry("owned-persisted-notice", {
+        display: true,
+        text: "Notice is not a Supervisor checkpoint",
+      });
+    });
+    await f.command("retry-review");
+    expect(currentRuntime().controlJournal?.finalValidationRegistrations).toHaveLength(1);
+    expect(finalValidationGuidance(f.ctx)?.stage).toBe("registered");
+  } finally {
+    f.close();
+  }
+});
+it("advances the final-validation handoff after registration without queuing Main or repeating metadata", async () => {
+  const f = await completedFixture();
+  try {
+    writeFileSync(join(f.dir, "review-input.txt"), "Owned new version requires validation\n");
+    f.sendMessage.mockClear();
+    await f.command("retry-review");
+    const count = currentRuntime().controlJournal?.finalValidationRegistrations?.length;
+    const next = nextFlowStep(getBoardRef(), currentRuntime().supervisor, flowFacts(f.ctx));
+    expect(count).toBe(1);
+    expect(next).toContain("Main");
+    expect(next).not.toContain("registration via /task-supervisor retry-review");
+    const context = await f.fire("before_agent_start", {
+      prompt: "Only perform the registered final validation",
+    });
+    expect(JSON.stringify(context)).toContain("synthetic repair validation");
+    expect(JSON.stringify(context)).not.toContain("propose_scope_revision");
+    const records = f.entries().length;
+    await f.command("retry-review");
+    expect(f.entries()).toHaveLength(records);
+    expect(currentRuntime().controlJournal?.finalValidationRegistrations).toHaveLength(count!);
+    expect(nextFlowStep(getBoardRef(), currentRuntime().supervisor, flowFacts(f.ctx))).toContain(
+      "Main",
+    );
+    expect(f.sendMessage.mock.calls.some(([, options]) => options?.triggerTurn)).toBe(false);
+  } finally {
+    f.close();
+  }
+});
+it.each(["cwd", "epoch", "owner", "source"])(
+  "does not turn a recorded registration with changed %s into Main execution permission",
+  async (changed) => {
+    const f = await completedFixture();
+    try {
+      writeFileSync(join(f.dir, "review-input.txt"), "Owned changed input\n");
+      await f.command("retry-review");
+      expect(finalValidationGuidance(f.ctx)?.stage).toBe("registered");
+      if (changed === "cwd") f.ctx.cwd = join(f.dir, "foreign");
+      if (changed === "epoch") currentRuntime().supervisor!.epoch++;
+      if (changed === "owner")
+        vi.mocked(f.ctx.sessionManager.getSessionId).mockReturnValue("foreign");
+      if (changed === "source")
+        vi.spyOn(f.ctx.sessionManager, "getSessionFile").mockReturnValue(
+          join(f.dir, "missing-source"),
+        );
+      const count = f.entries().length;
+      const context = finalValidationMainContext(f.ctx);
+      expect(context).not.toContain("Original registered invocation:");
+      expect(f.entries()).toHaveLength(count);
+    } finally {
+      f.close();
+    }
+  },
+);
 it("registers only the existing final check and accepts new validation without replaying completed tasks or rewriting bindings", async () => {
   const f = await completedFixture();
   let calls = 0;
@@ -598,6 +688,8 @@ it("registers only the existing final check and accepts new validation without r
       isError: false,
     });
     expect(currentRuntime().supervisor?.epoch).toBeGreaterThan(epoch);
+    expect(finalValidationGuidance(f.ctx)?.stage).toBe("observed");
+    expect(finalValidationMainContext(f.ctx)).toContain("retry-review");
     await f.command("retry-review");
     expect(calls).toBe(1);
     expect(currentRuntime().supervisor?.status).toBe("completed");

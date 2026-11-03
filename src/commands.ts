@@ -5,41 +5,30 @@ import {
   repairPreflightProjection,
 } from "./preflight-human";
 import type { ExtensionAPI, ExtensionCommandContext } from "@earendil-works/pi-coding-agent";
-import { answerBoardDecision, boardHumanContext, repairBoardProjection } from "./board-human";
-import { formatContinuePrompt, formatSummaryLine } from "./formatting";
-import {
-  flowFacts,
-  formatFlowStatus,
-  ordinaryResumeIssue,
-  resumeControlIssue,
-  SUPERVISOR_LIMITS,
-} from "./flow";
+import { answerBoardDecision, repairBoardProjection } from "./board-human";
+import { formatSummaryLine } from "./formatting";
+import { flowFacts, nextFlowStep, formatFlowStatus } from "./flow";
 import { currentRuntime } from "./runtime";
+import {
+  SCOPE_METADATA_HANDOFF,
+  ScopeProposalError,
+  ScopeReviewabilityError,
+} from "./scope-guidance";
 import { repairCompletionMetadata } from "./completion-intents";
 import {
   verifyManualCheck,
   reviewAcceptanceContract,
-  adoptPreflightAcceptance,
-  preflightAssociationIssue,
   repairPreflightAcceptance,
 } from "./acceptance-runtime";
 import {
   requestModeChange,
   captureManagementSnapshot,
-  decideAdmission,
   enableTasksMode,
-  adoptSupervisedMode,
   enterPlanningMode,
   assertPlanningAdmission,
 } from "./management-policy";
-import { retryFinalReview, pauseFaultedFinalReview, resumePausedFinalReview } from "./final-review";
-import {
-  advisorUsageForCurrent,
-  advisorUsageFor,
-  advisorBudgetAssessment,
-  type AdvisorUsage,
-} from "./advisor-calls";
-import { loadConfig } from "./config";
+import { retryFinalReview, pauseFaultedFinalReview } from "./final-review";
+import { advisorUsageForCurrent, advisorUsageFor, type AdvisorUsage } from "./advisor-calls";
 import {
   beginPreflight,
   inspectPreflightStart,
@@ -51,69 +40,26 @@ import {
 } from "./preflight";
 import { showTaskList } from "./board-ui";
 import { showGoalHistory } from "./goal-history-ui";
-import {
-  holdSupervisor,
-  recoverSupervisor,
-  saveSupervisor,
-  supervisorNotice,
-  supervisorState,
-} from "./supervisor";
+import { holdSupervisor, recoverSupervisor, supervisorNotice, supervisorState } from "./supervisor";
 import { enableSessionScope, isSessionScopeEnabled, updateActiveTools } from "./scope";
 import { getBoardRef, persistEntries, setBoard, updateUI, refreshUI } from "./state";
 import { preflightNotice, boardNotice } from "./human-presentation";
-import { cloneBoard, hasActionableTasks } from "./validation";
+import { cloneBoard } from "./validation";
 import { routeGoalCommand, goalStatusText, parseSuperviseArgs } from "./goal-commands";
-import { goalExecutionIssue } from "./goal-scope";
+import {
+  continuationCandidate,
+  resumeBoardControl,
+  resumeControlFailure,
+  adoptStartedGoal,
+} from "./session-controls";
 
 function notifyError(ctx: ExtensionCommandContext, message: string): void {
   if (ctx.hasUI) ctx.ui.notify(message, "error");
 }
 
-function continuationContent(ctx: ExtensionCommandContext): string {
-  const state = supervisorState();
-  const board = getBoardRef();
-  return `${boardHumanContext(ctx) ?? ""}\n${preflightContext(ctx) ?? ""}\n${state?.status === "active" ? `User-recorded goal: ${state.goal}\nContinue authorized work on the task board, or prepare a complete phased plan with final acceptance. Preserve all approvals and gates. ${formatContinuePrompt(board)}` : formatContinuePrompt(board)}`;
-}
-
-function continuationHeld(): boolean {
-  const state = supervisorState();
-  if (!state || state.status === "stopped") return false;
-  return (
-    state.status !== "active" ||
-    state.pending ||
-    Boolean(state.externalWait) ||
-    advisorBudgetAssessment(state).status !== "available" ||
-    state.stagnant >= SUPERVISOR_LIMITS.stagnant
-  );
-}
-
 function continueNow(pi: ExtensionAPI, ctx: ExtensionCommandContext): void {
-  if (decideAdmission(captureManagementSnapshot(ctx), { kind: "boundary" }).verdict === "deny")
-    return;
-  if (goalExecutionIssue(ctx) || preflightAssociationIssue(ctx)) return;
-  const board = getBoardRef();
-  const state = supervisorState();
-  const facts = flowFacts(ctx);
-  if (
-    !facts.idle ||
-    facts.pending ||
-    facts.journalFault ||
-    facts.preflightIssue ||
-    facts.receiptIssue
-  )
-    return;
-  if (continuationHeld() || board.tasks.some((task) => task.executionRef)) return;
-  if (["paused", "waiting_for_decision"].includes(board.workflowStatus)) return;
-  if (state?.status !== "active" && !hasActionableTasks(board)) return;
-  pi.sendMessage(
-    {
-      customType: "continuous-tasks:continue",
-      content: continuationContent(ctx),
-      display: false,
-      details: { generation: board.generation },
-    },
-    { triggerTurn: true, deliverAs: "followUp" },
-  );
+  const candidate = continuationCandidate(ctx);
+  if (candidate) pi.sendMessage(candidate.message, { triggerTurn: true, deliverAs: "followUp" });
 }
 
 function pause(pi: ExtensionAPI, ctx: ExtensionCommandContext, reason: string): void {
@@ -139,65 +85,13 @@ function pause(pi: ExtensionAPI, ctx: ExtensionCommandContext, reason: string): 
 }
 
 function resume(pi: ExtensionAPI, ctx: ExtensionCommandContext): void {
-  if (resumePausedFinalReview(pi, ctx)) {
-    updateUI(ctx, getBoardRef());
-    return;
-  }
   const board = getBoardRef();
-  if (board.workflowStatus !== "paused") {
-    notifyError(ctx, "Pi Task Supervisor is not paused");
-    return;
-  }
-  const facts = flowFacts(ctx);
   const state = supervisorState();
-  const controlIssue = resumeControlIssue(board, state, facts);
-  if (controlIssue) {
-    notifyError(ctx, controlIssue);
-    return;
-  }
-  const next =
-    state && !ordinaryResumeIssue(board, state, facts)
-      ? {
-          ...structuredClone(state),
-          status: "active" as const,
-          reason: undefined,
-          holdCause: undefined,
-          pending: false,
-        }
-      : undefined;
-  const updated = cloneBoard(board);
-  updated.workflowStatus = "active";
-  updated.pauseReason = undefined;
-  updated.generation++;
-  updated.stagnantSettles = 0;
-  currentRuntime().cancel();
+  if (resumeBoardControl(pi, ctx) !== "resumed") return;
   try {
-    // Write Supervisor first: a partial durable restore is interrupted/faulted, never replayed.
-    if (next) saveSupervisor(pi, next);
-    persistEntries(pi, { type: "resume_user", supervisorResumed: Boolean(next) }, updated);
-    if (next) currentRuntime().supervisor = next;
-    setBoard(updated);
-    updateUI(ctx, updated);
-    if (state && !next) {
-      ctx.ui.notify(
-        `Task board resumed only; Supervisor remains ${state.status}. ${
-          state.status === "stopped" || board.tasks.length > SUPERVISOR_LIMITS.tasks
-            ? "Stop/re-plan a valid goal; no automatic continuation."
-            : "Inspect existing work, then /task-supervisor recover (preserves spent review/continuation budget)."
-        }`,
-        "info",
-      );
-      return;
-    }
     continueNow(pi, ctx);
   } catch {
-    currentRuntime().supervisor = state;
-    setBoard(cloneBoard(board));
-    const message =
-      "Resume persistence/dispatch failed; inspect journal and pending work before recovery";
-    currentRuntime().journalFault = message;
-    updateUI(ctx, board);
-    notifyError(ctx, message);
+    resumeControlFailure(ctx, board, state);
   }
 }
 
@@ -327,10 +221,7 @@ async function startGoal(
   ctx.ui.notify(withTaskDetails(ctx, notice.message), notice.level);
   if (outcome.status === "started") {
     try {
-      adoptSupervisedMode(pi, ctx);
-      const config = await loadConfig();
-      if (config.receiptCache) currentRuntime().receiptStore?.configure(config.receiptCache);
-      adoptPreflightAcceptance(pi, ctx);
+      await adoptStartedGoal(pi, ctx);
       continueNow(pi, ctx);
     } catch (error) {
       currentRuntime().cancel();
@@ -559,7 +450,13 @@ async function scopeRevisionCommand(
   refreshUI(ctx);
   if (ctx.hasUI)
     ctx.ui.notify(
-      `范围记录：${result.status}；仍保留原权限/Start/暂停/用量，不代表恢复或验收。`,
+      [
+        `范围记录：${result.status}；仍保留原权限/Start/暂停/用量，不代表恢复或验收。`,
+        "remaining" in result ? result.remaining : undefined,
+        "next" in result ? result.next : undefined,
+      ]
+        .filter(Boolean)
+        .join("\n"),
       "info",
     );
   return true;
@@ -592,6 +489,29 @@ async function ownerControlCommand(
     );
   return routeGoalCommand(pi, ctx, action, text);
 }
+function pauseHandoff(ctx: ExtensionCommandContext): string {
+  const board = getBoardRef(),
+    facts = flowFacts(ctx);
+  if (
+    board.workflowStatus === "completed" ||
+    !board.finalAcceptanceTaskId ||
+    !supervisorState() ||
+    facts.scope ||
+    facts.preflightIssue
+  )
+    return `Main未排队；pause不会触发执行。Next: ${nextFlowStep(board, supervisorState(), facts)}`;
+  return SCOPE_METADATA_HANDOFF;
+}
+function commandFailure(ctx: ExtensionCommandContext, error: unknown): void {
+  if (error instanceof ScopeReviewabilityError) refreshUI(ctx);
+  const message =
+    error instanceof ScopeProposalError
+      ? `${error.message}\n${error.next}\n${error.guidance.remaining}`
+      : error instanceof Error
+        ? error.message
+        : "Pi Task Supervisor command failed";
+  notifyError(ctx, message);
+}
 export function registerCommands(pi: ExtensionAPI): void {
   const command = {
     description:
@@ -622,6 +542,7 @@ export function registerCommands(pi: ExtensionAPI): void {
         }
         if (action === "pause") {
           pause(pi, ctx, [id, ...answerParts].filter(Boolean).join(" "));
+          ctx.ui.notify(pauseHandoff(ctx), "info");
           return;
         }
         if (action === "resume") {
@@ -637,10 +558,7 @@ export function registerCommands(pi: ExtensionAPI): void {
           "Usage: /task-supervisor supervise <goal> | supervise --replan [same unstarted goal] (-- protects literal goal text) | tasks-only | disable | approve [planId [all|none|IDs]] | start [planId] | decide [id] (native) | repair-preflight | repair-decision | revoke <planId> | status | tasks | history [goalKey|page:offset] (read-only) | pause [reason] | resume | recover | repair-completion <intentId> | verify-check <checkId> | review-contract <proposalId> | review-scope <proposalId> | repair-scope <proposalId> | revoke-scope <revisionId> | retry-review [attemptId] | stop",
         );
       } catch (error) {
-        notifyError(
-          ctx,
-          error instanceof Error ? error.message : "Pi Task Supervisor command failed",
-        );
+        commandFailure(ctx, error);
       }
     },
   };

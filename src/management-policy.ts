@@ -357,7 +357,7 @@ function volatileUnknownHostCapture(ctx: ExtensionContext): boolean {
         entry.data.kind === "close_unknown",
     );
 }
-function writerAttention(ctx: ExtensionContext): SessionModeChangedV1["attention"] {
+export function writerAttention(ctx: ExtensionContext): SessionModeChangedV1["attention"] {
   const runtime = currentRuntime(),
     issues: SessionModeChangedV1["attention"] = [];
   if (runtime.journalFault) issues.push(attention("source", runtime.journalFault));

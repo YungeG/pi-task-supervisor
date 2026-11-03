@@ -20,16 +20,29 @@ export function approvalNativeResponses(
   branch: () => any[],
   legacyProposal: any,
 ) {
+  if (process.env.GOAL_NATIVE_COLD_CHECK === "1") return [fauxAssistantMessage("GOAL_NATIVE_COLD_CHECK_DONE: readonly inspection only, no new controls")];
+  if (scenario === "final-guidance") return finalValidationNativeResponses();
   if (
-    !["approval-existing", "approval-preparation", "approval-scope", "permissions"].includes(
-      scenario ?? "",
-    )
+    ![
+      "approval-existing",
+      "approval-preparation",
+      "approval-scope",
+      "approval-resource",
+      "approval-guidance",
+      "permissions",
+    ].includes(scenario ?? "")
   )
     return;
   const root = process.env.GOAL_NATIVE_OUT;
   if (!root) throw Error("No isolated CLI output workspace");
   const preparation = scenario === "approval-preparation",
-    permissionOnly = scenario === "permissions";
+    permissionOnly = scenario === "permissions",
+    resource = scenario === "approval-resource";
+  const capacityFiles = resource
+    ? Array.from({ length: 31 }, (_, i) => `owned_${"界".repeat(70)}_${i}.py`)
+    : [];
+  for (const file of capacityFiles)
+    writeFileSync(join(root, file), "# Owned unreadable-capacity fixture; never executed\n");
   const checkerRoot = preparation ? join(root, "owned-checker") : root;
   mkdirSync(checkerRoot, { recursive: true });
   writeFileSync(join(root, "input.txt"), "owned input\n");
@@ -91,7 +104,9 @@ export function approvalNativeResponses(
     action,
     environment: "Owned offline temporary fixture",
     required: true,
-    limits: "Only declared fixture files, fixed Python and owned private /tmp scratch",
+    limits: resource
+      ? "Synthetic business allowance120 seconds/64 MiB; fixed Python profile remains separately bounded"
+      : "Only declared fixture files, fixed Python and owned private /tmp scratch",
     risks: "Synthetic keys are not real human permission or product acceptance",
     fallback: "Stop without execution",
     reconfirm: "Any changed scope, root or execution profile",
@@ -178,6 +193,8 @@ export function approvalNativeResponses(
       "GOAL_NATIVE_APPROVED_ONLY: definition/permission confirmation is not Start",
     ),
   ];
+  if (process.env.GOAL_NATIVE_CANCEL_AFTER_START === "1")
+    return [...planning, fauxAssistantMessage("GOAL_NATIVE_CANCEL_NO_BUSINESS: retained original Start, no business effect")];
   if (permissionOnly)
     return [
       ...planning,
@@ -204,7 +221,61 @@ export function approvalNativeResponses(
     "native-draft",
   );
   const compile = tool("compile_tasks", { finalAcceptanceTaskId: "t-1.1" }, "native-compile");
-  const scope = scenario === "approval-scope";
+  const guidance = scenario === "approval-guidance";
+  const scope = scenario === "approval-scope" || guidance || resource;
+  const scopeProposal = (id: string) =>
+    tool(
+      "propose_scope_revision",
+      {
+        plan: {
+          ...proposal,
+          ...(resource
+            ? {
+                permissions: proposal.permissions.map((p: any) => ({
+                  ...p,
+                  limits:
+                    "Future owned segment after explicit recover until finite check closes:600 seconds/256 MiB; count actual recorded process use and stop on exceedance. Missing historical measurements remain unknown; this text is not an OS quota",
+                })),
+              }
+            : {}),
+          acceptance: [
+            resource
+              ? "Future owned segment only:600 seconds/256 MiB, actual finite check timeout5000ms within unchanged Python cap; retain all historical obligations and stop on exceedance"
+              : "Exactly declared output; precise synthetic timestamp exception A=1793178673175340907, B=1793178673175340907; every other original condition remains",
+          ],
+        },
+        contract: {
+          ...contract,
+          requirements: contract.requirements.map((requirement) => ({
+            ...requirement,
+            text:
+              requirement.text +
+              (resource
+                ? "; future owned segment allowance600 seconds/256 MiB after explicit recover; preserve unknown old measurements; finite check timeout5000ms"
+                : "; exact synthetic exception A=1793178673175340907, B=1793178673175340907 only, never latest values"),
+          })),
+          ...(resource
+            ? {
+                checks: contract.checks.map((check) =>
+                  check.kind === "automatic"
+                    ? {
+                        ...check,
+                        timeoutMs: 5000,
+                        ...(id === "native-scope-capacity-denied"
+                          ? { checkerFiles: [check.script, ...capacityFiles] }
+                          : {}),
+                      }
+                    : check,
+                ),
+              }
+            : {}),
+        },
+        reason: resource
+          ? "Amend prospective fixture business conditions only; retain original permission identity, Start, hard counters, profile caps and historical unknowns"
+          : "Precisely amend existing synthetic conditions; preserve original Goal/permissions/Start/budgets and all other guards",
+      },
+      id,
+    );
   return [
     ...planning,
     ...(preparation
@@ -222,33 +293,43 @@ export function approvalNativeResponses(
           compile,
         ]
       : [draft, compile]),
+    ...(resource
+      ? [
+          tool(
+            "propose_contract",
+            {
+              proposal: {
+                ...contract,
+                requirements: contract.requirements.map((r) => ({
+                  ...r,
+                  text: r.text + " revised definition",
+                })),
+              },
+            },
+            "native-postcompile-contract-denied",
+          ),
+        ]
+      : []),
     fauxAssistantMessage("GOAL_NATIVE_PLAN_CHECKPOINT"),
     ...(scope
       ? [
-          advice("hold"),
-          tool(
-            "propose_scope_revision",
-            {
-              plan: {
-                ...proposal,
-                acceptance: [
-                  "Exactly declared output; precise synthetic timestamp exception A=1793178673175340907, B=1793178673175340907; every other original condition remains",
-                ],
-              },
-              contract: {
-                ...contract,
-                requirements: contract.requirements.map((requirement) => ({
-                  ...requirement,
-                  text:
-                    requirement.text +
-                    "; exact synthetic exception A=1793178673175340907, B=1793178673175340907 only, never latest values",
-                })),
-              },
-              reason:
-                "Precisely amend existing synthetic conditions; preserve original Goal/permissions/Start/budgets and all other guards",
-            },
-            "native-scope-proposal",
-          ),
+          ...(guidance
+            ? [
+                advice("next_batch"),
+                scopeProposal("native-active-scope-denied"),
+                fauxAssistantMessage(
+                  "GOAL_NATIVE_ACTIVE_SCOPE_DENIED: user must pause, no automatic metadata turn",
+                ),
+                fauxAssistantMessage("GOAL_NATIVE_SCOPE_WAIT_ONE: no progress or scope authority"),
+                fauxAssistantMessage(
+                  "GOAL_NATIVE_SCOPE_WAIT_TWO: bounded stagnant hold, not permission",
+                ),
+              ]
+            : [advice("hold")]),
+          scopeProposal("native-scope-proposal"),
+          ...(resource
+            ? [scopeProposal("native-scope-repeat"), scopeProposal("native-scope-capacity-denied")]
+            : []),
           fauxAssistantMessage(
             "GOAL_NATIVE_SCOPE_PROPOSED: native review and separate recovery are still required",
           ),
@@ -294,5 +375,70 @@ export function approvalNativeResponses(
       if (!row?.data.receipt.id) throw Error("No original actual native-check receipt");
       return advice("accept", [row.data.receipt.id]);
     },
+  ];
+}
+function finalValidationNativeResponses() {
+  const root = process.env.GOAL_NATIVE_OUT!;
+  writeFileSync(join(root, "input.txt"), "first owned nonempty input\n");
+  const program = `const fs=require('node:fs'),a=require('node:assert/strict');const x=fs.readFileSync('input.txt','utf8');a.ok(x.trim().length>0);console.log('OWNED_NONEMPTY_VALIDATION_PASSED')`;
+  const input = { command: `${JSON.stringify(process.execPath)} -e ${JSON.stringify(program)}` };
+  const complete = (id: string) =>
+    tool(
+      "advance_tasks",
+      {
+        transitions: [
+          {
+            id: "t-1.1",
+            evidence: {
+              summary: "Actual fixed nonempty input validation",
+              refs: [
+                {
+                  kind: "command",
+                  label: "Exact native Bash validation",
+                  status: "passed",
+                  ref: `tool:${id}`,
+                  exitCode: 0,
+                },
+              ],
+            },
+          },
+        ],
+      },
+      "final-native-done",
+    );
+  return [
+    tool(
+      "write_tasks",
+      {
+        mode: "replace",
+        phases: [
+          {
+            title: "Owned final check",
+            tasks: [
+              {
+                title: "Validate input",
+                prompt: "Validate the nonempty input only",
+                profile: "main",
+              },
+            ],
+          },
+        ],
+      },
+      "final-native-plan",
+    ),
+    tool("compile_tasks", { finalAcceptanceTaskId: "t-1.1" }, "final-native-compile"),
+    fauxAssistantMessage("GOAL_FINAL_PLAN_CHECKPOINT"),
+    advice("next_batch"),
+    tool("get_ready_tasks", { count: 1 }, "final-native-ready"),
+    tool("advance_tasks", { transitions: [{ id: "t-1.1" }] }, "final-native-reviewing"),
+    tool("bash", input, "final-native-proof"),
+    complete("final-native-proof"),
+    fauxAssistantMessage("GOAL_FINAL_WORK_CHECKPOINT"),
+    () => {
+      throw Error("Owned final review unavailable; task completion must remain closed");
+    },
+    tool("bash", input, "new-final-native-proof"),
+    fauxAssistantMessage("GOAL_FINAL_NEW_VALIDATION_RECORDED"),
+    advice("accept", ["tool:new-final-native-proof"]),
   ];
 }

@@ -111,6 +111,48 @@ function failCache(h: ReturnType<typeof fixture>) {
   return append;
 }
 
+it("interaction diagnostics: reports UI failure without guessing user cancellation or granting", async () => {
+  const h = fixture();
+  vi.mocked(h.ctx.ui.custom).mockRejectedValueOnce(new Error("PRIVATE_UI_ERROR_DO_NOT_ECHO"));
+  const outcome = await submitted(h);
+  expect(outcome.details).toMatchObject({
+    status: "deferred",
+    interaction: { code: "ui_error", phase: "presentation" },
+  });
+  expect(JSON.stringify(outcome)).not.toContain("PRIVATE_UI_ERROR_DO_NOT_ECHO");
+  expect(h.entries.some((entry) => entry.customType === "continuous-tasks:preflight-control")).toBe(
+    false,
+  );
+  expect(currentRuntime().preflight?.phase).toBe("awaiting_authorization");
+  expect(supervisorState()).toBeUndefined();
+});
+
+it("interaction diagnostics: distinguishes an observed later choice from an unexplained exit", async () => {
+  const h = fixture();
+  vi.mocked(h.ctx.ui.select).mockResolvedValue("稍后决定");
+  const outcome = await submitted(h);
+  expect(outcome.details).toMatchObject({
+    status: "deferred",
+    interaction: { code: "user_deferred", phase: "response" },
+  });
+  expect(h.entries.some((entry) => entry.customType === "continuous-tasks:preflight-control")).toBe(
+    false,
+  );
+});
+
+it("interaction diagnostics: preserves an unexplained UI exit as unknown rather than user later", async () => {
+  const h = fixture();
+  vi.mocked(h.ctx.ui.custom).mockResolvedValueOnce(undefined);
+  const outcome = await submitted(h);
+  expect(outcome.details).toMatchObject({
+    status: "deferred",
+    interaction: { code: "no_response", phase: "presentation" },
+  });
+  expect(h.entries.some((entry) => entry.customType === "continuous-tasks:preflight-control")).toBe(
+    false,
+  );
+});
+
 it("attaches formatted reading and goal context without granting or skipping original permission material", async () => {
   const h = fixture();
   vi.mocked(h.ctx.ui.select).mockResolvedValue("稍后决定");

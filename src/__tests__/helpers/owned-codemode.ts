@@ -14,9 +14,10 @@ import {
   SettingsManager,
   type ExtensionAPI,
   type ExtensionContext,
+  type ExtensionCommandContext,
 } from "@earendil-works/pi-coding-agent";
 import { fauxProvider, fauxAssistantMessage, fauxToolCall } from "@earendil-works/pi-ai";
-import supervisor, { registerSupervisorComponents } from "../../index";
+import { registerSupervisorComponents } from "../../index";
 import { scopedAPI, currentRuntime } from "../../runtime";
 import { startSupervisor } from "../../supervisor";
 import { enableSessionScope } from "../../scope";
@@ -110,6 +111,8 @@ export interface OwnedFixtureHooks {
   checkTool?: string;
   prepare?: (dir: string) => void;
   goalStart?: (pi: ExtensionAPI, ctx: ExtensionContext, dir: string) => void;
+  finalAction?: "hold";
+  afterSettled?: (pi: ExtensionAPI, ctx: ExtensionCommandContext) => Promise<void>;
   approvalWorkflow?: {
     contract: (dir: string) => AcceptanceProposal;
     proposal: (dir: string) => Omit<PreflightProposal, "contractProposalId">;
@@ -329,7 +332,7 @@ export async function ownedCodemode(kind: OwnedCase, hooks: OwnedFixtureHooks = 
           )?.data as { receipt?: { id: string } } | undefined;
         return fauxAssistantMessage(
           JSON.stringify({
-            action: accepts ? "accept" : "hold",
+            action: hooks.finalAction ?? (accepts ? "accept" : "hold"),
             message: "Owned mechanism only",
             taskIds: accepts ? ["t-1.1"] : [],
             evidenceRefs: accepts ? (receipt?.receipt ? [receipt.receipt.id] : []) : [],
@@ -351,7 +354,16 @@ export async function ownedCodemode(kind: OwnedCase, hooks: OwnedFixtureHooks = 
       noContextFiles: true,
       extensionFactories: [
         workflow
-          ? supervisor
+          ? (pi: ExtensionAPI) => {
+              scopedAPI(pi, (api) => {
+                registerSupervisorComponents(api);
+                if (hooks.afterSettled)
+                  api.registerCommand("owned-inspect-settled", {
+                    description: "Isolated SDK fixture post-settle control probe",
+                    handler: (_args, ctx) => hooks.afterSettled!(api, ctx),
+                  });
+              });
+            }
           : (pi: ExtensionAPI) => {
               scopedAPI(pi, (api) => {
                 let hostDefinitions = false;
@@ -617,6 +629,11 @@ export async function ownedCodemode(kind: OwnedCase, hooks: OwnedFixtureHooks = 
       await new Promise((resolve) => setTimeout(resolve, 5));
     }
     await session.waitForIdle();
+    if (hooks.afterSettled) {
+      const inspect = session.extensionRunner.getCommand("owned-inspect-settled");
+      if (!inspect) throw Error("Owned post-settle probe missing");
+      await inspect.handler("", session.extensionRunner.createCommandContext());
+    }
     const writerDeadline = Date.now() + 1000;
     while (isWriting()) {
       if (Date.now() > writerDeadline)
@@ -626,7 +643,9 @@ export async function ownedCodemode(kind: OwnedCase, hooks: OwnedFixtureHooks = 
     const branch = structuredClone(manager.getBranch()),
       file = manager.getSessionFile();
     if (!file) throw Error("Owned SDK did not produce a physical session file");
-    passed = !hooks.approvalWorkflow || latest()?.status === (accepts ? "completed" : "paused");
+    passed =
+      !hooks.approvalWorkflow ||
+      latest()?.status === (accepts && !hooks.finalAction ? "completed" : "paused");
     return {
       branch,
       state: latest(),

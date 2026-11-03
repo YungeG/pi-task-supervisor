@@ -12,7 +12,7 @@ import { captureUnownedArtifactInputs } from "./artifact-version";
 import { inspectRestorableSession } from "./human-control";
 import { journalDigest, type SessionJournal } from "./human-journal";
 import { appendControlFence, readControlJournal } from "./control-journal";
-import { currentRuntime } from "./runtime";
+import { currentRuntime, type TaskRuntime } from "./runtime";
 import { checkerScopeInventory, type AutomaticCheckProposal } from "./acceptance-proposal";
 import { nativePlanDescriptor, type NativeCheckPlan } from "./check-profile";
 import { ApprovalContractCaptureSchema, type ApprovalContractCapture } from "./approval-schema";
@@ -123,13 +123,49 @@ export function needsPreflightAssociation(
     !state.permissionRequest?.acceptance?.pendingChecks.length
   );
 }
+function definitionBlockAction(
+  state: Extract<PreflightState, { version: 2 }>,
+  block: TaskRuntime["preflightDefinitionBlock"],
+): ApprovalAction | undefined {
+  if (!block) return;
+  const proposalId = state.proposal?.contractProposalId;
+  if (block.kind === "capability" || block.kind === "materials")
+    return {
+      kind: "materials",
+      actor: "Main",
+      proposalId,
+      effect: `${block.kind === "capability" ? "上次实际宿主检测没有合格证据通道；Main先核对工具模式与正式检查入口" : "真实输入/能力材料暂不可用；Main先核对并补齐"}，不请求 Start，也不因此重批业务权限。${block.reason}`,
+    };
+  if (block.kind === "scope")
+    return {
+      kind: "permissions",
+      actor: "user",
+      proposalId,
+      command: `/task-supervisor approve ${state.planId} ${state.approval?.permissionIds.join(",") || "none"}`,
+      effect: "工作区身份已改变；仅定义审核不能延展旧业务许可，需要明确的新范围确认，仍不启动。",
+    };
+  return undefined;
+}
+function matchingDefinitionBlock(
+  state: Extract<PreflightState, { version: 2 }>,
+  diagnostic: boolean | TaskRuntime["preflightDefinitionBlock"],
+) {
+  if (!diagnostic || typeof diagnostic !== "object") return;
+  return diagnostic.preflightId === state.preflightId &&
+    diagnostic.planDigest === state.planDigest &&
+    diagnostic.controlEntryId === state.definitionApproval?.controlEntryId
+    ? diagnostic
+    : undefined;
+}
 /** Pure cached decision projection, never an execution/permission qualification. */
 export function approvalAction(
   state: PreflightState | undefined,
   bound = false,
-  stale = false,
+  diagnostic: boolean | TaskRuntime["preflightDefinitionBlock"] = false,
 ): ApprovalAction | undefined {
   if (!isConsolidatedState(state)) return;
+  const block = matchingDefinitionBlock(state, diagnostic);
+  const stale = diagnostic === true || block !== undefined;
   if (state.phase === "interrupted") return;
   if (state.phase === "revoked")
     return {
@@ -167,7 +203,8 @@ export function approvalAction(
       command: "/task-supervisor approve",
       effect: "只确认所选业务范围与可用定义，不启动、不接受产物。",
     };
-  if (!state.started) return beforeStartAction(state, proposalId, stale);
+  if (!state.started)
+    return definitionBlockAction(state, block) ?? beforeStartAction(state, proposalId, stale);
   if (needsPreflightAssociation(state, bound))
     return {
       kind: "association",

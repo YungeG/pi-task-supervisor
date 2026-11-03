@@ -36,7 +36,7 @@ export function isSessionScopeEnabled(): boolean {
   return currentRuntime().enabled && modePermitsTools();
 }
 
-export function updateActiveTools(pi: ExtensionAPI, value: boolean): void {
+export function scopedActiveTools(pi: ExtensionAPI, value: boolean): string[] {
   const active = pi.getActiveTools().filter((name) => !taskTools.has(name));
   value = value && modePermitsTools();
   const runtime = currentRuntime(),
@@ -48,7 +48,17 @@ export function updateActiveTools(pi: ExtensionAPI, value: boolean): void {
       ? []
       : [PREFLIGHT_TOOL_NAME, ...proposalTools]
     : [...TASK_TOOL_NAMES, ...checkTools, ...proposalTools, ...(supervised ? scopeTools : [])];
-  pi.setActiveTools(value ? [...active, ...selected] : active);
+  return value ? [...active, ...selected] : active;
+}
+
+export function updateActiveTools(pi: ExtensionAPI, value: boolean): void {
+  pi.setActiveTools(scopedActiveTools(pi, value));
+}
+
+export function reconcileActiveTools(pi: ExtensionAPI, value: boolean): void {
+  const desired = scopedActiveTools(pi, value);
+  const active = pi.getActiveTools();
+  if (JSON.stringify(desired) !== JSON.stringify(active)) pi.setActiveTools(desired);
 }
 
 function hasActivationEntry(ctx: ExtensionContext): boolean {
@@ -69,9 +79,12 @@ export function restoreSessionScope(pi: ExtensionAPI, ctx: ExtensionContext): bo
   return value;
 }
 
-export function enableSessionScope(pi: ExtensionAPI): void {
+export function enableSessionScope(
+  pi: ExtensionAPI,
+  options?: { deferToolActivation?: boolean },
+): void {
   if (isSessionScopeEnabled()) return;
   pi.appendEntry(ACTIVATION_ENTRY_TYPE, { version: 1, enabled: true });
   setSessionScopeEnabled(true);
-  updateActiveTools(pi, true);
+  if (!options?.deferToolActivation) updateActiveTools(pi, true);
 }

@@ -1,4 +1,5 @@
 import { randomUUID } from "node:crypto";
+import { isDeepStrictEqual } from "node:util";
 import type {
   ExtensionAPI,
   ExtensionContext,
@@ -11,6 +12,8 @@ import { canonicalPreflightProposal, PREFLIGHT_ENTRY } from "./preflight";
 import { ownerSnapshot, goalLease } from "./goal-scope";
 import { captureManagementSnapshot } from "./management-policy";
 import { currentRuntime } from "./runtime";
+import { getBoardRef } from "./state";
+import { ScopeProposalError, ScopeReviewabilityError } from "./scope-guidance";
 import { journalDigest, type GoalReadbackFrame, type JournalNode } from "./human-journal";
 import {
   inspectRestorableSession,
@@ -34,6 +37,7 @@ import {
 import {
   scopeRevisionContractContext,
   prepareScopeRevisionContract,
+  scopeBindingRecordId,
   commitScopeRevisionContract,
   proposeAcceptanceContract,
 } from "./acceptance-runtime";
@@ -52,10 +56,18 @@ import {
   scopeEffectivePlan,
   scopeRevisionReviewSubject,
   scopePreviousContractMaterial,
+  rememberScopeMaterialChange,
+  rememberUnreviewableScope,
   assertScopeContractObjects,
 } from "./scope-revision-journal";
 import { readableScopeRevision } from "./human-presentation";
-import { contractProposalViews } from "./acceptance-planning";
+import {
+  contractProposalViews,
+  proposalTargetKey,
+  validContractProposal,
+  type ContractProposalView,
+} from "./acceptance-planning";
+import { validateAcceptanceProposal } from "./acceptance-proposal";
 import { contractReviewSubject } from "./acceptance-journal";
 import type { AcceptanceReference } from "./acceptance-contract";
 import { SCOPE_REVISION_FAULT, type ScopeRevisionControl } from "./scope-revision-facts";
@@ -105,6 +117,12 @@ function originalBase(source: ReturnType<typeof scopeRevisionContractContext>) {
     throw Error("Original approval/first-start references are unavailable; no reconstruction");
   return { node, approval, start, plan: state.proposal };
 }
+function requireAmendableWork(): void {
+  if (getBoardRef().workflowStatus === "completed")
+    throw Error(
+      "Completed task board does not support scope revision/adoption; inspect retry-review for the existing contract, or explicitly end this Goal and plan independent work. Completed business remains closed",
+    );
+}
 function scopeProposalContext(
   ctx: ExtensionContext,
   input: Static<typeof ProposeScopeRevisionParams>,
@@ -112,36 +130,86 @@ function scopeProposalContext(
   const source = scopeRevisionContractContext(ctx, "proposal"),
     base = originalBase(source),
     previous = selectedScopeRevision(source.view.acceptance, source.owner);
+  requireAmendableWork();
   if (previous && source.view.acceptance && scopeIsRevoked(source.view.acceptance, previous))
     throw Error("Revoked scope cannot be revived by a proposal");
   assertScopePlanObjects(base.plan, input.plan);
   assertScopeContractObjects(source.proposal, input.contract);
   canonicalPreflightProposal(source.goal, input.plan);
-  if (
-    (source.view.acceptance?.scopeProposals?.filter(
-      (p) => journalDigest(p.data.owner) === journalDigest(source.owner),
-    ).length ?? 0) >= 8
-  )
-    throw Error("Scope proposal capacity exhausted; no existing history is discarded");
   return { source, base, previous };
 }
-export function proposeScopeRevision(pi: ExtensionAPI, ctx: ExtensionContext, input: unknown) {
-  if (!Check(ProposeScopeRevisionParams, input))
-    throw Error("Scope proposal must include the complete exact plan, contract and reason");
-  const { source, base, previous } = scopeProposalContext(ctx, input);
-  const contract = proposeAcceptanceContract(pi, ctx, input.contract, true);
-  const journal = inspectRestorableSession(ctx, true);
-  const contractProposal =
-    journal &&
-    contractProposalViews(journal).find((p) => p.data.proposalId === contract.proposalId);
-  if (!journal || !contractProposal)
-    throw Error("Scope acceptance proposal is not physically available");
-  const plan = { ...input.plan, contractProposalId: contract.proposalId };
-  canonicalPreflightProposal(source.goal, plan);
+function scopePlanMaterial(
+  plan: Static<typeof ProposeScopeRevisionParams>["plan"] & { contractProposalId?: string },
+) {
+  const material = { ...plan };
+  delete material.contractProposalId;
+  return material;
+}
+function latestMatchingScope(
+  context: ReturnType<typeof scopeProposalContext>,
+  input: Static<typeof ProposeScopeRevisionParams>,
+) {
+  const { source, base, previous } = context;
+  const latest = source.view.acceptance?.scopeProposals
+    ?.filter((p) => journalDigest(p.data.owner) === journalDigest(source.owner))
+    .at(-1);
+  if (!latest) return;
+  const data = latest.data;
+  const expected = [
+    source.owner,
+    source.sourceRef,
+    ref(base.node),
+    ref(base.approval),
+    ref(base.start),
+    previous ? ref(previous) : null,
+    ref(source.bound),
+    scopePlanMaterial(input.plan),
+    input.contract,
+    input.reason,
+  ];
+  const actual = [
+    data.owner,
+    data.sourceRef,
+    data.basePreflightRef,
+    data.approvalRef,
+    data.startRef,
+    data.previousRevisionRef,
+    data.previousContractRef,
+    scopePlanMaterial(data.plan),
+    scopeRevisionContractProposal(source.journal, latest).data.proposal,
+    data.reason,
+  ];
+  if (!isDeepStrictEqual(actual, expected)) return;
+  if (
+    source.view.acceptance?.scopeReviews?.some((row) =>
+      sameScopeRef(row.control.data.proposalRef, latest),
+    )
+  )
+    throw Error(
+      `Latest identical scope proposal already responded; inspect saved native review/repair for ${data.proposalId}, not a replacement proposal or refreshed approval`,
+    );
+  return latest;
+}
+const futureReference = () => ({ entryId: "x".repeat(200), digest: "a".repeat(64) });
+function scopeProposalData(
+  context: ReturnType<typeof scopeProposalContext>,
+  input: Static<typeof ProposeScopeRevisionParams>,
+  contract: ContractProposalView,
+  proposalId: string,
+) {
+  const { source, base, previous } = context;
+  const plan = { ...input.plan, contractProposalId: contract.data.proposalId };
+  try {
+    canonicalPreflightProposal(source.goal, plan);
+  } catch (error) {
+    throw new ScopeReviewabilityError(
+      `Scope plan capacity upper bound/material with derived contract reference is invalid: ${error instanceof Error ? error.message : "unknown validation failure"}`,
+    );
+  }
   const data = {
     version: 1 as const,
-    sessionId: journal.sessionId,
-    proposalId: randomUUID(),
+    sessionId: source.journal.sessionId,
+    proposalId,
     owner: source.owner,
     sourceRef: source.sourceRef,
     basePreflightRef: ref(base.node),
@@ -149,12 +217,98 @@ export function proposeScopeRevision(pi: ExtensionAPI, ctx: ExtensionContext, in
     startRef: ref(base.start),
     previousRevisionRef: previous ? ref(previous) : null,
     previousContractRef: ref(source.bound),
-    contractProposalRef: ref(contractProposal),
+    contractProposalRef: ref(contract),
     plan,
     reason: input.reason,
   };
-  if (!validScopeRevisionProposal(data, journal.sessionId))
-    throw Error("Scope proposal exceeds exact schema/capacity; nothing is omitted");
+  if (!validScopeRevisionProposal(data, source.journal.sessionId))
+    throw new ScopeReviewabilityError(
+      "Scope proposal exceeds exact schema/capacity; nothing is omitted",
+    );
+  return data;
+}
+function previewContractProposal(
+  context: ReturnType<typeof scopeProposalContext>,
+  input: Static<typeof ProposeScopeRevisionParams>,
+): ContractProposalView {
+  const { source } = context,
+    proposal = validateAcceptanceProposal(input.contract);
+  const data = {
+    version: 1 as const,
+    sessionId: source.journal.sessionId,
+    proposalId: "x".repeat(200),
+    sourceRef: source.sourceRef,
+    target: { kind: "goal" as const, owner: source.owner },
+    proposal,
+  };
+  const previous = contractProposalViews(source.journal).filter(
+    (p) => proposalTargetKey(p.data) === proposalTargetKey(data),
+  );
+  const existing = previous.find((p) => journalDigest(p.data.proposal) === journalDigest(proposal));
+  if (existing) return existing;
+  if (previous.length >= 8)
+    throw new ScopeReviewabilityError(
+      "Contract proposal capacity reached; no source history is evicted",
+      "Main: inspect saved contract proposals; no new contract slot remains. Reuse only exact existing complete material when otherwise admissible; never delete history, omit conditions or reset limits",
+    );
+  if (!validContractProposal(data, source.journal.sessionId))
+    throw new ScopeReviewabilityError(
+      "Contract proposal metadata exceeds native64KB/schema capacity upper bound; no condition is dropped",
+    );
+  return { ...futureReference(), data };
+}
+function preflightScopeReview(
+  ctx: ExtensionContext,
+  context: ReturnType<typeof scopeProposalContext>,
+  input: Static<typeof ProposeScopeRevisionParams>,
+  duplicate: ReturnType<typeof latestMatchingScope>,
+): void {
+  const prepared = prepareScopeRevisionContract(ctx, input.contract, "proposal");
+  const contract = duplicate
+    ? scopeRevisionContractProposal(context.source.journal, duplicate)
+    : previewContractProposal(context, input);
+  const proposal = duplicate ?? {
+    ...futureReference(),
+    data: scopeProposalData(context, input, contract, "x".repeat(200)),
+  };
+  scopeReviewMaterial(context.source, proposal, contract, prepared, context.base.plan);
+}
+function requireScopeProposalSlot(source: ReturnType<typeof scopeRevisionContractContext>) {
+  if (
+    (source.view.acceptance?.scopeProposals?.filter(
+      (p) => journalDigest(p.data.owner) === journalDigest(source.owner),
+    ).length ?? 0) >= 8
+  )
+    throw Error("Scope proposal capacity exhausted; no existing history is discarded");
+}
+export function proposeScopeRevision(pi: ExtensionAPI, ctx: ExtensionContext, input: unknown) {
+  if (!Check(ProposeScopeRevisionParams, input))
+    throw new ScopeProposalError(
+      "SCOPE_PROPOSAL_INVALID",
+      "Scope proposal must include the complete exact plan, contract and reason",
+      "Main: supply complete plan, contract and nonempty reason; do not infer authority or silently fill missing material",
+    );
+  const context = scopeProposalContext(ctx, input),
+    { source } = context;
+  const duplicate = latestMatchingScope(context, input);
+  preflightScopeReview(ctx, context, input, duplicate);
+  if (duplicate)
+    return {
+      proposalId: duplicate.data.proposalId,
+      ref: { entryId: duplicate.entryId, digest: duplicate.digest },
+      status: "proposed" as const,
+      next: `/task-supervisor review-scope ${duplicate.data.proposalId}`,
+      reused: true,
+    };
+  requireScopeProposalSlot(source);
+  const contract = proposeAcceptanceContract(pi, ctx, input.contract, true);
+  const journal = inspectRestorableSession(ctx, true);
+  const contractProposal =
+    journal &&
+    contractProposalViews(journal).find((p) => p.data.proposalId === contract.proposalId);
+  if (!journal || !contractProposal)
+    throw Error("Scope acceptance proposal is not physically available");
+  const data = scopeProposalData(context, input, contractProposal, randomUUID());
   scopeProposalBase(journal, data, journal.branch.length);
   ensureFence(pi, ctx);
   const lease = captureControlLease(ctx);
@@ -176,6 +330,7 @@ export function proposeScopeRevision(pi: ExtensionAPI, ctx: ExtensionContext, in
       proposalId: data.proposalId,
       ref: { ...ref(saved) },
       status: "proposed" as const,
+      reused: false,
       next: `/task-supervisor review-scope ${data.proposalId}`,
     };
   } catch (error) {
@@ -187,9 +342,14 @@ function scopeFault(): void {
   currentRuntime().cancel();
   currentRuntime().journalFault = SCOPE_REVISION_FAULT;
 }
-function preparedReview(ctx: ExtensionContext, proposalId: string) {
+function preparedReview(
+  ctx: ExtensionContext,
+  proposalId: string,
+  originalControl?: AcceptanceReference,
+) {
   const source = scopeRevisionContractContext(ctx),
     view = source.view.acceptance;
+  if (!originalControl) requireAmendableWork();
   const proposal = view?.scopeProposals?.find((p) => p.data.proposalId === proposalId);
   if (!proposal || !view) throw Error("Unknown actual current-owner scope proposal");
   if (
@@ -204,11 +364,33 @@ function preparedReview(ctx: ExtensionContext, proposalId: string) {
   const base = scopeProposalBase(source.journal, proposal.data, source.journal.branch.length),
     contract = scopeRevisionContractProposal(source.journal, proposal);
   assertScopeContractObjects(source.proposal, contract.data.proposal);
-  const prepared = prepareScopeRevisionContract(ctx, contract.data.proposal);
-  // The review subject deliberately excludes future definition/commit references.
+  const prepared = prepareScopeRevisionContract(
+    ctx,
+    contract.data.proposal,
+    "review",
+    originalControl,
+  );
+  return {
+    source,
+    proposal,
+    prepared,
+    ...scopeReviewMaterial(source, proposal, contract, prepared, base.plan, originalControl),
+  };
+}
+function scopeReviewMaterial(
+  source: ReturnType<typeof scopeRevisionContractContext>,
+  proposal: Parameters<typeof scopeRevisionReviewSubject>[0],
+  contract: ContractProposalView,
+  prepared: ReturnType<typeof prepareScopeRevisionContract>,
+  originalPlan: Static<typeof ProposeScopeRevisionParams>["plan"],
+  originalControl?: AcceptanceReference,
+) {
+  const view = source.view.acceptance;
+  if (!view) throw Error("Original scope acceptance view unavailable");
+  // Preview references size material only. This subject is never accepted as a native response.
   const subject = scopeRevisionReviewSubject(
     proposal,
-    scopeEffectivePlan(view, source.owner) ?? base.plan,
+    scopeEffectivePlan(source.view.acceptance, source.owner) ?? originalPlan,
     contractReviewSubject(
       prepared.base,
       prepared.definitions,
@@ -219,7 +401,13 @@ function preparedReview(ctx: ExtensionContext, proposalId: string) {
     ),
     scopePreviousContractMaterial(view, proposal),
   );
-  return { source, proposal, prepared, subject };
+  const presentation = readableScopeRevision(subject);
+  requireScopeReviewCapacity({ source, prepared }, originalControl);
+  if (!originalControl && Buffer.byteLength(presentation.body, "utf8") > 64000)
+    throw new ScopeReviewabilityError(
+      "Scope review material exceeds64KB capacity upper bound; no condition is dropped",
+    );
+  return { subject, presentation };
 }
 function materialCurrent(
   ctx: ExtensionContext,
@@ -238,21 +426,40 @@ function materialCurrent(
     capture.inputGeneration === prepared.capture.inputGeneration
   );
 }
-function requireScopeReviewCapacity(review: ReturnType<typeof preparedReview>): void {
+function requireScopeReviewCapacity(
+  review: {
+    source: ReturnType<typeof scopeRevisionContractContext>;
+    prepared: ReturnType<typeof prepareScopeRevisionContract>;
+  },
+  originalControl?: AcceptanceReference,
+): void {
   const view = review.source.view.acceptance,
     key = journalDigest(review.source.owner);
   if (
+    !originalControl &&
     (view?.scopeReviews?.filter((r) => journalDigest(r.control.data.owner) === key).length ?? 0) >=
-    16
+      16
   )
-    throw Error("Scope native response capacity exhausted before collecting a new answer");
+    throw new ScopeReviewabilityError(
+      "Scope native response capacity exhausted before collecting a new answer",
+      "Inspect original saved scope responses; no new response slot remains for this Goal. Repair only exact witnessed metadata where applicable; do not repeat review, delete history or reset counts",
+    );
+  const additions = originalControl
+    ? review.prepared.definitions.filter(
+        (definition) =>
+          !view?.definitions.some(
+            (d) =>
+              d.data.recordId === scopeBindingRecordId(originalControl, definition.spec.checkId),
+          ),
+      ).length
+    : review.prepared.definitions.length;
   if (
-    (view?.definitions.filter((d) => journalDigest(d.data.owner) === key).length ?? 0) +
-      review.prepared.definitions.length >
+    (view?.definitions.filter((d) => journalDigest(d.data.owner) === key).length ?? 0) + additions >
     256
   )
-    throw Error(
+    throw new ScopeReviewabilityError(
       "Frozen scope definition capacity exhausted before native review; no field is omitted",
+      "Inspect original definitions and repair only exact witnessed metadata; capacity cannot be renewed by dropping required checks or historical records",
     );
 }
 function scopeCarrierCurrent(ctx: ExtensionContext, frame: InvocationFrame): boolean {
@@ -273,6 +480,15 @@ function scopeCarrierCurrent(ctx: ExtensionContext, frame: InvocationFrame): boo
     journalDigest(modeRef) === journalDigest(frame.modeRef)
   );
 }
+function prepareNativeScopeReview(ctx: ExtensionContext, proposalId: string) {
+  try {
+    return preparedReview(ctx, proposalId);
+  } catch (error) {
+    if (error instanceof ScopeReviewabilityError)
+      rememberUnreviewableScope(ctx, proposalId, error.next);
+    throw error;
+  }
+}
 export async function reviewScopeRevision(
   pi: ExtensionAPI,
   ctx: ExtensionCommandContext,
@@ -280,11 +496,17 @@ export async function reviewScopeRevision(
 ) {
   if (!isTrustedLocalTui(ctx)) return { status: "unsupported" as const };
   await ctx.waitForIdle();
-  const review = preparedReview(ctx, proposalId),
-    presentation = readableScopeRevision(review.subject);
-  requireScopeReviewCapacity(review);
-  if (Buffer.byteLength(presentation.body, "utf8") > 64000)
-    throw Error("Scope review material exceeds64KB; no condition is dropped");
+  return reviewScopeRevisionNow(pi, ctx, proposalId);
+}
+
+export async function reviewScopeRevisionNow(
+  pi: ExtensionAPI,
+  ctx: ExtensionContext,
+  proposalId: string,
+) {
+  if (!isTrustedLocalTui(ctx)) return { status: "unsupported" as const };
+  const review = prepareNativeScopeReview(ctx, proposalId),
+    presentation = review.presentation;
   ensureFence(pi, ctx);
   const carrier = captureInvocationFrame(ctx, review.source.owner),
     frame = captureGoalReadbackFrame(
@@ -363,9 +585,6 @@ function finishRevision(
   );
   if (!row?.witness || journalDigest(row.control.data.frame) !== journalDigest(frame))
     throw Error("Original confirmed scope response is unavailable; never synthesize its witness");
-  prepared.base.recordId = `scope-bound-${journalDigest(controlRef)}`;
-  for (const definition of prepared.definitions)
-    definition.recordId = `scope-def-${journalDigest([controlRef, definition.spec.checkId])}`;
   const existing = readControlJournal(ctx).acceptance?.contracts.find(
     (b) =>
       b.data.authority.kind === "scope-revision-reviewed" &&
@@ -411,7 +630,7 @@ function approvedScopeRepair(
     throw Error(
       "Repair needs the original latest approved native control AND its physical witness; review anew otherwise",
     );
-  const review = preparedReview(ctx, proposal.data.proposalId),
+  const review = preparedReview(ctx, proposal.data.proposalId, ref(row.control)),
     data = row.control.data;
   if (
     data.frame.scopeDigest !== journalDigest(review.subject) ||
@@ -461,6 +680,7 @@ export async function repairScopeRevision(
       runtime.controlJournal = readControlJournal(ctx);
       return {
         status: "needs_review" as const,
+        next: `/task-supervisor review-scope ${proposalId}`,
         remaining:
           "No matching original approved physical witness; still held. A new exact native review is required, not replay or recovery",
       };
@@ -474,8 +694,10 @@ export async function repairScopeRevision(
       runtime.journalFault = undefined;
       scopeRevisionContractContext(ctx);
       runtime.controlJournal = readControlJournal(ctx);
+      rememberScopeMaterialChange(ctx, proposalId);
       return {
         status: "needs_review" as const,
+        next: `/task-supervisor review-scope ${proposalId}`,
         remaining:
           error.message +
           "; execution remains held, only a new exact native review can authorize the changed material",

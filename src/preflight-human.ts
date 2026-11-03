@@ -25,7 +25,13 @@ import {
   type ReadbackProof,
   type ReadbackFrame,
 } from "./human-journal";
-import { isTrustedLocalTui, requestNativeAnswer, type NativeAnswer } from "./human-ui";
+import {
+  isTrustedLocalTui,
+  requestNativeInteraction,
+  type NativeAnswer,
+  type NativeInteractionDiagnostic,
+  type NativeInteractionResult,
+} from "./human-ui";
 import { currentRuntime } from "./runtime";
 import {
   PREFLIGHT_ENTRY,
@@ -94,6 +100,7 @@ export interface PreflightHumanResult {
     | "defined"
     | "definition_declined";
   remainingGates: string[];
+  interaction?: NativeInteractionDiagnostic;
   confirmed?: {
     kind: NativePreflightControl["kind"];
     requestId: string;
@@ -113,7 +120,7 @@ function own(ctx: ExtensionContext): PreflightState {
     throw new Error("No current-session preflight");
   return structuredClone(state);
 }
-function idle(ctx: ExtensionCommandContext): void {
+function idle(ctx: ExtensionContext): void {
   if (currentRuntime().journalFault) throw new Error(currentRuntime().journalFault);
   if (!ctx.isIdle() || ctx.hasPendingMessages())
     throw new Error("Wait for Main and pending messages before preflight control");
@@ -331,7 +338,7 @@ async function present(
   start: boolean,
   signal?: AbortSignal,
   denyOnly = false,
-): Promise<NativeAnswer | undefined> {
+): Promise<NativeInteractionResult> {
   const runtime = currentRuntime();
   const controller = new AbortController();
   runtime.humanAbort = controller;
@@ -344,7 +351,7 @@ async function present(
     denyOnly,
   );
   try {
-    return await requestNativeAnswer(
+    return await requestNativeInteraction(
       ctx,
       {
         frame,
@@ -464,8 +471,10 @@ async function permission(
     preflightPermissionScope(base, ids),
     base,
   );
-  const answer = await present(ctx, base, frame, ids, false, signal, denyOnly);
-  if (!permissionAnswerAllowed(ctx, answer, denyOnly)) return result(ctx, base, "deferred");
+  const interaction = await present(ctx, base, frame, ids, false, signal, denyOnly);
+  const answer = interaction.answer;
+  if (!permissionAnswerAllowed(ctx, answer, denyOnly))
+    return { ...result(ctx, base, "deferred"), interaction: interaction.diagnostic };
   const selectedIds = nativePermissionSelection(base, ids, answer);
   const control: NativePermissionControl = {
     version: 2,
@@ -569,7 +578,7 @@ function assertDefinitionBusinessCurrent(
   )
     throw Error("Definition review needs its exact original business grant");
 }
-async function reviewPreflightDefinitions(
+export async function reviewPreflightDefinitions(
   pi: ExtensionAPI,
   ctx: ExtensionContext,
   signal?: AbortSignal,
@@ -619,8 +628,9 @@ async function reviewPreflightDefinitions(
     preflightPermissionScope(base, ids),
     base,
   );
-  const answer = await present(ctx, base, frame, ids, false, signal);
-  if (!answer) return result(ctx, base, "deferred");
+  const interaction = await present(ctx, base, frame, ids, false, signal);
+  const answer = interaction.answer;
+  if (!answer) return { ...result(ctx, base, "deferred"), interaction: interaction.diagnostic };
   const control: NativePermissionControl = {
     version: 2,
     sessionId: base.sessionId,
@@ -637,7 +647,7 @@ async function reviewPreflightDefinitions(
 }
 export async function approvePreflight(
   pi: ExtensionAPI,
-  ctx: ExtensionCommandContext,
+  ctx: ExtensionContext,
   planIdHint?: string,
   selection?: string,
   signal?: AbortSignal,
@@ -730,7 +740,7 @@ function recordDefinitionBlock(
     reason,
   };
 }
-function validateBundleBeforeStart(ctx: ExtensionContext, base: PreflightState): void {
+export function assertPreflightStartMaterial(ctx: ExtensionContext, base: PreflightState): void {
   if (base.version !== 2 || !base.proposal?.contractProposalId) return;
   const captured = confirmedBundleCapture(ctx, base);
   let current: typeof captured;
@@ -767,17 +777,32 @@ function requireUnusedGoalStart(): void {
       "This GoalRun already saved its first-start; inspect/repair the existing result without another confirmation",
     );
 }
+function projectStartEffects(
+  pi: ExtensionAPI,
+  ctx: ExtensionContext,
+  options?: { deferToolActivation?: boolean },
+): void {
+  supervisorNotice(
+    pi,
+    ctx,
+    "Goal recorded after native first-start confirmation; other gates still apply.",
+  );
+  enableSessionScope(pi, options);
+  if (!options?.deferToolActivation) updateActiveTools(pi, true);
+}
+
 export async function startApprovedPreflight(
   pi: ExtensionAPI,
-  ctx: ExtensionCommandContext,
+  ctx: ExtensionContext,
   planIdHint?: string,
   signal?: AbortSignal,
+  options?: { deferToolActivation?: boolean },
 ): Promise<PreflightHumanResult> {
   idle(ctx);
   let base = own(ctx);
   requireUnusedGoalStart();
   inspectPreflightStart(ctx, base.goal, planIdHint);
-  validateBundleBeforeStart(ctx, base);
+  assertPreflightStartMaterial(ctx, base);
   requireCurrentEvidenceCapability(pi, ctx);
   if (!isTrustedLocalTui(ctx)) return result(ctx, base, "unsupported");
   base = prepareRequest(pi, ctx, base, "start");
@@ -797,9 +822,11 @@ export async function startApprovedPreflight(
     preflightStartScope(base, digest),
     base,
   );
-  const answer = await present(ctx, base, frame, base.approval.permissionIds, true, signal);
-  if (!answer || answer.value !== "Start execution") return result(ctx, base, "deferred");
-  validateBundleBeforeStart(ctx, base);
+  const interaction = await present(ctx, base, frame, base.approval.permissionIds, true, signal);
+  const answer = interaction.answer;
+  if (!answer || answer.value !== "Start execution")
+    return { ...result(ctx, base, "deferred"), interaction: interaction.diagnostic };
+  assertPreflightStartMaterial(ctx, base);
   const control: NativeStartControl = {
     version: 2,
     kind: "start",
@@ -844,13 +871,7 @@ export async function startApprovedPreflight(
       startupPending: startupVerified ? "projection" : "startup",
     };
   }
-  supervisorNotice(
-    pi,
-    ctx,
-    "Goal recorded after native first-start confirmation; other gates still apply.",
-  );
-  enableSessionScope(pi);
-  updateActiveTools(pi, true);
+  projectStartEffects(pi, ctx, options);
   return saved(ctx, projected, control, proof, "started");
 }
 function repairedJournalFault(

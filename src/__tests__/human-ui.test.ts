@@ -8,6 +8,7 @@ import { installCustomUI } from "./helpers/custom-ui";
 import {
   isTrustedLocalTui,
   requestNativeAnswer,
+  requestNativeInteraction,
   requireNativeAnswer,
   trustedCliRoots,
   type NativeQuestion,
@@ -337,6 +338,115 @@ describe("requestNativeAnswer - positive mechanism tests", () => {
     const trustedCliPath = `${prefix}/lib/node_modules/@earendil-works/pi-coding-agent/dist/cli.js`;
     process.argv = ["node", trustedCliPath];
   }
+
+  it("diagnostic results preserve opaque answers and cannot be used as approval", async () => {
+    setupTrustedTui();
+    const ctx = createMockContext();
+    vi.mocked(ctx.ui.select).mockResolvedValue("允许上述范围");
+    const question: NativeQuestion = {
+      frame: createMockFrame(),
+      kind: "authorization",
+      title: "范围",
+      body: "只读原件",
+    };
+    const interaction = await requestNativeInteraction(ctx, question, () => true);
+    expect(interaction.diagnostic).toEqual({ code: "answered", phase: "response" });
+    expect(requireNativeAnswer(ctx, interaction.answer, question.frame)).toBe(interaction.answer);
+    expect(() => requireNativeAnswer(ctx, interaction.diagnostic, question.frame)).toThrow(
+      "Unrecognized",
+    );
+    expect(() => requireNativeAnswer(ctx, { ...interaction.answer }, question.frame)).toThrow(
+      "Unrecognized",
+    );
+    expect(Object.isFrozen(interaction.diagnostic)).toBe(true);
+  });
+
+  it.each(["stale", "aborted", "unsupported", "display_unavailable"] as const)(
+    "reports %s without issuing an answer or asking another question",
+    async (code) => {
+      setupTrustedTui();
+      const ctx = createMockContext();
+      const controller = new AbortController();
+      if (code === "aborted") controller.abort();
+      if (code === "unsupported") Object.assign(ctx, { mode: "rpc" });
+      if (code === "display_unavailable")
+        vi.mocked(ctx.ui.setWidget).mockImplementation(() => {
+          throw new Error("private");
+        });
+      const question: NativeQuestion = {
+        frame: createMockFrame(),
+        kind: "authorization",
+        title: "范围",
+        body: "原件",
+      };
+      const outcome = await requestNativeInteraction(
+        ctx,
+        question,
+        () => code !== "stale",
+        controller.signal,
+      );
+      expect(outcome.answer).toBeUndefined();
+      expect(outcome.diagnostic).toEqual({ code, phase: "admission" });
+      expect(ctx.ui.custom).not.toHaveBeenCalled();
+      expect(JSON.stringify(outcome)).not.toContain("private");
+    },
+  );
+
+  it("reports an occupied original question without stealing its lock", async () => {
+    setupTrustedTui();
+    const ctx = createMockContext();
+    let finish: ((value: undefined) => void) | undefined;
+    vi.mocked(ctx.ui.custom).mockImplementationOnce(
+      () =>
+        new Promise<undefined>((resolve) => {
+          finish = resolve;
+        }),
+    );
+    const question: NativeQuestion = {
+      frame: createMockFrame(),
+      kind: "authorization",
+      title: "范围",
+      body: "原件",
+    };
+    const first = requestNativeInteraction(ctx, question, () => true);
+    await vi.waitFor(() => {
+      expect(ctx.ui.custom).toHaveBeenCalledOnce();
+    });
+    const second = await requestNativeInteraction(ctx, question, () => true);
+    expect(second).toEqual({ diagnostic: { code: "busy", phase: "admission" } });
+    expect(ctx.ui.custom).toHaveBeenCalledOnce();
+    finish!(undefined);
+    expect((await first).diagnostic.code).toBe("no_response");
+  });
+
+  it.each(["stale", "aborted"] as const)(
+    "does not accept an observed choice after %s during UI",
+    async (code) => {
+      setupTrustedTui();
+      const ctx = createMockContext();
+      const controller = new AbortController();
+      let current = true;
+      vi.mocked(ctx.ui.select).mockImplementation(async () => {
+        if (code === "stale") current = false;
+        else controller.abort();
+        return "允许上述范围";
+      });
+      const question: NativeQuestion = {
+        frame: createMockFrame(),
+        kind: "authorization",
+        title: "范围",
+        body: "原件",
+      };
+      const outcome = await requestNativeInteraction(
+        ctx,
+        question,
+        () => current,
+        controller.signal,
+      );
+      expect(outcome.answer).toBeUndefined();
+      expect(outcome.diagnostic.code).toBe(code);
+    },
+  );
 
   it.each([
     "missing",

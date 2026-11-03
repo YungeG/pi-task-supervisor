@@ -307,6 +307,7 @@ export function updateTaskWidget(
 export async function showTaskList(
   ctx: ExtensionContext,
   snapshot: Readonly<TaskBoardSnapshot>,
+  initialView?: "list" | "confirmation",
 ): Promise<void> {
   if (!ctx.hasUI) return;
   if (ctx.mode !== "tui") return showLegacyTaskList(ctx, snapshot);
@@ -351,6 +352,7 @@ export async function showTaskList(
           },
         },
         finish,
+        initialView,
       );
       abort = () => {
         component?.dispose();

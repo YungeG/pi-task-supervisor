@@ -54,8 +54,8 @@ describe("index (default export)", () => {
       expect.objectContaining({ description: expect.any(String) }),
     );
 
-    // Native continuation boundary plus notification-only abort reconciliation.
-    expect(mockObj.on).toHaveBeenCalledTimes(12); // Original eleven hooks plus actual kernel-end observation.
+    // Original hooks plus pending notification and three bounded H0 lifecycle observers.
+    expect(mockObj.on).toHaveBeenCalledTimes(16);
     const eventNames = mockObj.on.mock.calls.map((call: unknown) => (call as [string, unknown])[0]);
     expect(eventNames).toContain("session_start");
     expect(eventNames).toContain("agent_start");

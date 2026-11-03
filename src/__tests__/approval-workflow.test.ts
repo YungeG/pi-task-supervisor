@@ -21,7 +21,8 @@ import { createSubmitPreflightTool, createWriteTasksTool, createCompileTasksTool
 import { currentRuntime } from "../runtime";
 import { readControlJournal } from "../control-journal";
 import { getBoard, resetState } from "../state";
-import { beginPreflight, restorePreflight } from "../preflight";
+import { beginPreflight, restorePreflight, preflightContext } from "../preflight";
+import { captureUiSummary } from "../ui-capture";
 import { approvePreflight } from "../preflight-human";
 import type { AcceptanceProposal } from "../acceptance-proposal";
 import { flowFacts, nextFlowStep } from "../flow";
@@ -1356,6 +1357,58 @@ it.each(["profile", "permission-id", "checker-root", "missing-permission"])(
   },
 );
 
+it.each(["source-fault", "off"])(
+  "does not append actionable preflight instructions to %s status",
+  async (kind) => {
+    const h = await approvedNodeBundle();
+    if (kind === "off") await h.command("disable");
+    else currentRuntime().journalFault = "Independent source unavailable";
+    const before = readFileSync(h.path, "utf8");
+    vi.mocked(h.ctx.ui.notify).mockClear();
+    await h.command("status");
+    const text = vi
+      .mocked(h.ctx.ui.notify)
+      .mock.calls.map(([line]) => line)
+      .join("\n");
+    expect(text).not.toContain("Next preflight: /task-supervisor start");
+    expect(text).not.toContain("Next preflight: /task-supervisor approve");
+    expect(readFileSync(h.path, "utf8")).toBe(before);
+  },
+);
+it.each(["changed", "missing", "capability"])(
+  "keeps known %s Start blockers consistent across status, Main and the readonly UI",
+  async (kind) => {
+    const h = await approvedNodeBundle();
+    if (kind === "changed") writeFileSync(join(h.root, "checker.mjs"), "// changed definition\n");
+    if (kind === "missing") unlinkSync(join(h.root, "checker.mjs"));
+    if (kind === "capability")
+      vi.mocked(h.mock.api.getAllTools).mockReturnValue(
+        h.mock.api.getAllTools().filter((tool) => tool.name !== "run_check"),
+      );
+    await h.command("start");
+    expect(currentRuntime().preflight?.started).toBeUndefined();
+    const before = readFileSync(h.path, "utf8"),
+      approval = structuredClone(currentRuntime().preflight?.approval);
+    h.mock.sendMessage.mockClear();
+    vi.mocked(h.ctx.ui.notify).mockClear();
+    await h.command("status");
+    const status = vi
+      .mocked(h.ctx.ui.notify)
+      .mock.calls.map(([text]) => text)
+      .join("\n");
+    const context = preflightContext(h.ctx);
+    const ui = captureUiSummary(h.ctx, getBoard());
+    expect(status).not.toContain("Next preflight: /task-supervisor start");
+    expect(JSON.stringify(ui)).not.toContain("/task-supervisor start");
+    if (kind !== "changed") {
+      expect(context).not.toContain("/task-supervisor approve");
+      expect(status).toContain("Main");
+    } else expect(context).toContain("/task-supervisor approve");
+    expect(readFileSync(h.path, "utf8")).toBe(before);
+    expect(currentRuntime().preflight?.approval).toEqual(approval);
+    expect(h.mock.sendMessage).not.toHaveBeenCalled();
+  },
+);
 it.each(["input.txt", "checker.mjs"])(
   "asks Main to repair missing %s material, not reapprove or Start",
   async (file) => {

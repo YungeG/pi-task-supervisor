@@ -1,0 +1,25 @@
+{
+  "upstream": "https://github.com/earendil-works/pi.git",
+  "base": "4a080252f06caf63a525d7873c5d94d3c23887e0",
+  "version": "1.4.0",
+  "patch": "pi-1.4.0-h0-r2.patch",
+  "patchSha256": "f69863a83da9bf0c6321a7c5b5f06c94a7504e962efa11c2e6786b24d8b9b4a9",
+  "candidateFingerprint": "066b21cda79bd3ea2a12840243c428bfb525c1c21fc8f3442d5d281f400434a1",
+  "sourceFingerprint": "db154401d52c563420fc1fd09dc9ac1f5878f0619653432c6346521b7e96913c",
+  "files": {
+    "packages/coding-agent/docs/extensions.md": "485ced711ae9c93944c66ecabc3211394ac579a936c2cbbd7ab91b9d28d6aa5c",
+    "packages/coding-agent/src/core/agent-session.ts": "c5268b6dc3791c3f88dd06eabcae9d0efd967b528e2cc7f52afb706cc2c92d64",
+    "packages/coding-agent/src/core/extensions/index.ts": "3eae5963e894ee77ab97fa50df08b76f11e38ee0b2b924dc3aa07b56b6b86036",
+    "packages/coding-agent/src/core/extensions/loader.ts": "6c26b3eed45ed45515a31eb1e08639ad91d31925f6d899d787c76253530ac94f",
+    "packages/coding-agent/src/core/extensions/runner.ts": "84749b3f678a3b8eedd2e041afb72604a323eecf58ed7d64751c7a857c67eebc",
+    "packages/coding-agent/src/core/extensions/types.ts": "530a24f1de115e7aa0624362d06dd1b20170502f1a3b36700a3ddafd40a400b1",
+    "packages/coding-agent/src/core/idle-actions.ts": "609b79acfa1714468c121ff72874ebc42c6dbd2ea435c11a905c6c35aea5c99c",
+    "packages/coding-agent/src/index.ts": "13825b541b7e74dfb536e5c04d81139e55dd763492ae513290285b93bca31a71",
+    "packages/coding-agent/src/modes/interactive/interactive-mode.ts": "f24f2adf8babdcbe1b126a2c3c5b8513da5dc8297499294cc04a5dde5f773592",
+    "packages/coding-agent/src/modes/rpc/rpc-mode.ts": "dd27088ccf779260001ecfdaa0f7ba5526981b800aa9ebe069d76c00a630aa8b",
+    "packages/coding-agent/test/interactive-mode-idle-actions.test.ts": "40e13d51e3ee434f3be978d6bb4edebb5313bf789bfbc74a59e60e8bf323f9b5",
+    "packages/coding-agent/test/rpc-idle-actions.test.ts": "5e73af29511a9c1cb7e6c9bcfd74e02013963317f181bc1c50615ab92c71433d",
+    "packages/coding-agent/test/suite/agent-session-idle-actions.test.ts": "22773afda7d5e45a03b52a5167a51e469329170a4a08c0ad91439091114ab8a4"
+  },
+  "qualification": "Node local TUI only; not a registry release or Bun/RPC approval certification"
+}

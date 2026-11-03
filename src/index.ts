@@ -1,5 +1,6 @@
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import { registerCommands } from "./commands";
+import { registerPendingUi } from "./pending-ui";
 import {
   createRunCheckTool,
   createProposeContractTool,
@@ -24,6 +25,7 @@ export function registerSupervisorComponents(pi: ExtensionAPI): void {
   registerMessageRenderers(pi);
   registerEventHandlers(pi);
   registerCommands(pi);
+  registerPendingUi(pi);
 
   pi.registerTool(createWriteTasksTool(pi));
   pi.registerTool(createEditTasksTool(pi));

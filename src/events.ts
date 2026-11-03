@@ -8,12 +8,15 @@ import type { ContinuousTasksConfig } from "./config";
 import { registeredCheckInvocationIssue } from "./execution-capability";
 import { contractCompilationAdmission, preflightAssociationIssue } from "./acceptance-runtime";
 import { isScopeRevisionProposalTool } from "./scope-revision-schema";
+import { SCOPE_METADATA_REQUEST } from "./scope-guidance";
+import { cachedScopeFlow } from "./scope-revision-journal";
 import {
   observeFinalValidation,
   finalReviewWriteIssue,
   interruptFinalReview,
   restoreFinalReviewState,
   registeredFinalValidation,
+  finalValidationMainContext,
 } from "./final-review";
 import {
   readControlJournal,
@@ -37,6 +40,12 @@ import {
   activeGoalContext,
   materializeManagement,
 } from "./management-policy";
+import { pauseBoard } from "./session-controls";
+import {
+  reconcileHumanContinuationTools,
+  settleHumanDeliveryFailure,
+  humanKernelStarted,
+} from "./idle-human";
 import { currentRuntime } from "./runtime";
 import { existingExecutionMetadata } from "./execution-settlement";
 import { preflightContext, preflightTaskIssue, restorePreflight } from "./preflight";
@@ -51,7 +60,7 @@ import {
   setSessionScopeEnabled,
   updateActiveTools,
 } from "./scope";
-import { getBoardRef, persistEntries, reconstructState, setBoard, updateUI } from "./state";
+import { getBoardRef, reconstructState, setBoard, updateUI } from "./state";
 import { cloneBoard, hasActionableTasks, hasBlockedNonTerminalTasks } from "./validation";
 import {
   digest,
@@ -66,7 +75,6 @@ import {
   supervisorPlanError,
   supervisorState,
   type Advisor,
-  type SupervisorHoldCause,
 } from "./supervisor";
 
 import { restoreGoalLifecycle, settleGoalPlanning } from "./goal-lifecycle";
@@ -105,33 +113,6 @@ type Control = {
     ctx: ExtensionContext,
   ) => Promise<BoundaryResult | undefined>;
 };
-
-function pauseBoard(
-  pi: ExtensionAPI,
-  ctx: ExtensionContext,
-  reason: string,
-  cause: SupervisorHoldCause = "unknown",
-): void {
-  const board = getBoardRef();
-  if (board.workflowStatus === "active") {
-    const updated = cloneBoard(board);
-    updated.workflowStatus = "paused";
-    updated.pauseReason = reason;
-    updated.generation++;
-    persistEntries(pi, { type: "pause_controller", reason, cause }, updated);
-    setBoard(updated);
-    updateUI(ctx, updated);
-    pi.sendMessage(
-      {
-        customType: "continuous-tasks:notice",
-        content: `Pi Task Supervisor paused: ${reason}`,
-        display: true,
-      },
-      { triggerTurn: false },
-    );
-  }
-  holdSupervisor(pi, ctx, "paused", reason, cause);
-}
 
 function continuation(prompt: string, action?: "guide" | "next_batch"): BoundaryResult {
   return {
@@ -874,10 +855,23 @@ function beforePlanningContext(
   ctx: ExtensionContext,
   preflight: string | undefined,
 ): { handled: boolean; value?: ReturnType<typeof planningMessage> } {
-  if (currentRuntime().journalFault) return { handled: true };
+  if (currentRuntime().journalFault)
+    return {
+      handled: true,
+      value: {
+        message: {
+          customType: "continuous-tasks:goal-hold",
+          content: `${goalScopeContext(ctx)}\n${preflight ?? currentRuntime().journalFault}\nRead-only diagnosis only; source faults are not approval or replay permission.`,
+          display: false,
+        },
+      },
+    };
   const issue = goalExecutionIssue(ctx);
   const current = currentRuntime().goal?.current;
-  if (goalControlIssue(ctx) || (issue && current?.phase !== "planning"))
+  const heldMetadata =
+    currentRuntime().preflight?.started &&
+    ["paused", "fault"].includes(supervisorState()?.status ?? "");
+  if (goalControlIssue(ctx) || (issue && current?.phase !== "planning" && !heldMetadata))
     return {
       handled: true,
       value: {
@@ -904,11 +898,38 @@ function decisionWait(
     !state.pending
   );
 }
+function heldWorkContext(ctx: ExtensionContext, preflight: string | undefined) {
+  if (getBoardRef().workflowStatus === "completed")
+    return {
+      message: {
+        customType: "continuous-tasks:final-validation-context",
+        content: `${goalScopeContext(ctx)}\n${finalValidationMainContext(ctx)}`,
+        display: false,
+      },
+    };
+  if (
+    !currentRuntime().preflight?.started ||
+    !["paused", "fault"].includes(supervisorState()?.status ?? "")
+  )
+    return;
+  const scope = cachedScopeFlow(ctx);
+  return {
+    message: {
+      customType: "continuous-tasks:held-metadata-context",
+      content: `${goalScopeContext(ctx)}\n${preflight ?? "Inspect original held sources"}\nBusiness remains held; this explicit Main turn cannot recover, execute business or alter task status. ${scope ? `Scope next: ${scope.next}; do not replace the existing scope/control.` : `If the user requested scope metadata only: ${SCOPE_METADATA_REQUEST}`}`,
+      display: false,
+    },
+  };
+}
 function managementPlanningContext(ctx: ExtensionContext, supervised: boolean) {
   const preflight = supervised ? preflightContext(ctx) : undefined;
   const leading = supervised
     ? beforePlanningContext(ctx, preflight)
     : { handled: false, value: undefined };
+  if (supervised && !leading.handled) {
+    const held = heldWorkContext(ctx, preflight);
+    if (held) return { preflight, leading: { handled: true, value: held } };
+  }
   return { preflight, leading };
 }
 function registerWorkHandlers(pi: ExtensionAPI, control: Control): void {
@@ -919,12 +940,16 @@ function registerWorkHandlers(pi: ExtensionAPI, control: Control): void {
       ctx.sessionManager.getSessionId(),
       currentRuntime().goal?.current?.supervisor === null ? "planning" : "execution",
     ]);
+  const settledFromAnotherScope = (started: string | undefined, ctx: ExtensionContext) =>
+    started ? started !== runScope(ctx) : Boolean(currentRuntime().goal?.current);
   pi.on("agent_start", (_event, ctx) => {
     const key = runScope(ctx);
     if (runs.at(-1) !== key) runs.push(key);
     if (runs.length > 128) runs.shift();
+    humanKernelStarted();
   });
-  pi.on("before_agent_start", (_event, ctx) => {
+  pi.on("before_agent_start", (event, ctx) => {
+    reconcileHumanContinuationTools(pi, event, ctx);
     materializeStoppedChoice(pi, ctx);
     const management = captureManagementSnapshot(ctx);
     if (decideAdmission(management, { kind: "context" }).verdict === "deny") return undefined;
@@ -952,7 +977,8 @@ function registerWorkHandlers(pi: ExtensionAPI, control: Control): void {
   pi.on("agent_settled", (event, ctx) => {
     materializeStoppedChoice(pi, ctx);
     const started = runs.shift();
-    if (started ? started !== runScope(ctx) : Boolean(currentRuntime().goal?.current)) return;
+    if (settleHumanDeliveryFailure(pi, event, ctx)) return;
+    if (settledFromAnotherScope(started, ctx)) return;
     if (!isSessionScopeEnabled()) return;
     settleGoalPlanning(pi, ctx);
     if (goalExecutionIssue(ctx)) return;

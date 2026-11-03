@@ -1,12 +1,16 @@
 // Offline actual CLI fixture. No argv/TTY/UI/admission substitution; no business effects.
 import { join } from "node:path";
-import { writeFileSync } from "node:fs";
+import { writeFileSync, appendFileSync } from "node:fs";
 import { fauxProvider, fauxAssistantMessage, fauxToolCall } from "@earendil-works/pi-ai";
-import extension from "../src/index.ts";
-import { getBoardRef, setBoard } from "../src/state.ts";
+import extension, { registerSupervisorComponents } from "../src/index.ts";
+import { currentRuntime, scopedAPI, bindRuntimeCallback } from "../src/runtime.ts";
+import { hasActiveNativeQuestion } from "../src/human-ui.ts";
+import hostModuleFixture from "./host-module-extension.ts";
+import { getBoardRef, setBoard, persistEntries } from "../src/state.ts";
 import { answerBoardDecision } from "../src/board-human.ts";
 import { approvalNativeResponses } from "./approval-native-responses.ts";
 import { readControlJournal } from "../src/control-journal.ts";
+import { cachedApprovalAction } from "../src/flow.ts";
 import { assessEvidenceCapability } from "../src/execution-capability.ts";
 
 const proposal = {
@@ -35,6 +39,19 @@ export default function goalNativeFixture(pi: any) {
   const scenario = process.env.GOAL_NATIVE_SCENARIO;
   let manager: any;
   let idles = 0;
+  let readRestored: ((ctx: Parameters<typeof readControlJournal>[0]) => unknown) | undefined;
+  let nativeUiPrompts = 0;
+  pi.on("ui_prompt_start", (event: unknown) => {
+    nativeUiPrompts++;
+    appendFileSync(join(process.env.GOAL_NATIVE_OUT!, "native-ui-events.jsonl"), JSON.stringify(event)+"\n");
+  });
+  const settledObservations: Array<{ idle: boolean; pending: boolean }> = [];
+  const scopedObservations: Array<Record<string, unknown>> = [];
+  let ownedScopeWriteFailed = false;
+  let ownedHumanFault = false;
+  let ownedHumanPause = false;
+  let compilePauseRelease: (() => void) | undefined;
+  const ownedHumanEvents: Array<Record<string, unknown>> = [];
   const branch = () => manager?.getBranch() ?? [];
   const commits = () =>
     branch().filter(
@@ -55,9 +72,100 @@ export default function goalNativeFixture(pi: any) {
     ],
   );
   pi.registerProvider(faux.provider);
-  extension(pi);
+  if (scenario === "final-guidance") hostModuleFixture(pi);
+  else {
+    if (scenario === "human-interaction") {
+      // Observe real shortcut completion; never substitute context, UI or answers.
+      const register = pi.registerShortcut.bind(pi);
+      pi.registerShortcut = (key: any, options: any) =>
+        register(key, {
+          ...options,
+          async handler(ctx: any) {
+            await options.handler(ctx);
+            ctx.ui.notify("GOAL_NATIVE_UI_CLOSED", "info");
+          },
+        });
+    }
+    if (["permissions", "human-interaction"].includes(scenario ?? "") || process.env.GOAL_NATIVE_CANCEL_AFTER_START === "1" || process.env.GOAL_NATIVE_PREPARE_FAILURE === "1" || process.env.GOAL_NATIVE_COLD_CHECK === "1" || process.env.GOAL_NATIVE_PROJECTION_FAILURE === "1" || process.env.GOAL_NATIVE_JOINT_RESUME === "1" || (process.env.GOAL_NATIVE_HUMAN_CONTROLS === "1" && scenario === "information")) {
+      // Exact production composition plus a readonly runtime observer.
+      scopedAPI(pi, (api) => {
+        const append = api.appendEntry.bind(api);
+        const controlled = { ...api, registerCommand(name: string, command: Parameters<typeof api.registerCommand>[1]) {
+          api.registerCommand(name, {...command, handler(args, ctx) {
+            if (name === "task-supervisor" && args.startsWith("pause ")) compilePauseRelease?.();
+            return command.handler(args, ctx);
+          }});
+        }, setActiveTools(names: string[]) {
+          if (process.env.GOAL_NATIVE_PROJECTION_FAILURE === "1" && currentRuntime().preflight?.started && !ownedHumanFault) { ownedHumanFault = true; throw new Error("Owned tool projection failure"); }
+          return api.setActiveTools(names);
+        }, appendEntry(type: string, value: unknown) {
+          append(type, value);
+          const body = value && typeof value === "object" && "snapshot" in value ? value.snapshot : value;
+          if (!ownedHumanFault && process.env.GOAL_NATIVE_CANCEL_AFTER_START === "1" && type === "continuous-tasks:preflight" && body && typeof body === "object" && "started" in body && body.started) {
+            ownedHumanFault = true;
+            api.events.emit("owned-native-cancel", {});
+          }
+        } };
+        api.events.on("owned-native-cancel", () => { api.sendUserMessage("Inspect the retained Start only; no business execution or replay."); });
+        registerSupervisorComponents(controlled);
+        readRestored = bindRuntimeCallback((ctx) => { const runtime=currentRuntime(), journal=readControlJournal(ctx); return {mode:runtime.management?.mode,journalFault:runtime.journalFault,approval:!!runtime.preflight?.approval,started:!!runtime.preflight?.started,pendingAction:cachedApprovalAction(ctx.sessionManager.getSessionId())?.kind,hasBoundContract:!!journal.acceptance?.latestContractBound}; });
+        if (scenario === "information") api.registerCommand("goal-native-pending-info", { handler(_args, context) {
+          const board = structuredClone(getBoardRef());
+          board.generation++; board.workflowStatus = "waiting_for_decision"; board.pauseReason = undefined;
+          board.tasks = [{ id: "owned-info-task", title: "Owned draft", prompt: "Metadata only", profile: "main", phase: 1, dependencies: [], status: "draft", createdAt: "2026-11-02", updatedAt: "2026-11-02" }];
+          board.phases = [{ phase: 1, status: "pending" }]; board.finalAcceptanceTaskId = undefined;
+          board.decision = { id: "owned-h0-info", taskId: "owned-info-task", question: process.env.GOAL_NATIVE_CHOICE === "1" ? "选择唯一原方案（不扩权）" : "填写候选观察天数", whyUserOwned: "只记录整数，不授权或执行业务。", createdAt: "2026-11-02", ...(process.env.GOAL_NATIVE_CHOICE === "1" ? {options:["保留原方案"],spec:{version:1,kind:"choice"}} : {spec: { version: 1, kind: "information", format: "integer" }}) };
+          persistEntries(api, { type: "owned-fixture-question" }, board); setBoard(board);
+          context.ui.notify("GOAL_NATIVE_PENDING_READY");
+        } });
+        api.on("before_agent_start", (event: any) => {
+          if (!ownedHumanFault && process.env.GOAL_NATIVE_PREPARE_FAILURE === "1" && event.messageType === "custom" && event.message.customType === "continuous-tasks:continue") {
+            ownedHumanFault = true; event.systemPromptOptions.selectedTools = null;
+          }
+        });
+        api.on("tool_result", async (event, ctx) => {
+          if (process.env.GOAL_NATIVE_JOINT_RESUME === "1" && !ownedHumanPause && event.toolName === "compile_tasks" && !event.isError) {
+            ownedHumanPause = true;
+            await new Promise<void>(resolve => { compilePauseRelease = resolve; ctx.ui.notify("GOAL_NATIVE_COMPILE_CHECKPOINT"); });
+          }
+        });
+        api.on("agent_start", () => { ownedHumanEvents.push({ type: "agent_start" }); });
+        api.on("agent_settled", (_event, ctx) => {
+          ownedHumanEvents.push({ type: "agent_settled", aborted: _event.aborted, failure: (_event as unknown as { idleActionFailure?: unknown }).idleActionFailure ?? null });
+          const runtime = currentRuntime();
+          scopedObservations.push({
+            enabled: runtime.enabled,
+            phase: runtime.preflight?.phase,
+            preflightSession: runtime.preflight?.sessionId,
+            sessionId: ctx.sessionManager.getSessionId(),
+            boardStatus: runtime.board.workflowStatus,
+            nativeQuestion: hasActiveNativeQuestion(ctx),
+          });
+        });
+      });
+    } else extension(pi);
+  }
   pi.on("session_start", (_event: any, ctx: any) => {
     manager = ctx.sessionManager;
+    if (scenario === "approval-guidance") {
+      const append = manager.appendCustomEntry.bind(manager);
+      manager.appendCustomEntry = (type: string, data: any) => {
+        if (
+          !ownedScopeWriteFailed &&
+          type === "continuous-tasks:acceptance-facts" &&
+          data?.kind === "acceptance-contract-bound" &&
+          data.authority?.kind === "scope-revision-reviewed"
+        ) {
+          ownedScopeWriteFailed = true;
+          throw Error("Owned scope binding write failure before append");
+        }
+        return append(type, data);
+      };
+    }
+    if (process.env.GOAL_NATIVE_COLD_CHECK === "1") {
+      writeFileSync(join(process.env.GOAL_NATIVE_OUT!, "cold-ready.json"), JSON.stringify({pid:process.pid,mode:ctx.mode,argv1:process.argv[1],resolvedCodingAgent:import.meta.resolve("@earendil-works/pi-coding-agent")}));
+      process.on("SIGUSR1", () => { writeFileSync(join(process.env.GOAL_NATIVE_OUT!, "cold-observer.json"), JSON.stringify({mode:ctx.mode,stdinTty:process.stdin.isTTY,stdoutTty:process.stdout.isTTY,h0:ctx.idleActions?.state(),nativeUiPrompts,modelCalls:faux.state.callCount,restored:readRestored?.(ctx) ?? null})); });
+    }
     ctx.ui.notify("GOAL_NATIVE_READY", "info");
   });
   pi.on("before_agent_start", (_event: any, ctx: any) => {
@@ -66,8 +174,42 @@ export default function goalNativeFixture(pi: any) {
   pi.on("agent_settled", (_event: any, ctx: any) => {
     manager = ctx.sessionManager;
     idles++;
-    ctx.ui.notify(`GOAL_NATIVE_IDLE_${idles}`, "info");
+    settledObservations.push({ idle: ctx.isIdle(), pending: ctx.hasPendingMessages() });
+    // A second toast in the same tick replaces the pending notice before paint.
+    // Keep this synthetic marker out of the notification channel in its native test.
+    if (scenario === "permissions") console.log(`GOAL_NATIVE_IDLE_${idles}`);
+    else ctx.ui.notify(`GOAL_NATIVE_IDLE_${idles}`, "info");
   });
+  if (scenario === "human-interaction") {
+    let diagnosticCalls = 0;
+    pi.registerCommand("goal-native-diagnostic", {
+      description: "Owned native no-answer diagnostic fixture; no business control",
+      async handler(_args: string, ctx: any) {
+        const board = structuredClone(getBoardRef());
+        board.generation++;
+        board.workflowStatus = "waiting_for_decision";
+        board.decision = {
+          id: `owned-diagnostic-${++diagnosticCalls}`,
+          taskId: "old-task",
+          question: "只验证稍后与未知退出的区别",
+          whyUserOwned: "仅临时夹具；不授权或执行任何业务。",
+          createdAt: "2026-11-02T00:00:00.000Z",
+          spec: { version: 1, kind: "choice" },
+          options: ["临时选项"],
+        };
+        pi.appendEntry("continuous-tasks:snapshot", board);
+        setBoard(board);
+        const result = await answerBoardDecision(pi, ctx);
+        if (result.status !== "deferred" || result.confirmed)
+          throw Error("Owned diagnostic unexpectedly submitted a control");
+        writeFileSync(
+          join(process.env.GOAL_NATIVE_OUT!, `diagnostic-${diagnosticCalls}.json`),
+          JSON.stringify(result),
+        );
+        ctx.ui.notify(`GOAL_NATIVE_DIAGNOSTIC_${result.interaction?.code ?? "missing"}`, "info");
+      },
+    });
+  }
   if (scenario === "information")
     pi.registerCommand("goal-native-information", {
       description: "Owned offline information-card fixture; no business execution",
@@ -104,6 +246,8 @@ export default function goalNativeFixture(pi: any) {
         stdinTty: process.stdin.isTTY === true,
         stdoutTty: process.stdout.isTTY === true,
         argv1: process.argv[1],
+        resolvedCodingAgent: import.meta.resolve("@earendil-works/pi-coding-agent"),
+        h0Version: ctx.idleActions?.version ?? null,
         nativeSourceMocked: false,
         businessExecutionCertified: false,
         sessionFile: manager.getSessionFile(),
@@ -118,9 +262,15 @@ export default function goalNativeFixture(pi: any) {
           })),
         evidenceCapability: assessEvidenceCapability(pi),
         idles,
+        settledObservations,
+        scopedObservations,
+        ownedScopeWriteFailed,
+        ownedHumanFault,
+        ownedHumanPause,
+        ownedHumanEvents,
         // This command is outside the supervisor's private scopedAPI runtime.
         // Inspect actual published first-owner facts, not its unrelated default runtime.
-        ...(scenario?.startsWith("approval-")
+        ...(scenario?.startsWith("approval-") || scenario === "final-guidance"
           ? {
               board: [...entries]
                 .reverse()
@@ -139,8 +289,7 @@ export default function goalNativeFixture(pi: any) {
         entries: entries.filter(
           (entry: any) =>
             entry.type === "custom" ||
-            (entry.type === "custom_message" &&
-              entry.customType === "continuous-tasks:preflight-planning"),
+            entry.type === "custom_message",
         ),
       };
       writeFileSync(
